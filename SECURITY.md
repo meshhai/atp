@@ -27,4 +27,4 @@ Before running ATP as a public hosted service, add deployment-level controls:
 
 Please do not open public issues for security reports.
 
-Email: security@meshh.ai
+Email: contact@meshh.ai

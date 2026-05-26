@@ -1,7 +1,7 @@
 defmodule Atp.ArchitectureTest do
   use ExUnit.Case, async: true
 
-  test "ATP has no Mesh or MeshFx app dependency" do
+  test "ATP dependencies stay carrier scoped" do
     dep_apps =
       Atp.MixProject.project()
       |> Keyword.fetch!(:deps)
@@ -10,13 +10,10 @@ defmodule Atp.ArchitectureTest do
         {app, _requirement, _opts} -> app
       end)
 
-    refute :mesh in dep_apps
-    refute :mesh_fx in dep_apps
+    assert dep_apps -- allowed_dependency_apps() == []
   end
 
-  test "ATP lib code does not reference Mesh product modules" do
-    forbidden = ~r/\b(Mesh|MeshFx|SourceMonitor|RLM|MarketEvents)\b/
-
+  test "ATP lib code does not reference product-domain modules" do
     matches =
       "lib/**/*.{ex,exs}"
       |> Path.wildcard()
@@ -25,7 +22,7 @@ defmodule Atp.ArchitectureTest do
         |> File.read!()
         |> String.split("\n")
         |> Enum.with_index(1)
-        |> Enum.filter(fn {line, _line_number} -> line =~ forbidden end)
+        |> Enum.filter(fn {line, _line_number} -> line =~ product_domain_pattern() end)
         |> Enum.map(fn {line, line_number} -> "#{path}:#{line_number}: #{line}" end)
       end)
 
@@ -80,5 +77,24 @@ defmodule Atp.ArchitectureTest do
       end)
 
     assert matches == []
+  end
+
+  defp allowed_dependency_apps do
+    [
+      :bandit,
+      :boundary,
+      :ecto_sql,
+      :jason,
+      :phoenix,
+      :phoenix_ecto,
+      :plug_crypto,
+      :postgrex,
+      :req,
+      :tidewave
+    ]
+  end
+
+  defp product_domain_pattern do
+    ~r/\b(SourceMonitor|RLM|MarketEvents|Billing|Corpus|Missions)\b/
   end
 end
