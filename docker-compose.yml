@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: atp_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  atp:
+    image: hexpm/elixir:1.18.4-erlang-27.3.4-debian-bookworm-20250428-slim
+    working_dir: /app
+    command: sh -c "mix deps.get && mix ecto.setup && mix phx.server"
+    environment:
+      MIX_ENV: dev
+      ATP_PORT: "4105"
+      ATP_BIND_ALL: "true"
+      ATP_DB_NAME: atp_dev
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGHOST: postgres
+    ports:
+      - "4105:4105"
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
