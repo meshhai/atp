@@ -274,8 +274,6 @@ defmodule Atp.CLITest do
     assert override_output =~ "Sender: claude-123"
     assert override_output =~ "Message: msg_override"
 
-    seed_active_alias!(atp_home, "claude-123")
-
     Req.Test.expect(__MODULE__, fn conn ->
       assert conn.method == "POST"
       assert conn.request_path == "/api/inbox/claims"
@@ -303,7 +301,7 @@ defmodule Atp.CLITest do
       })
     end)
 
-    inbox_output = capture_io(fn -> assert Atp.CLI.run(["inbox"]) == 0 end)
+    inbox_output = capture_io(fn -> assert Atp.CLI.run(["inbox", "--as", "claude-123"]) == 0 end)
 
     assert inbox_output =~ "Delivery: dlv_claimed"
     assert inbox_output =~ "Sender: codex-atp (atp://agent/agt_codex_atp)"
@@ -350,7 +348,14 @@ defmodule Atp.CLITest do
 
     ack_output =
       capture_io(fn ->
-        assert Atp.CLI.run(["ack", "dlv_claimed", "--completed", "done reviewing"]) == 0
+        assert Atp.CLI.run([
+                 "ack",
+                 "dlv_claimed",
+                 "--completed",
+                 "done reviewing",
+                 "--as",
+                 "claude-123"
+               ]) == 0
       end)
 
     assert ack_output =~ "ACK completed."
@@ -483,8 +488,6 @@ defmodule Atp.CLITest do
     assert open_output =~ "Opening message: msg_opening"
     assert open_output =~ "Opening delivery: dlv_opening"
 
-    seed_active_alias!(atp_home, "claude-123")
-
     Req.Test.expect(__MODULE__, fn conn ->
       assert conn.method == "POST"
       assert conn.request_path == "/api/sessions/ses_cli/accept"
@@ -511,7 +514,7 @@ defmodule Atp.CLITest do
 
     accept_output =
       capture_io(fn ->
-        assert Atp.CLI.run(["session", "accept", "ses_cli"]) == 0
+        assert Atp.CLI.run(["session", "accept", "ses_cli", "--as", "claude-123"]) == 0
       end)
 
     assert accept_output =~ "Session accepted."
@@ -554,7 +557,14 @@ defmodule Atp.CLITest do
 
     send_output =
       capture_io(fn ->
-        assert Atp.CLI.run(["session", "send", "ses_cli", "I see the tradeoff"]) == 0
+        assert Atp.CLI.run([
+                 "session",
+                 "send",
+                 "ses_cli",
+                 "I see the tradeoff",
+                 "--as",
+                 "claude-123"
+               ]) == 0
       end)
 
     assert send_output =~ "Session message sent."
@@ -600,7 +610,14 @@ defmodule Atp.CLITest do
 
     reject_output =
       capture_io(fn ->
-        assert Atp.CLI.run(["session", "reject", "ses_reject", "not this time"]) == 0
+        assert Atp.CLI.run([
+                 "session",
+                 "reject",
+                 "ses_reject",
+                 "not this time",
+                 "--as",
+                 "claude-123"
+               ]) == 0
       end)
 
     assert reject_output =~ "Session rejected."
@@ -633,8 +650,12 @@ defmodule Atp.CLITest do
     assert show_output =~ "Status: open"
     assert show_output =~ "Initiator: codex-atp (atp://agent/agt_codex_atp)"
     assert show_output =~ "Recipient: claude-123 (atp://agent/agt_claude_123)"
-    assert show_output =~ "Seq\tTime\tSender\tRecipient\tStatus\tMessage"
-    assert show_output =~ "1\t2026-05-27T12:00:00Z\tcodex-atp\tclaude-123\taccepted\topening turn"
+
+    assert show_output =~
+             "Seq  Time                  Sender      Recipient   Status    Message"
+
+    assert show_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
 
     Application.put_env(:atp, Atp.CLI,
       req_options: [plug: {Req.Test, __MODULE__}],
@@ -659,7 +680,15 @@ defmodule Atp.CLITest do
         conn,
         session_transcript_response([
           session_message(1, "msg_opening"),
-          session_message(2, "msg_reply")
+          session_message(
+            2,
+            "msg_reply",
+            "atp://agent/agt_claude_123",
+            "atp://agent/agt_codex_atp",
+            "2026-05-27T12:01:00Z",
+            nil,
+            "reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient status and message columns aligned in the terminal"
+          )
         ])
       )
     end)
@@ -669,15 +698,70 @@ defmodule Atp.CLITest do
         assert Atp.CLI.run(["session", "watch", "ses_cli"]) == 0
       end)
 
-    assert watch_output =~ "Seq\tTime\tSender\tRecipient\tStatus\tMessage"
+    assert watch_output =~
+             "Seq  Time                  Sender      Recipient   Status    Message"
 
     assert watch_output =~
-             "1\t2026-05-27T12:00:00Z\tcodex-atp\tclaude-123\taccepted\topening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
 
-    assert watch_output =~ "2\t2026-05-27T12:01:00Z\tclaude-123\tcodex-atp\tqueued\treply turn"
+    assert watch_output =~
+             "2    2026-05-27T12:01:00Z  claude-123  codex-atp   queued    reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient status and"
 
-    assert [_header] = Regex.scan(~r/Seq\tTime\tSender\tRecipient\tStatus\tMessage/, watch_output)
+    assert watch_output =~
+             "                                                             message columns aligned in the terminal"
+
+    assert [_header] = Regex.scan(~r/Seq  Time/, watch_output)
     assert [] = Regex.scan(~r/msg_opening/, watch_output)
+  end
+
+  test "session show and watch accept explicit agent identity overrides", %{atp_home: atp_home} do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+
+      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+    end)
+
+    show_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "show", "ses_cli", "--as", "claude-123"]) == 0
+      end)
+
+    assert show_output =~ "Session: ses_cli"
+
+    assert show_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+
+    Application.put_env(:atp, Atp.CLI,
+      req_options: [plug: {Req.Test, __MODULE__}],
+      watch_poll_interval_ms: 0,
+      watch_max_polls: 1
+    )
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+
+      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+    end)
+
+    watch_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "watch", "ses_cli", "--as", "claude-123"]) == 0
+      end)
+
+    assert watch_output =~
+             "Seq  Time                  Sender      Recipient   Status    Message"
+
+    assert watch_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
   end
 
   defp seed_initialized_state!(atp_home) do

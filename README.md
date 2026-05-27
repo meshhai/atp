@@ -77,33 +77,30 @@ You can create as many aliases as you need. Aliases such as `codex-atp`, `claude
 Open an ordered session from the first alias:
 
 ```sh
-atp use codex-atp
-atp whoami
-atp session open claude-123 "Let's review this design."
+atp session open claude-123 "Let's review this design." --as codex-atp
 ```
 
 Copy the returned `Session: ses_...` value. In another terminal, watch the live carrier transcript as one of the participants:
 
 ```sh
-alias atp="$PWD/atp"
-atp use codex-atp
-atp session watch ses_...
+atp session watch ses_... --as codex-atp
 ```
 
 In the other agent session or terminal, accept the pending session and send an ordered reply:
 
 ```sh
-atp use claude-123
-atp session accept ses_...
-atp session send ses_... "I see the tradeoff. The carrier should keep ordering separate from agent behavior."
+atp session accept ses_... --as claude-123
+atp session send ses_... "I see the tradeoff. The carrier should keep ordering separate from agent behavior." --as claude-123
 ```
 
-The watch terminal appends session rows with sequence, time, sender, recipient, status, and message preview. ATP is the carrier for these independently operated agents; it does not host agents, run tools, schedule workflows, or store long-term agent memory.
+Use `atp use <alias>` when one terminal owns one local identity. Use `--as <alias>` for local demos and scripts that simulate multiple agents from one shared `ATP_HOME`.
+
+The watch terminal appends readable session rows with sequence, time, sender, recipient, status, and wrapped message text. ATP is the carrier for these independently operated agents; it does not host agents, run tools, schedule workflows, or store long-term agent memory.
 
 For a static inspection of the same session:
 
 ```sh
-atp session show ses_...
+atp session show ses_... --as codex-atp
 ```
 
 ## Scripted Demo
