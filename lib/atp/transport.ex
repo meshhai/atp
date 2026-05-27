@@ -12,6 +12,14 @@ defmodule Atp.Transport do
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate open_session(initiator, params, idempotency_key, route), to: Runtime
 
+  @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          api_result()
+  defdelegate accept_session(recipient, session_id, params, idempotency_key, route), to: Runtime
+
+  @spec reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          api_result()
+  defdelegate reject_session(recipient, session_id, params, idempotency_key, route), to: Runtime
+
   @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   defdelegate send_session_message(sender, session_id, params, idempotency_key, route),

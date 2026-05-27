@@ -10,6 +10,11 @@ defmodule AtpWeb.SessionController do
     recipient_not_found: :unprocessable_entity,
     invalid_session_recipient: :unprocessable_entity,
     session_not_open: :conflict,
+    message_expired: :conflict,
+    invalid_ack_transition: :conflict,
+    terminal_ack_status: :conflict,
+    delivery_not_delivered: :conflict,
+    lease_expired: :conflict,
     unknown_sender_rate_limited: :too_many_requests,
     payload_required: :unprocessable_entity,
     payload_must_be_json: :unprocessable_entity,
@@ -33,6 +38,30 @@ defmodule AtpWeb.SessionController do
       {:error, :not_found} ->
         APIResponse.send_error(conn, :not_found, :not_found)
     end
+  end
+
+  @spec accept(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def accept(conn, %{"id" => id} = params) do
+    conn.assigns.atp_agent
+    |> Transport.accept_session(
+      id,
+      Map.delete(params, "id"),
+      APIResponse.idempotency_key(conn),
+      "POST /api/sessions/#{id}/accept"
+    )
+    |> APIResponse.send_result(conn, @transport_errors)
+  end
+
+  @spec reject(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def reject(conn, %{"id" => id} = params) do
+    conn.assigns.atp_agent
+    |> Transport.reject_session(
+      id,
+      Map.delete(params, "id"),
+      APIResponse.idempotency_key(conn),
+      "POST /api/sessions/#{id}/reject"
+    )
+    |> APIResponse.send_result(conn, @transport_errors)
   end
 
   @spec create_message(Plug.Conn.t(), map()) :: Plug.Conn.t()

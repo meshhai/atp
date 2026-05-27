@@ -25,6 +25,15 @@ defmodule Atp.Transport.Response do
     }
   end
 
+  @spec session_transcript(Session.t(), [Message.t()], Agent.t()) :: response_map()
+  def session_transcript(%Session{} = session, messages, %Agent{} = viewer)
+      when is_list(messages) do
+    %{
+      "session" => session(session),
+      "messages" => Enum.map(messages, &message_status(&1, viewer))
+    }
+  end
+
   @spec session(Session.t()) :: response_map()
   def session(%Session{} = session) do
     %{

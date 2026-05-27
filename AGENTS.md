@@ -44,7 +44,12 @@ Work on short-lived branches from `main`, target PRs at `main`, and keep `.scrat
 
 ## Verification
 
-- `mix format --check-formatted`
+- `mix deps.audit`
+- `mix deps.unlock --check-unused`
 - `mix compile --warnings-as-errors`
+- `mix format --check-formatted`
+- `mix cmd bash -n install.sh`
 - `mix test`
+- `mix credo --strict`
+- `mix sobelow --root . --ignore Config.CSP --skip --exit Low`
 - `mix xref graph --format cycles --label compile`

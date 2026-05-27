@@ -25,6 +25,22 @@ defmodule Atp.Transport.Runtime do
     |> warm_pending_opening_session()
   end
 
+  @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) :: api_result()
+  def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) do
+    recipient
+    |> Ledger.accept_session(session_id, params, idempotency_key, route)
+    |> handle_session_id_accept(session_id)
+  end
+
+  @spec reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) :: api_result()
+  def reject_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) do
+    recipient
+    |> Ledger.reject_session(session_id, params, idempotency_key, route)
+    |> handle_session_id_reject(session_id)
+  end
+
   @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
@@ -166,6 +182,29 @@ defmodule Atp.Transport.Runtime do
   end
 
   defp handle_opening_session_ack(result, _params, _session_id), do: result
+
+  defp handle_session_id_accept({:ok, _status, _body} = result, session_id) do
+    case safe_ensure_session_started(session_id) do
+      {:ok, _pid} -> :ok
+      {:error, reason} -> log_session_warm_failure(session_id, reason)
+    end
+
+    result
+  end
+
+  defp handle_session_id_accept(result, _session_id), do: result
+
+  defp handle_session_id_reject({:ok, _status, _body} = result, session_id) do
+    stop_session_process(session_id)
+    result
+  end
+
+  defp handle_session_id_reject({:error, :message_expired} = result, session_id) do
+    stop_session_process(session_id)
+    result
+  end
+
+  defp handle_session_id_reject(result, _session_id), do: result
 
   defp safe_ensure_session_started(session_id) do
     ensure_session_started(session_id)

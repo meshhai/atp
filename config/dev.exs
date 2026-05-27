@@ -17,7 +17,7 @@ bind_ip =
   end
 
 config :atp, AtpWeb.Endpoint,
-  http: [ip: bind_ip, port: String.to_integer(System.get_env("ATP_PORT", "4105"))],
+  http: [ip: bind_ip, port: String.to_integer(System.get_env("ATP_PORT", "4000"))],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,

@@ -137,6 +137,198 @@ defmodule Atp.SessionAPITest do
     assert initiator_reply["message_status"]["message"]["to"] == recipient["address"]
   end
 
+  test "recipient can accept or reject a pending session by session ID without a delivery ID", %{
+    conn: conn
+  } do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    initiator = register_agent!(account_token, "register-session-action-initiator", %{})
+    recipient = register_agent!(account_token, "register-session-action-recipient", %{})
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-session-action-accept",
+        recipient["address"],
+        a2a_user_text("session-action-accept", "please accept")
+      )
+
+    accepted =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("accept-session-by-id")
+      |> post("/api/sessions/#{opened["session"]["id"]}/accept", %{})
+      |> json_response(201)
+
+    assert accepted["session"]["id"] == opened["session"]["id"]
+    assert accepted["session"]["status"] == "open"
+    assert accepted["ack"]["status"] == "accepted"
+    assert accepted["ack"]["message_id"] == opened["message_status"]["message"]["id"]
+    assert accepted["ack"]["delivery_id"] =~ "dlv_"
+    assert accepted["message_status"]["carrier_status"] == "delivered"
+    assert accepted["message_status"]["ack_status"] == "accepted"
+
+    assert [%{"id" => delivery_id, "status" => "delivered", "delivered_at" => delivered_at}] =
+             accepted["message_status"]["deliveries"]
+
+    assert delivery_id == accepted["ack"]["delivery_id"]
+    assert {:ok, _delivered_at, 0} = DateTime.from_iso8601(delivered_at)
+
+    replayed_accept =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("accept-session-by-id")
+      |> post("/api/sessions/#{opened["session"]["id"]}/accept", %{})
+      |> json_response(201)
+
+    assert replayed_accept == accepted
+
+    accepted_send =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("send-after-session-id-accept")
+      |> post("/api/sessions/#{opened["session"]["id"]}/messages", %{
+        "payload" => a2a_agent_text("session-action-reply", "accepted by ID")
+      })
+      |> json_response(201)
+
+    assert accepted_send["session"]["last_sequence"] == 2
+    assert accepted_send["message_status"]["message"]["session_sequence"] == 2
+
+    rejected_open =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-session-action-reject",
+        recipient["address"],
+        a2a_user_text("session-action-reject", "please reject")
+      )
+
+    rejected =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("reject-session-by-id")
+      |> post("/api/sessions/#{rejected_open["session"]["id"]}/reject", %{
+        "payload" => a2a_agent_text("session-action-reject-reason", "not this time")
+      })
+      |> json_response(201)
+
+    assert rejected["session"]["id"] == rejected_open["session"]["id"]
+    assert rejected["session"]["status"] == "rejected"
+    assert rejected["ack"]["status"] == "rejected"
+    assert rejected["ack"]["payload"]["parts"] == [%{"text" => "not this time"}]
+    assert rejected["message_status"]["carrier_status"] == "delivered"
+    assert rejected["message_status"]["ack_status"] == "rejected"
+
+    assert [%{"status" => "delivered", "delivered_at" => rejected_delivered_at}] =
+             rejected["message_status"]["deliveries"]
+
+    assert {:ok, _rejected_delivered_at, 0} = DateTime.from_iso8601(rejected_delivered_at)
+
+    initiator_accept =
+      build_conn()
+      |> authorize(initiator["agent_api_key"]["token"])
+      |> idempotency_key("initiator-cannot-accept-by-id")
+      |> post("/api/sessions/#{rejected_open["session"]["id"]}/accept", %{})
+      |> json_response(404)
+
+    assert error_code(initiator_accept) == "not_found"
+  end
+
+  test "session reads include ordered transcript messages for participants only", %{conn: conn} do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    initiator = register_agent!(account_token, "register-transcript-initiator", %{})
+    recipient = register_agent!(account_token, "register-transcript-recipient", %{})
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-transcript-session",
+        recipient["address"],
+        a2a_user_text("transcript-opening", "opening turn")
+      )
+
+    delivery =
+      claim_inbox!(recipient["agent_api_key"]["token"], "claim-transcript-opening", %{
+        "lease_seconds" => 60
+      })
+
+    ack_delivery!(
+      recipient["agent_api_key"]["token"],
+      delivery["id"],
+      "accept-transcript-opening",
+      %{"status" => "accepted"}
+    )
+
+    recipient_reply =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("transcript-recipient-reply")
+      |> post("/api/sessions/#{opened["session"]["id"]}/messages", %{
+        "payload" => a2a_agent_text("transcript-recipient", "recipient turn")
+      })
+      |> json_response(201)
+
+    initiator_reply =
+      build_conn()
+      |> authorize(initiator["agent_api_key"]["token"])
+      |> idempotency_key("transcript-initiator-reply")
+      |> post("/api/sessions/#{opened["session"]["id"]}/messages", %{
+        "payload" => a2a_user_text("transcript-initiator", "initiator turn")
+      })
+      |> json_response(201)
+
+    transcript =
+      build_conn()
+      |> authorize(initiator["agent_api_key"]["token"])
+      |> get("/api/sessions/#{opened["session"]["id"]}")
+      |> json_response(200)
+
+    assert transcript["session"]["id"] == opened["session"]["id"]
+    assert transcript["session"]["status"] == "open"
+
+    assert Enum.map(transcript["messages"], &get_in(&1, ["message", "session_sequence"])) ==
+             [1, 2, 3]
+
+    assert Enum.map(transcript["messages"], &get_in(&1, ["message", "id"])) == [
+             opened["message_status"]["message"]["id"],
+             recipient_reply["message_status"]["message"]["id"],
+             initiator_reply["message_status"]["message"]["id"]
+           ]
+
+    assert [
+             %{"ack_status" => "accepted"},
+             %{"carrier_status" => "queued"},
+             %{"carrier_status" => "queued"}
+           ] = transcript["messages"]
+
+    recipient_transcript =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> get("/api/sessions/#{opened["session"]["id"]}")
+      |> json_response(200)
+
+    assert Enum.map(recipient_transcript["messages"], &get_in(&1, ["message", "id"])) ==
+             Enum.map(transcript["messages"], &get_in(&1, ["message", "id"]))
+
+    unrelated_account = create_account!(build_conn(), %{"name" => "Unrelated Transcript Network"})
+
+    unrelated_agent =
+      register_agent!(
+        unrelated_account["account_api_key"]["token"],
+        "register-unrelated-transcript-agent",
+        %{}
+      )
+
+    unrelated_read =
+      build_conn()
+      |> authorize(unrelated_agent["agent_api_key"]["token"])
+      |> get("/api/sessions/#{opened["session"]["id"]}")
+      |> json_response(404)
+
+    assert error_code(unrelated_read) == "not_found"
+  end
+
   test "session send responses redact recipient webhook request URLs from senders", %{
     conn: conn
   } do

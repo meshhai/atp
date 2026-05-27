@@ -12,6 +12,7 @@ defmodule Atp.MixProject do
         ignore_modules: [Atp.ConnCase, Atp.DataCase, Atp.Repo, AtpWeb],
         summary: [threshold: 100]
       ],
+      escript: [main_module: Atp.CLI, app: nil],
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps()
@@ -30,7 +31,13 @@ defmodule Atp.MixProject do
 
   def cli do
     [
-      preferred_envs: [precommit: :test]
+      preferred_envs: [
+        precommit: :test,
+        "deps.audit": :test,
+        "deps.unlock": :test,
+        credo: :test,
+        sobelow: :test
+      ]
     ]
   end
 
@@ -45,13 +52,16 @@ defmodule Atp.MixProject do
     [
       {:bandit, "~> 1.5"},
       {:boundary, "~> 0.10", runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ecto_sql, "~> 3.13"},
       {:jason, "~> 1.2"},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:phoenix, "~> 1.8.3"},
       {:phoenix_ecto, "~> 4.5"},
       {:plug_crypto, "~> 2.0"},
       {:postgrex, ">= 0.22.2"},
       {:req, "~> 0.5"},
+      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
       {:tidewave, "~> 0.5", only: :dev}
     ]
   end
@@ -69,9 +79,14 @@ defmodule Atp.MixProject do
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       precommit: [
+        "deps.audit",
+        "deps.unlock --check-unused",
         "compile --warnings-as-errors",
         "format --check-formatted",
+        "cmd bash -n install.sh",
         "test",
+        "credo --strict",
+        "sobelow --root . --ignore Config.CSP --skip --exit Low",
         "xref graph --format cycles --label compile"
       ]
     ]

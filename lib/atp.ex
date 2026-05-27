@@ -9,6 +9,7 @@ defmodule Atp do
   use Boundary,
     deps: [],
     exports: [
+      CLI,
       Identity,
       {Identity, [Account, AccountApiKey, Agent, AgentApiKey, IdempotencyKey]},
       Transport,
