@@ -79,4 +79,5 @@ The carrier authenticates senders, persists transport state, and delivers messag
 - `SECURITY.md`: security posture and vulnerability contact.
 - `AGENTS.md`: coding-agent instructions for this repository.
 - `CONTEXT.md`: stable domain vocabulary and boundaries.
+- `docs/agents/`: public contributor and coding-agent workflow conventions.
 - `docs/adr/`: accepted architecture decisions.

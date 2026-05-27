@@ -2,6 +2,31 @@
 
 ATP is a Phoenix API service for agent-to-agent carrier infrastructure.
 
+## Instruction Sources
+
+- `AGENTS.md` is the canonical coding-agent instruction file for this repository.
+- Keep durable domain language in `CONTEXT.md`.
+- Keep durable architecture decisions in `docs/adr/`.
+- Keep local planning scratch and executable agent skills out of the public repo unless explicitly promoted.
+
+## Agent Skills
+
+### Issue Tracker
+
+Implementation planning uses feature-scoped local planning files under `.scratch/<feature>/`; GitHub is used for PRs. See `docs/agents/issue-tracker.md`.
+
+### Triage Labels
+
+Use canonical status names in `.scratch/<feature>/issues.md`: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain Docs
+
+ATP uses a single-context layout: read `AGENTS.md`, `CONTEXT.md`, and relevant ADRs in `docs/adr/`. See `docs/agents/domain.md`.
+
+### PR Lifecycle
+
+Work on short-lived branches from `main`, target PRs at `main`, and keep `.scratch/` local-only by default. See `docs/agents/pr-lifecycle.md`.
+
 ## Project Guidelines
 
 - Keep ATP product-neutral. ATP modules, APIs, and docs should not depend on downstream product code or product-specific assumptions.
