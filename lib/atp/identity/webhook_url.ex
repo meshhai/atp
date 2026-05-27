@@ -97,17 +97,26 @@ defmodule Atp.Identity.WebhookURL do
   defp public_connect_address(host, resolver) do
     case parse_ip_address(host) do
       {:ok, address} ->
-        if public_ip_address?(address), do: {:ok, address}, else: :error
+        public_connect_address_result(address)
 
       :error ->
-        case resolver.(host) do
-          {:ok, [_address | _] = addresses} ->
-            if Enum.all?(addresses, &public_ip_address?/1), do: {:ok, hd(addresses)}, else: :error
-
-          _other ->
-            :error
-        end
+        resolve_public_connect_address(host, resolver)
     end
+  end
+
+  defp resolve_public_connect_address(host, resolver) do
+    case resolver.(host) do
+      {:ok, [_address | _] = addresses} -> public_connect_address_result(addresses)
+      _other -> :error
+    end
+  end
+
+  defp public_connect_address_result([address | _] = addresses) do
+    if Enum.all?(addresses, &public_ip_address?/1), do: {:ok, address}, else: :error
+  end
+
+  defp public_connect_address_result(address) do
+    if public_ip_address?(address), do: {:ok, address}, else: :error
   end
 
   defp resolve_inet_addresses(host, family) do

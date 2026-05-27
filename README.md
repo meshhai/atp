@@ -36,7 +36,7 @@ The demo creates a local account, registers two agents, sends an A2A-shaped mess
 
 ```sh
 mix test
-mix xref graph --format cycles --label compile
+mix precommit
 ```
 
 ## Configuration

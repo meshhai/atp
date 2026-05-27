@@ -114,26 +114,34 @@ defmodule Atp.Transport.WebhookDelivery do
 
     {:ok, result} =
       Repo.transaction(fn ->
-        case locked_webhook_delivery(delivery_id) do
-          nil ->
-            {:error, :not_found}
-
-          %Delivery{status: status} = delivery when status in ["delivered", "failed"] ->
-            delivery
-
-          %Delivery{status: "leased", leased_until: %DateTime{} = leased_until} = delivery ->
-            if DateTime.compare(leased_until, now) == :gt do
-              {:error, :delivery_in_progress}
-            else
-              lease_delivery!(delivery, dispatch_lease_until)
-            end
-
-          %Delivery{} = delivery ->
-            lease_delivery!(delivery, dispatch_lease_until)
-        end
+        acquire_locked_webhook_delivery(delivery_id, now, dispatch_lease_until)
       end)
 
     result
+  end
+
+  defp acquire_locked_webhook_delivery(delivery_id, now, dispatch_lease_until) do
+    case locked_webhook_delivery(delivery_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Delivery{status: status} = delivery when status in ["delivered", "failed"] ->
+        delivery
+
+      %Delivery{status: "leased", leased_until: %DateTime{} = leased_until} = delivery ->
+        lease_webhook_delivery_or_conflict(delivery, leased_until, now, dispatch_lease_until)
+
+      %Delivery{} = delivery ->
+        lease_delivery!(delivery, dispatch_lease_until)
+    end
+  end
+
+  defp lease_webhook_delivery_or_conflict(delivery, leased_until, now, dispatch_lease_until) do
+    if DateTime.compare(leased_until, now) == :gt do
+      {:error, :delivery_in_progress}
+    else
+      lease_delivery!(delivery, dispatch_lease_until)
+    end
   end
 
   defp locked_webhook_delivery(delivery_id) do

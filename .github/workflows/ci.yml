@@ -38,7 +38,4 @@ jobs:
           otp-version: "27.3"
 
       - run: mix deps.get
-      - run: mix compile --warnings-as-errors
-      - run: mix format --check-formatted
-      - run: mix test
-      - run: mix xref graph --format cycles --label compile
+      - run: mix precommit

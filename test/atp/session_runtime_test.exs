@@ -1639,20 +1639,23 @@ defmodule Atp.SessionRuntimeTest do
   end
 
   defp start_session_lock!(session_id, parent) do
-    task =
-      Task.async(fn ->
-        checked_out_unboxed_repo(fn ->
-          Repo.transaction(fn ->
-            lock_session!(session_id)
-            send(parent, :session_locked)
-            assert_receive :release_session_lock, 5_000
-            :ok
-          end)
-        end)
-      end)
+    task = Task.async(fn -> hold_session_lock!(session_id, parent) end)
 
     assert_receive :session_locked, 5_000
     task
+  end
+
+  defp hold_session_lock!(session_id, parent) do
+    checked_out_unboxed_repo(fn ->
+      Repo.transaction(fn -> wait_with_session_lock!(session_id, parent) end)
+    end)
+  end
+
+  defp wait_with_session_lock!(session_id, parent) do
+    lock_session!(session_id)
+    send(parent, :session_locked)
+    assert_receive :release_session_lock, 5_000
+    :ok
   end
 
   defp lock_session!(session_id) do

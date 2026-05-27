@@ -33,13 +33,17 @@ Run the narrow relevant check first, then broaden.
 Recommended full local gate:
 
 ```sh
-mix format --check-formatted
+mix deps.audit
+mix deps.unlock --check-unused
 mix compile --warnings-as-errors
+mix format --check-formatted
 mix test
+mix credo --strict
+mix sobelow --root . --ignore Config.CSP --exit Low
 mix xref graph --format cycles --label compile
 ```
 
-Run `mix precommit` when available and appropriate. If verification cannot run because dependencies, Postgres, credentials, or services are unavailable, state the exact command attempted and the blocker.
+Run `mix precommit` when available and appropriate. If verification cannot run because dependencies, Postgres, credentials, network access for advisories, or services are unavailable, state the exact command attempted and the blocker.
 
 ## Releases
 

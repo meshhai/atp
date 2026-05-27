@@ -83,13 +83,16 @@ defmodule Atp.ArchitectureTest do
     [
       :bandit,
       :boundary,
+      :credo,
       :ecto_sql,
       :jason,
+      :mix_audit,
       :phoenix,
       :phoenix_ecto,
       :plug_crypto,
       :postgrex,
       :req,
+      :sobelow,
       :tidewave
     ]
   end

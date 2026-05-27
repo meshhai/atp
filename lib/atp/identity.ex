@@ -92,18 +92,22 @@ defmodule Atp.Identity do
     route = "POST /api/agents/#{agent_id}/keys"
 
     Idempotency.run(account, route, idempotency_key, attrs, fn ->
-      case lock_agent(account, agent_id) do
-        %Agent{} = agent ->
-          lock_active_agent_keys!(agent)
-
-          with {:ok, key, token} <- rotate_key(agent) do
-            {:ok, 201, agent_key_response(key, token)}
-          end
-
-        nil ->
-          {:error, :not_found}
-      end
+      rotate_agent_key_for_account(account, agent_id)
     end)
+  end
+
+  defp rotate_agent_key_for_account(%Account{} = account, agent_id) do
+    case lock_agent(account, agent_id) do
+      %Agent{} = agent ->
+        lock_active_agent_keys!(agent)
+
+        with {:ok, key, token} <- rotate_key(agent) do
+          {:ok, 201, agent_key_response(key, token)}
+        end
+
+      nil ->
+        {:error, :not_found}
+    end
   end
 
   @spec configure_webhook_endpoint(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::

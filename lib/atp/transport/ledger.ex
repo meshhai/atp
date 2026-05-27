@@ -43,21 +43,7 @@ defmodule Atp.Transport.Ledger do
         route,
         idempotency_key,
         params,
-        fn ->
-          with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
-               :ok <-
-                 SenderPolicies.enforce_unknown_sender_rate_limit(
-                   sender,
-                   recipient,
-                   trust,
-                   blocked?
-                 ),
-               {:ok, message} <- insert_message(sender, recipient, trust, blocked?, payload),
-               {:ok, webhook_delivery_id} <-
-                 prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
-            {:ok, 201, Response.message_status(message, sender), webhook_delivery_id}
-          end
-        end,
+        fn -> persist_message_send(sender, recipient_address, payload) end,
         fn status, body, webhook_delivery_id ->
           finish_prepared_webhook_delivery(sender, status, body, webhook_delivery_id)
         end
@@ -75,24 +61,7 @@ defmodule Atp.Transport.Ledger do
         route,
         idempotency_key,
         params,
-        fn ->
-          with {:ok, recipient, trust, blocked?} <- fetch_recipient(initiator, recipient_address),
-               :ok <- ensure_distinct_session_participant(initiator, recipient),
-               :ok <-
-                 SenderPolicies.enforce_unknown_sender_rate_limit(
-                   initiator,
-                   recipient,
-                   trust,
-                   blocked?
-                 ),
-               {:ok, session, message} <-
-                 insert_opening_session_message(initiator, recipient, trust, blocked?, payload),
-               {:ok, webhook_delivery_id} <-
-                 prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
-            {:ok, 201, Response.session_message(session, message, initiator),
-             {session.id, webhook_delivery_id}}
-          end
-        end,
+        fn -> persist_session_open(initiator, recipient_address, payload) end,
         fn status, body, commit_value ->
           finish_prepared_session_webhook_delivery(initiator, status, body, commit_value)
         end
@@ -107,6 +76,41 @@ defmodule Atp.Transport.Ledger do
     with {:ok, status, body, prepared} <-
            prepare_session_message_send(sender, session_id, params, idempotency_key, route) do
       finish_prepared_session_message_send(sender, status, body, prepared)
+    end
+  end
+
+  defp persist_message_send(%Agent{} = sender, recipient_address, payload) do
+    with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
+         :ok <-
+           SenderPolicies.enforce_unknown_sender_rate_limit(
+             sender,
+             recipient,
+             trust,
+             blocked?
+           ),
+         {:ok, message} <- insert_message(sender, recipient, trust, blocked?, payload),
+         {:ok, webhook_delivery_id} <-
+           prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
+      {:ok, 201, Response.message_status(message, sender), webhook_delivery_id}
+    end
+  end
+
+  defp persist_session_open(%Agent{} = initiator, recipient_address, payload) do
+    with {:ok, recipient, trust, blocked?} <- fetch_recipient(initiator, recipient_address),
+         :ok <- ensure_distinct_session_participant(initiator, recipient),
+         :ok <-
+           SenderPolicies.enforce_unknown_sender_rate_limit(
+             initiator,
+             recipient,
+             trust,
+             blocked?
+           ),
+         {:ok, session, message} <-
+           insert_opening_session_message(initiator, recipient, trust, blocked?, payload),
+         {:ok, webhook_delivery_id} <-
+           prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
+      {:ok, 201, Response.session_message(session, message, initiator),
+       {session.id, webhook_delivery_id}}
     end
   end
 
@@ -769,31 +773,36 @@ defmodule Atp.Transport.Ledger do
   end
 
   defp append_ack(%Agent{} = agent, delivery_id, ack_status, payload) do
-    Repo.transaction(fn ->
-      now = DateTime.utc_now(:microsecond)
-
-      case fetch_locked_delivery(agent, delivery_id) do
-        nil ->
-          Repo.rollback(:not_found)
-
-        %Delivery{} = delivery ->
-          with :ok <- validate_ack_lease(delivery, now),
-               :ok <- validate_ack_transition(delivery.message.current_ack_status, ack_status),
-               {:ok, opening_session} <- lock_opening_session(delivery.message),
-               :ok <- expire_due_opening_session(opening_session, delivery.message, now),
-               :ok <- validate_opening_session_ack(opening_session, ack_status),
-               {:ok, ack} <- insert_ack(delivery, ack_status, payload),
-               {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
-               {:ok, _session} <-
-                 cache_opening_session_ack_status(opening_session, ack_status, now) do
-            {201, Response.ack(agent, ack, message)}
-          else
-            {:commit_error, reason} -> {:commit_error, reason}
-            {:error, reason} -> Repo.rollback(reason)
-          end
-      end
-    end)
+    Repo.transaction(fn -> append_ack_in_transaction(agent, delivery_id, ack_status, payload) end)
     |> unwrap_transaction_result()
+  end
+
+  defp append_ack_in_transaction(%Agent{} = agent, delivery_id, ack_status, payload) do
+    now = DateTime.utc_now(:microsecond)
+
+    case fetch_locked_delivery(agent, delivery_id) do
+      nil ->
+        Repo.rollback(:not_found)
+
+      %Delivery{} = delivery ->
+        persist_ack(agent, delivery, ack_status, payload, now)
+    end
+  end
+
+  defp persist_ack(%Agent{} = agent, %Delivery{} = delivery, ack_status, payload, now) do
+    with :ok <- validate_ack_lease(delivery, now),
+         :ok <- validate_ack_transition(delivery.message.current_ack_status, ack_status),
+         {:ok, opening_session} <- lock_opening_session(delivery.message),
+         :ok <- expire_due_opening_session(opening_session, delivery.message, now),
+         :ok <- validate_opening_session_ack(opening_session, ack_status),
+         {:ok, ack} <- insert_ack(delivery, ack_status, payload),
+         {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
+         {:ok, _session} <- cache_opening_session_ack_status(opening_session, ack_status, now) do
+      {201, Response.ack(agent, ack, message)}
+    else
+      {:commit_error, reason} -> {:commit_error, reason}
+      {:error, reason} -> Repo.rollback(reason)
+    end
   end
 
   defp fetch_locked_delivery(%Agent{} = agent, delivery_id) do
