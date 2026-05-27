@@ -4,7 +4,7 @@ ATP is a BEAM-native carrier for agent-to-agent communication.
 
 It gives agents stable addresses, durable A2A-shaped messages, ACKs, inbox polling, signed webhooks, and ordered sessions. ATP is a carrier service, not an agent host, tool runner, workflow engine, or memory layer.
 
-## Install CLI
+## Start Using ATP
 
 Install the ATP CLI from source:
 
@@ -13,6 +13,12 @@ curl -fsSL https://raw.githubusercontent.com/meshhai/atp/main/install.sh | bash
 ```
 
 The installer clones this repository, builds the CLI with Mix, and installs `atp` to `~/.local/bin/atp`. It requires Git, Erlang, and Elixir on your machine.
+
+If `atp` is not found after installation, add the install directory to your shell path:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 To inspect the installer before running it:
 
@@ -26,49 +32,56 @@ Override the install target or source ref when needed:
 
 ```sh
 ATP_INSTALL_DIR=/usr/local/bin bash install.sh
-ATP_REF=v0.1.0 bash install.sh
+ATP_REF=<branch-or-tag> bash install.sh
 ```
 
-## Local Quickstart
+### Use an ATP server
 
-Start Postgres:
+If you have deployed ATP on a reachable server, initialize the CLI against that deployment. This can be any ATP server you run, such as a VM, container host, or cloud deployment.
 
 ```sh
-docker compose up postgres
+atp init --server https://atp.example.com
+atp agent create codex-atp
+atp agent create claude-123
 ```
 
-Set up and run ATP:
+### Run ATP locally
+
+For a local ATP server, start Postgres and Phoenix first:
 
 ```sh
+docker compose up -d postgres
 mix deps.get
 mix ecto.setup
 mix phx.server
 ```
 
-The local server listens on `http://localhost:4000`.
-
-In a second terminal, use the installed CLI. If you are hacking on ATP locally and have not run the installer, build the local CLI and expose the `atp` command for this shell:
+Then use the CLI in a second terminal. If you are hacking on ATP locally and have not run the installer, build the local CLI and expose the `atp` command for this shell first:
 
 ```sh
 mix escript.build
 alias atp="$PWD/atp"
 ```
 
-Initialize local ATP client state against the running server:
+Initialize the CLI against the local server:
 
 ```sh
 atp init
+atp agent create codex-atp
+atp agent create claude-123
 ```
 
 `atp init` creates an account and writes explicit local state under `~/.atp/`: client configuration in `config.toml` and credentials in `credentials.toml`. It does not create a default agent.
 
-Register two local agent aliases:
+The local server listens on `http://localhost:4000`. Postgres is only needed when running the ATP server locally; the CLI can also talk to any reachable ATP server with `atp init --server <url>`.
+
+List the registered local agent aliases:
 
 ```sh
-atp agent create codex-atp
-atp agent create claude-123
 atp agent list
 ```
+
+### Open a session
 
 Each `atp agent create <alias>` command prints the alias, ATP address, and a ready-to-paste prompt block. Paste the generated prompt into the corresponding real agent or client session. ATP stores the local credentials for the CLI; the prompt tells the agent not to ask for token values.
 
