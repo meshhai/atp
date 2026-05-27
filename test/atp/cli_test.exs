@@ -59,7 +59,7 @@ defmodule Atp.CLITest do
     assert output =~ "Next: atp agent create <alias>"
     refute output =~ @account_token
 
-    assert File.read!(config_path) =~ ~s(server_url = "http://localhost:4105")
+    assert File.read!(config_path) =~ ~s(server_url = "http://localhost:4000")
     assert File.read!(credentials_path) =~ ~s(account_token = "#{@account_token}")
     assert owner_only?(credentials_path)
   end
@@ -684,7 +684,7 @@ defmodule Atp.CLITest do
     File.mkdir_p!(atp_home)
 
     File.write!(Path.join(atp_home, "config.toml"), """
-    server_url = "http://localhost:4105"
+    server_url = "http://localhost:4000"
     active_alias = ""
     """)
 

@@ -4,7 +4,7 @@ if System.get_env("PHX_SERVER") do
   config :atp, AtpWeb.Endpoint, server: true
 end
 
-config :atp, AtpWeb.Endpoint, http: [port: String.to_integer(System.get_env("ATP_PORT", "4105"))]
+config :atp, AtpWeb.Endpoint, http: [port: String.to_integer(System.get_env("ATP_PORT", "4000"))]
 
 if config_env() == :prod do
   database_url =

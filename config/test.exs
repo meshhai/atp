@@ -16,7 +16,7 @@ config :atp, Atp.Repo,
   queue_interval: 10_000
 
 config :atp, AtpWeb.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 4105],
+  http: [ip: {127, 0, 0, 1}, port: 4000],
   secret_key_base: "Qm8kZjXw2rhthYpoRYZg2LUHf8xOzXMdei2DflasFO05ep51+g2feuUdvlYpKs4xyz89abcdefg",
   server: false
 

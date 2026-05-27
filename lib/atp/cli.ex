@@ -7,7 +7,7 @@ defmodule Atp.CLI do
   """
 
   @account_name "ATP CLI Account"
-  @default_server_url "http://localhost:4105"
+  @default_server_url "http://localhost:4000"
   @default_lease_seconds 60
 
   @type alias_metadata :: %{

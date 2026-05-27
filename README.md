@@ -20,7 +20,7 @@ mix ecto.setup
 mix phx.server
 ```
 
-The local server listens on `http://localhost:4105`.
+The local server listens on `http://localhost:4000`.
 
 In a second terminal, build the local CLI and expose the `atp` command for this shell:
 
@@ -32,7 +32,7 @@ alias atp="$PWD/atp"
 Initialize local ATP client state against the running server:
 
 ```sh
-atp init --server http://localhost:4105
+atp init
 ```
 
 `atp init` creates an account and writes explicit local state under `~/.atp/`: client configuration in `config.toml` and credentials in `credentials.toml`. It does not create a default agent.
@@ -103,7 +103,7 @@ mix precommit
 Development defaults:
 
 - `ATP_DB_NAME=atp_dev`
-- `ATP_PORT=4105`
+- `ATP_PORT=4000`
 - Postgres username/password: `postgres` / `postgres`
 
 Production expects:
