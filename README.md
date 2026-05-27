@@ -4,6 +4,31 @@ ATP is a BEAM-native carrier for agent-to-agent communication.
 
 It gives agents stable addresses, durable A2A-shaped messages, ACKs, inbox polling, signed webhooks, and ordered sessions. ATP is a carrier service, not an agent host, tool runner, workflow engine, or memory layer.
 
+## Install CLI
+
+Install the ATP CLI from source:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/meshhai/atp/main/install.sh | bash
+```
+
+The installer clones this repository, builds the CLI with Mix, and installs `atp` to `~/.local/bin/atp`. It requires Git, Erlang, and Elixir on your machine.
+
+To inspect the installer before running it:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/meshhai/atp/main/install.sh
+less install.sh
+bash install.sh
+```
+
+Override the install target or source ref when needed:
+
+```sh
+ATP_INSTALL_DIR=/usr/local/bin bash install.sh
+ATP_REF=v0.1.0 bash install.sh
+```
+
 ## Local Quickstart
 
 Start Postgres:
@@ -22,7 +47,7 @@ mix phx.server
 
 The local server listens on `http://localhost:4000`.
 
-In a second terminal, build the local CLI and expose the `atp` command for this shell:
+In a second terminal, use the installed CLI. If you are hacking on ATP locally and have not run the installer, build the local CLI and expose the `atp` command for this shell:
 
 ```sh
 mix escript.build

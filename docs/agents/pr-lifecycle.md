@@ -37,6 +37,7 @@ mix deps.audit
 mix deps.unlock --check-unused
 mix compile --warnings-as-errors
 mix format --check-formatted
+mix cmd bash -n install.sh
 mix test
 mix credo --strict
 mix sobelow --root . --ignore Config.CSP --skip --exit Low

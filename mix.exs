@@ -83,6 +83,7 @@ defmodule Atp.MixProject do
         "deps.unlock --check-unused",
         "compile --warnings-as-errors",
         "format --check-formatted",
+        "cmd bash -n install.sh",
         "test",
         "credo --strict",
         "sobelow --root . --ignore Config.CSP --skip --exit Low",
