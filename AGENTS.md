@@ -11,6 +11,12 @@ ATP is a Phoenix API service for agent-to-agent carrier infrastructure.
 - Use `Req` for HTTP.
 - Run `mix precommit` before publishing a change.
 
+## Domain Docs
+
+- Read `CONTEXT.md` for stable ATP vocabulary, product boundaries, and architecture rules.
+- Use `docs/adr/` for durable architecture decisions.
+- Do not commit local planning scratch such as `.agents/` or `.scratch/`.
+
 ## Verification
 
 - `mix format --check-formatted`
