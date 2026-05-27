@@ -235,14 +235,24 @@ defmodule Atp.Transport.Ledger do
   def get_session(%Agent{} = agent, session_id) when is_binary(session_id) do
     case Repo.get(Session, session_id) do
       %Session{} = session when session.initiator_agent_id == agent.id ->
-        {:ok, %{"session" => Response.session(session)}}
+        {:ok, session_transcript_response(session, agent)}
 
       %Session{} = session when session.recipient_agent_id == agent.id ->
-        {:ok, %{"session" => Response.session(session)}}
+        {:ok, session_transcript_response(session, agent)}
 
       _other ->
         {:error, :not_found}
     end
+  end
+
+  defp session_transcript_response(%Session{} = session, %Agent{} = viewer) do
+    messages =
+      Message
+      |> where([message], message.session_id == ^session.id)
+      |> order_by([message], asc: message.session_sequence, asc: message.inserted_at)
+      |> Repo.all()
+
+    Response.session_transcript(session, messages, viewer)
   end
 
   @spec fetch_open_session(String.t()) ::

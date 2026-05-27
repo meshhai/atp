@@ -70,6 +70,8 @@ defmodule Atp.CLI do
   defp dispatch(["session", "accept", session_id]), do: accept_session(session_id)
   defp dispatch(["session", "reject", session_id, reason]), do: reject_session(session_id, reason)
   defp dispatch(["session", "send", session_id, text]), do: send_session_message(session_id, text)
+  defp dispatch(["session", "show", session_id]), do: show_session(session_id)
+  defp dispatch(["session", "watch", session_id]), do: watch_session(session_id)
   defp dispatch(["help"]), do: {:ok, help()}
   defp dispatch(["--help"]), do: {:ok, help()}
   defp dispatch(_args), do: {:error, "unknown command. Run `atp help`."}
@@ -278,6 +280,35 @@ defmodule Atp.CLI do
     end
   end
 
+  defp show_session(session_id) do
+    with {:ok, config, token} <- session_read_context(),
+         {:ok, body} <-
+           get(
+             config.server_url,
+             "/api/sessions/#{session_id}",
+             authorization_headers(token)
+           ) do
+      {:ok, session_show_output(config, body)}
+    end
+  end
+
+  defp watch_session(session_id) do
+    with {:ok, config, token} <- session_read_context() do
+      case poll_session_watch(
+             config,
+             token,
+             session_id,
+             MapSet.new(),
+             false,
+             0,
+             watch_max_polls()
+           ) do
+        :ok -> {:ok, ""}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
   defp post_session_action(session_id, action, body) do
     with {:ok, config} <- read_config(),
          {:ok, credentials} <- read_credentials(),
@@ -293,6 +324,16 @@ defmodule Atp.CLI do
           session_action_idempotency_key(action, session_id)
         )
       )
+    end
+  end
+
+  defp session_read_context do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, alias} <- active_alias(config),
+         {:ok, _metadata} <- fetch_alias(config, alias),
+         {:ok, token} <- fetch_agent_token(credentials, alias) do
+      {:ok, config, token}
     end
   end
 
@@ -314,17 +355,28 @@ defmodule Atp.CLI do
   end
 
   defp post(server_url, path, body, headers \\ []) do
+    request(
+      method: :post,
+      url: endpoint_url(server_url, path),
+      json: body,
+      headers: headers,
+      retry: false
+    )
+  end
+
+  defp get(server_url, path, headers) do
+    request(
+      method: :get,
+      url: endpoint_url(server_url, path),
+      headers: headers,
+      retry: false
+    )
+  end
+
+  defp request(options) do
     {:ok, _started} = Application.ensure_all_started(:req)
 
-    options =
-      [
-        method: :post,
-        url: endpoint_url(server_url, path),
-        json: body,
-        headers: headers,
-        retry: false
-      ]
-      |> Keyword.merge(req_options())
+    options = Keyword.merge(options, req_options())
 
     case Req.request(options) do
       {:ok, %Req.Response{status: status, body: response_body}} when status in 200..299 ->
@@ -394,6 +446,8 @@ defmodule Atp.CLI do
       atp session accept <session-id>
       atp session reject <session-id> "<reason>"
       atp session send <session-id> "<text>"
+      atp session show <session-id>
+      atp session watch <session-id>
     """
   end
 
@@ -472,6 +526,8 @@ defmodule Atp.CLI do
   defp agent_headers(token, idempotency_prefix) do
     agent_headers_with_idempotency_key(token, unique_key(idempotency_prefix))
   end
+
+  defp authorization_headers(token), do: [{"authorization", "Bearer #{token}"}]
 
   defp agent_headers_with_idempotency_key(token, idempotency_key) do
     [
@@ -582,6 +638,165 @@ defmodule Atp.CLI do
     Message: #{message["id"]}
     Delivery: #{first_delivery_id(body) || "none"}
     """
+  end
+
+  defp session_show_output(config, body) do
+    session = Map.get(body, "session", %{})
+    messages = transcript_messages(body)
+
+    """
+    Session: #{session["id"]}
+    Status: #{session["status"]}
+    Initiator: #{format_address(config, session["initiator"])}
+    Recipient: #{format_address(config, session["recipient"])}
+    Last sequence: #{session["last_sequence"]}
+
+    Messages:
+    #{session_transcript_table(config, messages)}
+    """
+  end
+
+  defp session_transcript_table(_config, []), do: "No session messages.\n"
+
+  defp session_transcript_table(config, messages) do
+    session_table_header() <> format_session_rows(config, messages)
+  end
+
+  defp session_table_header, do: "Seq\tTime\tSender\tRecipient\tStatus\tMessage\n"
+
+  defp format_session_rows(config, messages) do
+    messages
+    |> Enum.sort_by(&message_sort_key/1)
+    |> Enum.map_join("", &format_session_row(config, &1))
+  end
+
+  defp format_session_row(config, message_status) do
+    message = Map.get(message_status, "message", %{})
+
+    [
+      table_cell(message["session_sequence"]),
+      table_cell(message["created_at"]),
+      table_cell(table_address(config, message["from"])),
+      table_cell(table_address(config, message["to"])),
+      table_cell(transcript_status(message_status)),
+      table_cell(message_text_preview(message))
+    ]
+    |> Enum.join("\t")
+    |> Kernel.<>("\n")
+  end
+
+  defp poll_session_watch(
+         _config,
+         _token,
+         _session_id,
+         _seen,
+         _printed_header,
+         poll_count,
+         max_polls
+       )
+       when is_integer(max_polls) and poll_count >= max_polls do
+    :ok
+  end
+
+  defp poll_session_watch(config, token, session_id, seen, printed_header, poll_count, max_polls) do
+    case get(config.server_url, "/api/sessions/#{session_id}", authorization_headers(token)) do
+      {:ok, body} ->
+        printed_header = print_watch_header_once(printed_header)
+        {new_messages, seen} = unseen_transcript_messages(body, seen)
+        IO.write(format_session_rows(config, new_messages))
+
+        next_poll_count = poll_count + 1
+
+        if max_poll_reached?(next_poll_count, max_polls) do
+          :ok
+        else
+          sleep_between_watch_polls()
+
+          poll_session_watch(
+            config,
+            token,
+            session_id,
+            seen,
+            printed_header,
+            next_poll_count,
+            max_polls
+          )
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp print_watch_header_once(true), do: true
+
+  defp print_watch_header_once(false) do
+    IO.write(session_table_header())
+    true
+  end
+
+  defp unseen_transcript_messages(body, seen) do
+    body
+    |> transcript_messages()
+    |> Enum.sort_by(&message_sort_key/1)
+    |> Enum.reduce({[], seen}, fn message_status, {messages, seen} ->
+      key = message_key(message_status)
+
+      if MapSet.member?(seen, key) do
+        {messages, seen}
+      else
+        {[message_status | messages], MapSet.put(seen, key)}
+      end
+    end)
+    |> then(fn {messages, seen} -> {Enum.reverse(messages), seen} end)
+  end
+
+  defp transcript_messages(%{"messages" => messages}) when is_list(messages), do: messages
+  defp transcript_messages(_body), do: []
+
+  defp message_sort_key(message_status) do
+    message = Map.get(message_status, "message", %{})
+    {message["session_sequence"] || 0, message["created_at"] || "", message["id"] || ""}
+  end
+
+  defp message_key(message_status) do
+    message = Map.get(message_status, "message", %{})
+    message["session_sequence"] || message["id"] || message_status
+  end
+
+  defp transcript_status(%{"ack_status" => status}) when is_binary(status) and status != "",
+    do: status
+
+  defp transcript_status(%{"carrier_status" => status}) when is_binary(status) and status != "",
+    do: status
+
+  defp transcript_status(_message_status), do: "-"
+
+  defp table_address(config, address) when is_binary(address) do
+    alias_for_address(config, address) || address
+  end
+
+  defp table_address(_config, _address), do: "-"
+
+  defp table_cell(nil), do: "-"
+
+  defp table_cell(value) do
+    value
+    |> to_string()
+    |> String.replace(~r/[\t\r\n]+/, " ")
+    |> String.trim()
+  end
+
+  defp max_poll_reached?(poll_count, max_polls) when is_integer(max_polls),
+    do: poll_count >= max_polls
+
+  defp max_poll_reached?(_poll_count, _max_polls), do: false
+
+  defp sleep_between_watch_polls do
+    case watch_poll_interval_ms() do
+      interval_ms when is_integer(interval_ms) and interval_ms > 0 -> Process.sleep(interval_ms)
+      _zero -> :ok
+    end
   end
 
   defp format_address(config, address) do
@@ -810,5 +1025,17 @@ defmodule Atp.CLI do
     :atp
     |> Application.get_env(__MODULE__, [])
     |> Keyword.get(:req_options, [])
+  end
+
+  defp watch_poll_interval_ms do
+    :atp
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:watch_poll_interval_ms, 1_000)
+  end
+
+  defp watch_max_polls do
+    :atp
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:watch_max_polls, :infinity)
   end
 end

@@ -575,6 +575,76 @@ defmodule Atp.CLITest do
     assert reject_output =~ "ACK: ack_reject"
   end
 
+  test "session show and watch print ordered transcript rows", %{atp_home: atp_home} do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+    end)
+
+    show_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "show", "ses_cli"]) == 0
+      end)
+
+    assert show_output =~ "Session: ses_cli"
+    assert show_output =~ "Status: open"
+    assert show_output =~ "Initiator: codex-atp (atp://agent/agt_codex_atp)"
+    assert show_output =~ "Recipient: claude-123 (atp://agent/agt_claude_123)"
+    assert show_output =~ "Seq\tTime\tSender\tRecipient\tStatus\tMessage"
+    assert show_output =~ "1\t2026-05-27T12:00:00Z\tcodex-atp\tclaude-123\taccepted\topening turn"
+
+    Application.put_env(:atp, Atp.CLI,
+      req_options: [plug: {Req.Test, __MODULE__}],
+      watch_poll_interval_ms: 0,
+      watch_max_polls: 2
+    )
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+    end)
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening"),
+          session_message(2, "msg_reply")
+        ])
+      )
+    end)
+
+    watch_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "watch", "ses_cli"]) == 0
+      end)
+
+    assert watch_output =~ "Seq\tTime\tSender\tRecipient\tStatus\tMessage"
+
+    assert watch_output =~
+             "1\t2026-05-27T12:00:00Z\tcodex-atp\tclaude-123\taccepted\topening turn"
+
+    assert watch_output =~ "2\t2026-05-27T12:01:00Z\tclaude-123\tcodex-atp\tqueued\treply turn"
+
+    assert [_header] = Regex.scan(~r/Seq\tTime\tSender\tRecipient\tStatus\tMessage/, watch_output)
+    assert [] = Regex.scan(~r/msg_opening/, watch_output)
+  end
+
   defp seed_initialized_state!(atp_home) do
     File.mkdir_p!(atp_home)
 
@@ -628,6 +698,67 @@ defmodule Atp.CLITest do
   defp owner_only?(path) do
     {:ok, %{mode: mode}} = File.stat(path)
     Bitwise.band(mode, 0o077) == 0
+  end
+
+  defp session_transcript_response(messages) do
+    %{
+      "session" => %{
+        "id" => "ses_cli",
+        "status" => "open",
+        "initiator" => "atp://agent/agt_codex_atp",
+        "recipient" => "atp://agent/agt_claude_123",
+        "opening_message_id" => "msg_opening",
+        "last_sequence" => length(messages),
+        "created_at" => "2026-05-27T12:00:00Z",
+        "opened_at" => "2026-05-27T12:00:30Z",
+        "terminal_at" => nil
+      },
+      "messages" => messages
+    }
+  end
+
+  defp session_message(1, message_id) do
+    session_message(
+      1,
+      message_id,
+      "atp://agent/agt_codex_atp",
+      "atp://agent/agt_claude_123",
+      "2026-05-27T12:00:00Z",
+      "accepted",
+      "opening turn"
+    )
+  end
+
+  defp session_message(2, message_id) do
+    session_message(
+      2,
+      message_id,
+      "atp://agent/agt_claude_123",
+      "atp://agent/agt_codex_atp",
+      "2026-05-27T12:01:00Z",
+      nil,
+      "reply turn"
+    )
+  end
+
+  defp session_message(sequence, message_id, from, to, created_at, ack_status, text) do
+    %{
+      "message" => %{
+        "id" => message_id,
+        "from" => from,
+        "to" => to,
+        "session_id" => "ses_cli",
+        "session_sequence" => sequence,
+        "created_at" => created_at,
+        "payload" => %{
+          "messageId" => "a2a-#{message_id}",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => text}]
+        }
+      },
+      "carrier_status" => "queued",
+      "ack_status" => ack_status
+    }
   end
 
   defp restore_env(name, nil), do: System.delete_env(name)
