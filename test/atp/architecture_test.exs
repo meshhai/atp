@@ -47,6 +47,8 @@ defmodule Atp.ArchitectureTest do
 
     assert Code.ensure_loaded?(runtime)
     assert function_exported?(runtime, :open_session, 4)
+    assert function_exported?(runtime, :accept_session, 5)
+    assert function_exported?(runtime, :reject_session, 5)
     assert function_exported?(runtime, :send_session_message, 5)
     assert function_exported?(runtime, :get_session, 2)
     assert function_exported?(runtime, :ack_delivery, 5)
@@ -54,11 +56,13 @@ defmodule Atp.ArchitectureTest do
     assert function_exported?(runtime, :list_active_sessions, 0)
 
     assert runtime.__info__(:functions) |> Enum.sort() == [
+             accept_session: 5,
              ack_delivery: 5,
              ensure_session_started: 1,
              get_session: 2,
              list_active_sessions: 0,
              open_session: 4,
+             reject_session: 5,
              send_session_message: 5
            ]
   end

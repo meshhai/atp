@@ -377,6 +377,206 @@ defmodule Atp.CLITest do
     assert output =~ "Delivery: dlv_raw"
   end
 
+  test "session commands open, accept, reject, and send using local aliases", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/sessions"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+      assert [open_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(open_key, "cli-session-open-")
+
+      assert %{
+               "to" => "atp://agent/agt_claude_123",
+               "payload" => %{
+                 "messageId" => opening_message_id,
+                 "role" => "ROLE_USER",
+                 "parts" => [%{"text" => "let's review"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(opening_message_id, "cli-msg-")
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "session" => %{
+          "id" => "ses_cli",
+          "status" => "pending",
+          "initiator" => "atp://agent/agt_codex_atp",
+          "recipient" => "atp://agent/agt_claude_123",
+          "opening_message_id" => "msg_opening",
+          "last_sequence" => 1
+        },
+        "message_status" => %{
+          "message" => %{
+            "id" => "msg_opening",
+            "from" => "atp://agent/agt_codex_atp",
+            "to" => "atp://agent/agt_claude_123",
+            "session_id" => "ses_cli",
+            "session_sequence" => 1,
+            "payload" => %{
+              "messageId" => opening_message_id,
+              "role" => "ROLE_USER",
+              "parts" => [%{"text" => "let's review"}]
+            }
+          },
+          "carrier_status" => "queued",
+          "ack_status" => nil,
+          "deliveries" => [%{"id" => "dlv_opening", "status" => "leased"}]
+        }
+      })
+    end)
+
+    open_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "open", "claude-123", "let's review"]) == 0
+      end)
+
+    assert open_output =~ "Session opened."
+    assert open_output =~ "Sender: codex-atp"
+    assert open_output =~ "Recipient: claude-123"
+    assert open_output =~ "Resolved address: atp://agent/agt_claude_123"
+    assert open_output =~ "Session: ses_cli"
+    assert open_output =~ "Status: pending"
+    assert open_output =~ "Opening message: msg_opening"
+    assert open_output =~ "Opening delivery: dlv_opening"
+
+    seed_active_alias!(atp_home, "claude-123")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/sessions/ses_cli/accept"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+      assert [accept_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(accept_key, "cli-session-accept-")
+      assert Jason.decode!(Req.Test.raw_body(conn)) == %{}
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "session" => %{"id" => "ses_cli", "status" => "open"},
+        "ack" => %{
+          "id" => "ack_accept",
+          "delivery_id" => "dlv_opening",
+          "message_id" => "msg_opening",
+          "status" => "accepted"
+        },
+        "message_status" => %{
+          "message" => %{"id" => "msg_opening"},
+          "ack_status" => "accepted"
+        }
+      })
+    end)
+
+    accept_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "accept", "ses_cli"]) == 0
+      end)
+
+    assert accept_output =~ "Session accepted."
+    assert accept_output =~ "Session: ses_cli"
+    assert accept_output =~ "Status: open"
+    assert accept_output =~ "Opening delivery: dlv_opening"
+    assert accept_output =~ "ACK: ack_accept"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/sessions/ses_cli/messages"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+      assert [send_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(send_key, "cli-session-send-")
+
+      assert %{
+               "payload" => %{
+                 "messageId" => session_message_id,
+                 "role" => "ROLE_USER",
+                 "parts" => [%{"text" => "I see the tradeoff"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(session_message_id, "cli-msg-")
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "session" => %{"id" => "ses_cli", "status" => "open", "last_sequence" => 2},
+        "message_status" => %{
+          "message" => %{
+            "id" => "msg_session_reply",
+            "session_id" => "ses_cli",
+            "session_sequence" => 2
+          },
+          "deliveries" => [%{"id" => "dlv_session_reply", "status" => "leased"}]
+        }
+      })
+    end)
+
+    send_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "send", "ses_cli", "I see the tradeoff"]) == 0
+      end)
+
+    assert send_output =~ "Session message sent."
+    assert send_output =~ "Session: ses_cli"
+    assert send_output =~ "Sequence: 2"
+    assert send_output =~ "Message: msg_session_reply"
+    assert send_output =~ "Delivery: dlv_session_reply"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/sessions/ses_reject/reject"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+      assert [reject_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(reject_key, "cli-session-reject-")
+
+      assert %{
+               "payload" => %{
+                 "messageId" => reject_message_id,
+                 "role" => "ROLE_AGENT",
+                 "contextId" => reject_context_id,
+                 "parts" => [%{"text" => "not this time"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(reject_message_id, "cli-msg-")
+      assert reject_context_id == "ctx_#{reject_message_id}"
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "session" => %{"id" => "ses_reject", "status" => "rejected"},
+        "ack" => %{
+          "id" => "ack_reject",
+          "delivery_id" => "dlv_reject",
+          "message_id" => "msg_reject",
+          "status" => "rejected"
+        },
+        "message_status" => %{
+          "message" => %{"id" => "msg_reject"},
+          "ack_status" => "rejected"
+        }
+      })
+    end)
+
+    reject_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "reject", "ses_reject", "not this time"]) == 0
+      end)
+
+    assert reject_output =~ "Session rejected."
+    assert reject_output =~ "Session: ses_reject"
+    assert reject_output =~ "Status: rejected"
+    assert reject_output =~ "Opening delivery: dlv_reject"
+    assert reject_output =~ "ACK: ack_reject"
+  end
+
   defp seed_initialized_state!(atp_home) do
     File.mkdir_p!(atp_home)
 

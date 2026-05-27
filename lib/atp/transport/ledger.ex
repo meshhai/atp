@@ -69,6 +69,20 @@ defmodule Atp.Transport.Ledger do
     end
   end
 
+  @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          api_result()
+  def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) do
+    ack_session_by_id(recipient, session_id, "accepted", params, idempotency_key, route)
+  end
+
+  @spec reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          api_result()
+  def reject_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) do
+    ack_session_by_id(recipient, session_id, "rejected", params, idempotency_key, route)
+  end
+
   @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
@@ -409,6 +423,26 @@ defmodule Atp.Transport.Ledger do
            {:ok, payload} <- fetch_optional_payload(params),
            :ok <- Payload.validate_optional_a2a(payload) do
         append_ack(agent, delivery_id, ack_status, payload)
+      end
+    end)
+  end
+
+  defp ack_session_by_id(
+         %Agent{} = agent,
+         session_id,
+         ack_status,
+         params,
+         idempotency_key,
+         route
+       ) do
+    agent
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, payload} <- fetch_optional_payload(params),
+           :ok <- Payload.validate_optional_a2a(payload),
+           {:ok, delivery_id} <- ensure_session_action_delivery(agent, session_id),
+           {:ok, status, body} <- append_ack(agent, delivery_id, ack_status, payload),
+           {:ok, body} <- put_session_in_ack_body(agent, session_id, body) do
+        {:ok, status, body}
       end
     end)
   end
@@ -769,6 +803,78 @@ defmodule Atp.Transport.Ledger do
           |> Repo.update!()
 
         {:ok, 200, Response.delivery_claim(updated_delivery, delivery.message)}
+    end
+  end
+
+  defp ensure_session_action_delivery(%Agent{} = agent, session_id) do
+    with {:ok, opening_message_id} <- opening_message_id_for_session_action(agent, session_id) do
+      now = DateTime.utc_now(:microsecond)
+
+      case fetch_ackable_delivery(agent, opening_message_id, now) do
+        %Delivery{id: delivery_id} -> {:ok, delivery_id}
+        nil -> insert_session_action_delivery(agent, opening_message_id, now)
+      end
+    end
+  end
+
+  defp opening_message_id_for_session_action(%Agent{} = agent, session_id) do
+    case Repo.get(Session, session_id) do
+      %Session{recipient_agent_id: agent_id, status: "pending", opening_message_id: message_id}
+      when agent_id == agent.id and is_binary(message_id) ->
+        {:ok, message_id}
+
+      %Session{recipient_agent_id: agent_id} when agent_id == agent.id ->
+        {:error, :invalid_ack_transition}
+
+      _other ->
+        {:error, :not_found}
+    end
+  end
+
+  defp fetch_ackable_delivery(%Agent{} = agent, opening_message_id, now) do
+    Delivery
+    |> where(
+      [delivery],
+      delivery.message_id == ^opening_message_id and delivery.recipient_agent_id == ^agent.id
+    )
+    |> order_by([delivery], desc: delivery.inserted_at)
+    |> Repo.all()
+    |> Enum.find(&ackable_delivery?(&1, now))
+  end
+
+  defp ackable_delivery?(
+         %Delivery{mode: "polling", status: "leased", leased_until: %DateTime{} = leased_until},
+         now
+       ) do
+    DateTime.compare(leased_until, now) == :gt
+  end
+
+  defp ackable_delivery?(%Delivery{mode: "webhook", status: "delivered"}, _now), do: true
+
+  defp ackable_delivery?(%Delivery{}, _now), do: false
+
+  defp insert_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
+    lease_until = DateTime.add(now, @default_lease_seconds, :second)
+
+    %Delivery{id: ID.generate("dlv")}
+    |> Delivery.changeset(%{
+      message_id: opening_message_id,
+      recipient_agent_id: agent.id,
+      mode: "polling",
+      status: "leased",
+      leased_until: lease_until
+    })
+    |> Repo.insert()
+    |> case do
+      {:ok, %Delivery{id: delivery_id}} -> {:ok, delivery_id}
+      {:error, _changeset} -> {:error, :invalid_ack_transition}
+    end
+  end
+
+  defp put_session_in_ack_body(%Agent{} = agent, session_id, body) do
+    case get_session(agent, session_id) do
+      {:ok, %{"session" => session}} -> {:ok, Map.put(body, "session", session)}
+      {:error, reason} -> {:error, reason}
     end
   end
 

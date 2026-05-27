@@ -137,6 +137,93 @@ defmodule Atp.SessionAPITest do
     assert initiator_reply["message_status"]["message"]["to"] == recipient["address"]
   end
 
+  test "recipient can accept or reject a pending session by session ID without a delivery ID", %{
+    conn: conn
+  } do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    initiator = register_agent!(account_token, "register-session-action-initiator", %{})
+    recipient = register_agent!(account_token, "register-session-action-recipient", %{})
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-session-action-accept",
+        recipient["address"],
+        a2a_user_text("session-action-accept", "please accept")
+      )
+
+    accepted =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("accept-session-by-id")
+      |> post("/api/sessions/#{opened["session"]["id"]}/accept", %{})
+      |> json_response(201)
+
+    assert accepted["session"]["id"] == opened["session"]["id"]
+    assert accepted["session"]["status"] == "open"
+    assert accepted["ack"]["status"] == "accepted"
+    assert accepted["ack"]["message_id"] == opened["message_status"]["message"]["id"]
+    assert accepted["ack"]["delivery_id"] =~ "dlv_"
+    assert accepted["message_status"]["ack_status"] == "accepted"
+
+    assert [%{"id" => delivery_id}] = accepted["message_status"]["deliveries"]
+    assert delivery_id == accepted["ack"]["delivery_id"]
+
+    replayed_accept =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("accept-session-by-id")
+      |> post("/api/sessions/#{opened["session"]["id"]}/accept", %{})
+      |> json_response(201)
+
+    assert replayed_accept == accepted
+
+    accepted_send =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("send-after-session-id-accept")
+      |> post("/api/sessions/#{opened["session"]["id"]}/messages", %{
+        "payload" => a2a_agent_text("session-action-reply", "accepted by ID")
+      })
+      |> json_response(201)
+
+    assert accepted_send["session"]["last_sequence"] == 2
+    assert accepted_send["message_status"]["message"]["session_sequence"] == 2
+
+    rejected_open =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-session-action-reject",
+        recipient["address"],
+        a2a_user_text("session-action-reject", "please reject")
+      )
+
+    rejected =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("reject-session-by-id")
+      |> post("/api/sessions/#{rejected_open["session"]["id"]}/reject", %{
+        "payload" => a2a_agent_text("session-action-reject-reason", "not this time")
+      })
+      |> json_response(201)
+
+    assert rejected["session"]["id"] == rejected_open["session"]["id"]
+    assert rejected["session"]["status"] == "rejected"
+    assert rejected["ack"]["status"] == "rejected"
+    assert rejected["ack"]["payload"]["parts"] == [%{"text" => "not this time"}]
+    assert rejected["message_status"]["ack_status"] == "rejected"
+
+    initiator_accept =
+      build_conn()
+      |> authorize(initiator["agent_api_key"]["token"])
+      |> idempotency_key("initiator-cannot-accept-by-id")
+      |> post("/api/sessions/#{rejected_open["session"]["id"]}/accept", %{})
+      |> json_response(404)
+
+    assert error_code(initiator_accept) == "not_found"
+  end
+
   test "session send responses redact recipient webhook request URLs from senders", %{
     conn: conn
   } do

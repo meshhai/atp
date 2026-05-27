@@ -36,6 +36,8 @@ defmodule AtpWeb.Router do
     get("/messages/:id", MessageController, :show)
     post("/sessions", SessionController, :create)
     get("/sessions/:id", SessionController, :show)
+    post("/sessions/:id/accept", SessionController, :accept)
+    post("/sessions/:id/reject", SessionController, :reject)
     post("/sessions/:id/messages", SessionController, :create_message)
     put("/agents/:id/webhook_endpoint", WebhookEndpointController, :update)
     put("/agents/:id/sender_policies", SenderPolicyController, :upsert)

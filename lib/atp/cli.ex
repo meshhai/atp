@@ -66,6 +66,10 @@ defmodule Atp.CLI do
   defp dispatch(["ack", delivery_id, "--completed", text]),
     do: complete_delivery(delivery_id, text)
 
+  defp dispatch(["session", "open", recipient, text]), do: open_session(recipient, text)
+  defp dispatch(["session", "accept", session_id]), do: accept_session(session_id)
+  defp dispatch(["session", "reject", session_id, reason]), do: reject_session(session_id, reason)
+  defp dispatch(["session", "send", session_id, text]), do: send_session_message(session_id, text)
   defp dispatch(["help"]), do: {:ok, help()}
   defp dispatch(["--help"]), do: {:ok, help()}
   defp dispatch(_args), do: {:error, "unknown command. Run `atp help`."}
@@ -222,6 +226,73 @@ defmodule Atp.CLI do
     end
   end
 
+  defp open_session(recipient_input, text) do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, sender_alias} <- active_alias(config),
+         {:ok, sender_metadata} <- fetch_alias(config, sender_alias),
+         {:ok, sender_token} <- fetch_agent_token(credentials, sender_alias),
+         {:ok, recipient} <- resolve_recipient(config, recipient_input),
+         {:ok, body} <-
+           post(
+             config.server_url,
+             "/api/sessions",
+             %{
+               "to" => recipient.address,
+               "payload" => user_text_payload(text)
+             },
+             agent_headers(sender_token, "cli-session-open")
+           ) do
+      {:ok, session_open_output(sender_alias, sender_metadata, recipient, body)}
+    end
+  end
+
+  defp accept_session(session_id) do
+    with {:ok, body} <- post_session_action(session_id, "accept", %{}, "cli-session-accept") do
+      {:ok, session_ack_output("accepted", session_id, body)}
+    end
+  end
+
+  defp reject_session(session_id, reason) do
+    body = %{"payload" => agent_text_payload(reason)}
+
+    with {:ok, body} <- post_session_action(session_id, "reject", body, "cli-session-reject") do
+      {:ok, session_ack_output("rejected", session_id, body)}
+    end
+  end
+
+  defp send_session_message(session_id, text) do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, alias} <- active_alias(config),
+         {:ok, _metadata} <- fetch_alias(config, alias),
+         {:ok, token} <- fetch_agent_token(credentials, alias),
+         {:ok, body} <-
+           post(
+             config.server_url,
+             "/api/sessions/#{session_id}/messages",
+             %{"payload" => user_text_payload(text)},
+             agent_headers(token, "cli-session-send")
+           ) do
+      {:ok, session_message_output(session_id, body)}
+    end
+  end
+
+  defp post_session_action(session_id, action, body, idempotency_prefix) do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, alias} <- active_alias(config),
+         {:ok, _metadata} <- fetch_alias(config, alias),
+         {:ok, token} <- fetch_agent_token(credentials, alias) do
+      post(
+        config.server_url,
+        "/api/sessions/#{session_id}/#{action}",
+        body,
+        agent_headers(token, idempotency_prefix)
+      )
+    end
+  end
+
   defp register_agent(server_url, account_token, alias) do
     headers = [
       {"authorization", "Bearer #{account_token}"},
@@ -316,6 +387,10 @@ defmodule Atp.CLI do
       atp send <alias-or-address> "<text>" [--as <alias>]
       atp inbox
       atp ack <delivery-id> --completed "<text>"
+      atp session open <alias-or-address> "<text>"
+      atp session accept <session-id>
+      atp session reject <session-id> "<reason>"
+      atp session send <session-id> "<text>"
     """
   end
 
@@ -423,6 +498,10 @@ defmodule Atp.CLI do
     Enum.find_value(deliveries, fn delivery -> delivery["id"] end)
   end
 
+  defp first_delivery_id(%{"message_status" => message_status}) when is_map(message_status) do
+    first_delivery_id(message_status)
+  end
+
   defp first_delivery_id(_body), do: nil
 
   defp claimed_delivery(%{"delivery" => nil}), do: nil
@@ -447,6 +526,48 @@ defmodule Atp.CLI do
     Delivery: #{ack["delivery_id"] || delivery_id}
     Message: #{ack["message_id"] || get_in(body, ["message_status", "message", "id"])}
     ACK: #{ack["id"]}
+    """
+  end
+
+  defp session_open_output(sender_alias, sender_metadata, recipient, body) do
+    session = Map.get(body, "session", %{})
+    message = get_in(body, ["message_status", "message"]) || %{}
+
+    """
+    Session opened.
+    Sender: #{format_alias_address(sender_alias, sender_metadata["address"])}
+    Recipient: #{recipient.input}
+    #{resolved_address_line(recipient)}
+    Session: #{session["id"]}
+    Status: #{session["status"]}
+    Opening message: #{session["opening_message_id"] || message["id"]}
+    Opening delivery: #{first_delivery_id(body) || "none"}
+    """
+  end
+
+  defp session_ack_output(status, session_id, body) do
+    session = Map.get(body, "session", %{})
+    ack = Map.get(body, "ack", %{})
+
+    """
+    Session #{status}.
+    Session: #{session["id"] || session_id}
+    Status: #{session["status"]}
+    Opening delivery: #{ack["delivery_id"] || "none"}
+    ACK: #{ack["id"]}
+    """
+  end
+
+  defp session_message_output(session_id, body) do
+    session = Map.get(body, "session", %{})
+    message = get_in(body, ["message_status", "message"]) || %{}
+
+    """
+    Session message sent.
+    Session: #{session["id"] || session_id}
+    Sequence: #{message["session_sequence"] || session["last_sequence"]}
+    Message: #{message["id"]}
+    Delivery: #{first_delivery_id(body) || "none"}
     """
   end
 
