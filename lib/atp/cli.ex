@@ -79,7 +79,7 @@ defmodule Atp.CLI do
   defp init(server_url) do
     server_url = normalize_server_url(server_url)
 
-    with :ok <- ensure_home!(),
+    with :ok <- ensure_home(),
          {:ok, account} <- post(server_url, "/api/accounts", %{"name" => @account_name}) do
       config = %{server_url: server_url, active_alias: nil, aliases: %{}}
 
@@ -90,20 +90,20 @@ defmodule Atp.CLI do
         agents: %{}
       }
 
-      write_config!(config)
-      write_credentials!(credentials)
+      with :ok <- write_config(config),
+           :ok <- write_credentials(credentials) do
+        {:ok,
+         """
+         ATP account initialized.
+         Server: #{server_url}
+         Account: #{account["id"]}
+         Config: #{config_path()}
+         Credentials: #{credentials_path()}
 
-      {:ok,
-       """
-       ATP account initialized.
-       Server: #{server_url}
-       Account: #{account["id"]}
-       Config: #{config_path()}
-       Credentials: #{credentials_path()}
-
-       No default agent was created.
-       Next: atp agent create <alias>
-       """}
+         No default agent was created.
+         Next: atp agent create <alias>
+         """}
+      end
     end
   end
 
@@ -116,10 +116,10 @@ defmodule Atp.CLI do
       updated_config = put_agent_alias(config, alias, agent)
       updated_credentials = put_agent_credentials(credentials, alias, agent)
 
-      write_config!(updated_config)
-      write_credentials!(updated_credentials)
-
-      {:ok, agent_created_output(alias, agent)}
+      with :ok <- write_config(updated_config),
+           :ok <- write_credentials(updated_credentials) do
+        {:ok, agent_created_output(alias, agent)}
+      end
     end
   end
 
@@ -142,11 +142,8 @@ defmodule Atp.CLI do
 
   defp use_alias(alias) do
     with {:ok, config} <- read_config(),
-         {:ok, metadata} <- fetch_alias(config, alias) do
-      config
-      |> Map.put(:active_alias, alias)
-      |> write_config!()
-
+         {:ok, metadata} <- fetch_alias(config, alias),
+         :ok <- config |> Map.put(:active_alias, alias) |> write_config() do
       {:ok,
        """
        Active alias: #{alias}
@@ -556,8 +553,15 @@ defmodule Atp.CLI do
     Recipient: #{recipient.input}
     #{resolved_address_line(recipient)}
     Message: #{get_in(body, ["message", "id"])}
-    Delivery: #{first_delivery_id(body) || "none"}
+    #{send_delivery_line(body)}
     """
+  end
+
+  defp send_delivery_line(body) do
+    case first_delivery_id(body) do
+      nil -> "Delivery: none yet (polling recipient should run `atp inbox`)"
+      delivery_id -> "Delivery: #{delivery_id}"
+    end
   end
 
   defp resolved_address_line(%{alias: nil, address: address}), do: "Recipient address: #{address}"
@@ -835,10 +839,15 @@ defmodule Atp.CLI do
   end
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp ensure_home! do
-    File.mkdir_p!(atp_home())
-    File.chmod(atp_home(), 0o700)
-    :ok
+  defp ensure_home do
+    case file_result(File.mkdir_p(atp_home()), "create", atp_home()) do
+      :ok ->
+        File.chmod(atp_home(), 0o700)
+        |> file_result("set owner-only permissions on", atp_home())
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp read_config do
@@ -880,23 +889,48 @@ defmodule Atp.CLI do
   end
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp write_config!(config) do
-    ensure_home!()
-
-    config
-    |> render_config()
-    |> then(&File.write!(config_path(), &1))
+  defp write_config(config) do
+    with :ok <- ensure_home() do
+      config_path()
+      |> File.write(render_config(config))
+      |> file_result("write", config_path())
+    end
   end
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp write_credentials!(credentials) do
-    ensure_home!()
+  defp write_credentials(credentials) do
+    with :ok <- ensure_home() do
+      write_owner_only_file(credentials_path(), render_credentials(credentials))
+    end
+  end
 
-    credentials
-    |> render_credentials()
-    |> then(&File.write!(credentials_path(), &1))
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_owner_only_file(path, content) do
+    temporary_path = "#{path}.tmp-#{unique_suffix()}"
 
-    File.chmod(credentials_path(), 0o600)
+    result =
+      with :ok <-
+             file_result(File.write(temporary_path, "", [:exclusive]), "create", temporary_path),
+           :ok <- set_owner_only_permissions(temporary_path),
+           :ok <- file_result(File.write(temporary_path, content), "write", temporary_path) do
+        File.rename(temporary_path, path)
+        |> file_result("replace", path)
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        File.rm(temporary_path)
+        error
+    end
+  end
+
+  defp set_owner_only_permissions(path) do
+    path
+    |> credential_chmod(0o600)
+    |> file_result("set owner-only permissions on", path)
   end
 
   defp render_config(config) do
@@ -1019,6 +1053,22 @@ defmodule Atp.CLI do
 
   defp atp_home do
     System.get_env("ATP_HOME") || Path.join(System.user_home!(), ".atp")
+  end
+
+  defp file_result(:ok, _action, _path), do: :ok
+
+  defp file_result({:error, reason}, action, path) do
+    {:error, "could not #{action} #{path}: #{:file.format_error(reason)}"}
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp credential_chmod(path, mode) do
+    chmod =
+      :atp
+      |> Application.get_env(__MODULE__, [])
+      |> Keyword.get(:credential_chmod, &File.chmod/2)
+
+    chmod.(path, mode)
   end
 
   defp req_options do

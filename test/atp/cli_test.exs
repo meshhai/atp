@@ -68,6 +68,7 @@ defmodule Atp.CLITest do
     atp_home: atp_home
   } do
     seed_initialized_state!(atp_home)
+    File.chmod!(Path.join(atp_home, "credentials.toml"), 0o644)
 
     Req.Test.expect(__MODULE__, fn conn ->
       assert conn.method == "POST"
@@ -108,6 +109,46 @@ defmodule Atp.CLITest do
     assert config =~ ~s(address = "atp://agent/agt_codex")
     assert credentials =~ ~s([agents."codex-atp"])
     assert credentials =~ ~s(agent_token = "#{@agent_token}")
+    assert owner_only?(Path.join(atp_home, "credentials.toml"))
+  end
+
+  test "agent create fails closed when credential permissions cannot be set", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+
+    Application.put_env(:atp, Atp.CLI,
+      req_options: [plug: {Req.Test, __MODULE__}],
+      credential_chmod: fn _path, 0o600 -> {:error, :eperm} end
+    )
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/agents"
+
+      Req.Test.json(conn, %{
+        "id" => "agt_codex",
+        "address" => "atp://agent/agt_codex",
+        "display_name" => "codex-atp",
+        "description" => "ATP CLI local alias codex-atp",
+        "active_agent_key_id" => "agtkey_codex",
+        "agent_api_key" => %{
+          "id" => "agtkey_codex",
+          "token" => @agent_token
+        }
+      })
+    end)
+
+    stderr =
+      capture_io(:stderr, fn ->
+        assert Atp.CLI.run(["agent", "create", "codex-atp"]) == 1
+      end)
+
+    credentials = File.read!(Path.join(atp_home, "credentials.toml"))
+
+    assert stderr =~ "could not set owner-only permissions"
+    refute credentials =~ @agent_token
+    refute Enum.any?(File.ls!(atp_home), &String.contains?(&1, ".tmp-"))
   end
 
   test "agent list, use, and whoami work from local config", %{atp_home: atp_home} do
@@ -173,9 +214,7 @@ defmodule Atp.CLITest do
         "carrier_status" => "queued",
         "ack_status" => nil,
         "terminal_at" => nil,
-        "deliveries" => [
-          %{"id" => "dlv_cli_send", "status" => "pending"}
-        ]
+        "deliveries" => []
       })
     end)
 
@@ -188,7 +227,7 @@ defmodule Atp.CLITest do
     assert send_output =~ "Recipient: claude-123"
     assert send_output =~ "Resolved address: atp://agent/agt_claude_123"
     assert send_output =~ "Message: msg_cli_send"
-    assert send_output =~ "Delivery: dlv_cli_send"
+    assert send_output =~ "Delivery: none yet (polling recipient should run `atp inbox`)"
 
     Req.Test.expect(__MODULE__, fn conn ->
       assert conn.method == "POST"
@@ -223,9 +262,7 @@ defmodule Atp.CLITest do
         "carrier_status" => "queued",
         "ack_status" => nil,
         "terminal_at" => nil,
-        "deliveries" => [
-          %{"id" => "dlv_override", "status" => "pending"}
-        ]
+        "deliveries" => []
       })
     end)
 
@@ -360,9 +397,7 @@ defmodule Atp.CLITest do
         "carrier_status" => "queued",
         "ack_status" => nil,
         "terminal_at" => nil,
-        "deliveries" => [
-          %{"id" => "dlv_raw", "status" => "pending"}
-        ]
+        "deliveries" => []
       })
     end)
 
@@ -374,7 +409,7 @@ defmodule Atp.CLITest do
     assert output =~ "Recipient: atp://agent/agt_external"
     assert output =~ "Recipient address: atp://agent/agt_external"
     assert output =~ "Message: msg_raw"
-    assert output =~ "Delivery: dlv_raw"
+    assert output =~ "Delivery: none yet (polling recipient should run `atp inbox`)"
   end
 
   test "session commands open, accept, reject, and send using local aliases", %{
