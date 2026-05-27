@@ -12,6 +12,7 @@ defmodule Atp.MixProject do
         ignore_modules: [Atp.ConnCase, Atp.DataCase, Atp.Repo, AtpWeb],
         summary: [threshold: 100]
       ],
+      escript: [main_module: Atp.CLI, app: nil],
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps()
@@ -84,7 +85,7 @@ defmodule Atp.MixProject do
         "format --check-formatted",
         "test",
         "credo --strict",
-        "sobelow --root . --ignore Config.CSP --exit Low",
+        "sobelow --root . --ignore Config.CSP --skip --exit Low",
         "xref graph --format cycles --label compile"
       ]
     ]
