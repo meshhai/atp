@@ -8,6 +8,7 @@ defmodule Atp.CLI do
 
   @account_name "ATP CLI Account"
   @default_server_url "http://localhost:4105"
+  @default_lease_seconds 60
 
   @type alias_metadata :: %{
           required(String.t()) => String.t()
@@ -52,6 +53,19 @@ defmodule Atp.CLI do
   defp dispatch(["agent", "list"]), do: list_agents()
   defp dispatch(["use", alias]), do: use_alias(alias)
   defp dispatch(["whoami"]), do: whoami()
+  defp dispatch(["send", recipient, text]), do: send_message(recipient, text, nil)
+
+  defp dispatch(["send", recipient, text, "--as", alias]),
+    do: send_message(recipient, text, alias)
+
+  defp dispatch(["send", "--as", alias, recipient, text]),
+    do: send_message(recipient, text, alias)
+
+  defp dispatch(["inbox"]), do: claim_inbox()
+
+  defp dispatch(["ack", delivery_id, "--completed", text]),
+    do: complete_delivery(delivery_id, text)
+
   defp dispatch(["help"]), do: {:ok, help()}
   defp dispatch(["--help"]), do: {:ok, help()}
   defp dispatch(_args), do: {:error, "unknown command. Run `atp help`."}
@@ -147,6 +161,67 @@ defmodule Atp.CLI do
     end
   end
 
+  defp send_message(recipient_input, text, alias_override) do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, sender_alias} <- selected_alias(config, alias_override),
+         {:ok, sender_metadata} <- fetch_alias(config, sender_alias),
+         {:ok, sender_token} <- fetch_agent_token(credentials, sender_alias),
+         {:ok, recipient} <- resolve_recipient(config, recipient_input),
+         {:ok, body} <-
+           post(
+             config.server_url,
+             "/api/messages",
+             %{
+               "to" => recipient.address,
+               "payload" => user_text_payload(text)
+             },
+             agent_headers(sender_token, "cli-send")
+           ) do
+      {:ok, send_output(sender_alias, sender_metadata, recipient, body)}
+    end
+  end
+
+  defp claim_inbox do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, alias} <- active_alias(config),
+         {:ok, _metadata} <- fetch_alias(config, alias),
+         {:ok, token} <- fetch_agent_token(credentials, alias),
+         {:ok, body} <-
+           post(
+             config.server_url,
+             "/api/inbox/claims",
+             %{"lease_seconds" => @default_lease_seconds},
+             agent_headers(token, "cli-inbox")
+           ) do
+      case claimed_delivery(body) do
+        nil -> {:ok, "No pending deliveries.\n"}
+        delivery -> {:ok, inbox_output(config, delivery)}
+      end
+    end
+  end
+
+  defp complete_delivery(delivery_id, text) do
+    with {:ok, config} <- read_config(),
+         {:ok, credentials} <- read_credentials(),
+         {:ok, alias} <- active_alias(config),
+         {:ok, _metadata} <- fetch_alias(config, alias),
+         {:ok, token} <- fetch_agent_token(credentials, alias),
+         {:ok, body} <-
+           post(
+             config.server_url,
+             "/api/deliveries/#{delivery_id}/acks",
+             %{
+               "status" => "completed",
+               "payload" => agent_text_payload(text)
+             },
+             agent_headers(token, "cli-ack")
+           ) do
+      {:ok, ack_output(delivery_id, body)}
+    end
+  end
+
   defp register_agent(server_url, account_token, alias) do
     headers = [
       {"authorization", "Bearer #{account_token}"},
@@ -238,6 +313,9 @@ defmodule Atp.CLI do
       atp agent list
       atp use <alias>
       atp whoami
+      atp send <alias-or-address> "<text>" [--as <alias>]
+      atp inbox
+      atp ack <delivery-id> --completed "<text>"
     """
   end
 
@@ -246,6 +324,16 @@ defmodule Atp.CLI do
   end
 
   defp fetch_account_token(_credentials), do: {:error, "run `atp init` before creating agents"}
+
+  defp fetch_agent_token(%{agents: agents}, alias) do
+    case get_in(agents, [alias, "agent_token"]) do
+      token when is_binary(token) and token != "" ->
+        {:ok, token}
+
+      _missing ->
+        {:error, "no stored credentials for alias #{alias}. Run `atp agent create #{alias}`."}
+    end
+  end
 
   defp fetch_alias(%{aliases: aliases}, alias) do
     case Map.fetch(aliases, alias) do
@@ -258,6 +346,136 @@ defmodule Atp.CLI do
     do: {:ok, alias}
 
   defp active_alias(_config), do: {:error, "no active alias. Run `atp use <alias>`."}
+
+  defp selected_alias(config, nil), do: active_alias(config)
+  defp selected_alias(_config, alias), do: {:ok, alias}
+
+  defp resolve_recipient(%{aliases: aliases}, recipient_input) do
+    recipient_input = String.trim(recipient_input)
+
+    cond do
+      Map.has_key?(aliases, recipient_input) ->
+        {:ok,
+         %{
+           input: recipient_input,
+           alias: recipient_input,
+           address: get_in(aliases, [recipient_input, "address"])
+         }}
+
+      String.starts_with?(recipient_input, "atp://agent/") ->
+        {:ok, %{input: recipient_input, alias: nil, address: recipient_input}}
+
+      true ->
+        {:error,
+         "unknown recipient #{recipient_input}. Use a local alias or atp://agent/... address."}
+    end
+  end
+
+  defp user_text_payload(text), do: text_payload("ROLE_USER", text)
+
+  defp agent_text_payload(text) do
+    message_id = cli_message_id()
+
+    "ROLE_AGENT"
+    |> text_payload(text, message_id)
+    |> Map.put("contextId", "ctx_#{message_id}")
+  end
+
+  defp text_payload(role, text), do: text_payload(role, text, cli_message_id())
+
+  defp text_payload(role, text, message_id) do
+    %{
+      "messageId" => message_id,
+      "role" => role,
+      "parts" => [%{"text" => text}]
+    }
+  end
+
+  defp agent_headers(token, idempotency_prefix) do
+    [
+      {"authorization", "Bearer #{token}"},
+      {"idempotency-key", unique_key(idempotency_prefix)}
+    ]
+  end
+
+  defp unique_key(prefix), do: "#{prefix}-#{unique_suffix()}"
+  defp cli_message_id, do: unique_key("cli-msg")
+
+  defp unique_suffix do
+    "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
+  end
+
+  defp send_output(sender_alias, sender_metadata, recipient, body) do
+    """
+    Message sent.
+    Sender: #{format_alias_address(sender_alias, sender_metadata["address"])}
+    Recipient: #{recipient.input}
+    #{resolved_address_line(recipient)}
+    Message: #{get_in(body, ["message", "id"])}
+    Delivery: #{first_delivery_id(body) || "none"}
+    """
+  end
+
+  defp resolved_address_line(%{alias: nil, address: address}), do: "Recipient address: #{address}"
+  defp resolved_address_line(%{address: address}), do: "Resolved address: #{address}"
+
+  defp first_delivery_id(%{"deliveries" => deliveries}) when is_list(deliveries) do
+    Enum.find_value(deliveries, fn delivery -> delivery["id"] end)
+  end
+
+  defp first_delivery_id(_body), do: nil
+
+  defp claimed_delivery(%{"delivery" => nil}), do: nil
+  defp claimed_delivery(%{"delivery" => delivery}) when is_map(delivery), do: delivery
+  defp claimed_delivery(%{"id" => _id} = delivery), do: delivery
+
+  defp inbox_output(config, %{"message" => message} = delivery) do
+    """
+    Delivery: #{delivery["id"]}
+    Sender: #{format_address(config, message["from"])}
+    Message: #{message["id"]}
+    Timestamp: #{message["created_at"]}
+    Text: #{message_text_preview(message)}
+    """
+  end
+
+  defp ack_output(delivery_id, body) do
+    ack = Map.get(body, "ack", %{})
+
+    """
+    ACK completed.
+    Delivery: #{ack["delivery_id"] || delivery_id}
+    Message: #{ack["message_id"] || get_in(body, ["message_status", "message", "id"])}
+    ACK: #{ack["id"]}
+    """
+  end
+
+  defp format_address(config, address) do
+    case alias_for_address(config, address) do
+      nil -> address
+      alias -> format_alias_address(alias, address)
+    end
+  end
+
+  defp format_alias_address(alias, address), do: "#{alias} (#{address})"
+
+  defp alias_for_address(%{aliases: aliases}, address) do
+    Enum.find_value(aliases, fn {alias, metadata} ->
+      if metadata["address"] == address, do: alias
+    end)
+  end
+
+  defp message_text_preview(%{"payload" => %{"parts" => parts}}) when is_list(parts) do
+    parts
+    |> Enum.find_value("non-text payload", fn
+      %{"text" => text} when is_binary(text) -> text
+      _part -> nil
+    end)
+    |> String.replace(~r/\s+/, " ")
+    |> String.slice(0, 120)
+  end
+
+  defp message_text_preview(_message), do: "non-text payload"
 
   defp validate_alias(alias) do
     if Regex.match?(~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/, alias) do

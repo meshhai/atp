@@ -130,6 +130,253 @@ defmodule Atp.CLITest do
     assert whoami_output =~ "Address: atp://agent/agt_codex_atp"
   end
 
+  test "send, inbox, and completed ACK use aliases and stored agent credentials", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/messages"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+      assert [send_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(send_key, "cli-send-")
+
+      assert %{
+               "to" => "atp://agent/agt_claude_123",
+               "payload" => %{
+                 "messageId" => send_message_id,
+                 "role" => "ROLE_USER",
+                 "parts" => [%{"text" => "hello from codex"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(send_message_id, "cli-msg-")
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "message" => %{
+          "id" => "msg_cli_send",
+          "from" => "atp://agent/agt_codex_atp",
+          "to" => "atp://agent/agt_claude_123",
+          "created_at" => "2026-05-27T12:00:00Z",
+          "payload" => %{
+            "messageId" => send_message_id,
+            "role" => "ROLE_USER",
+            "parts" => [%{"text" => "hello from codex"}]
+          }
+        },
+        "carrier_status" => "queued",
+        "ack_status" => nil,
+        "terminal_at" => nil,
+        "deliveries" => [
+          %{"id" => "dlv_cli_send", "status" => "pending"}
+        ]
+      })
+    end)
+
+    send_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["send", "claude-123", "hello from codex"]) == 0
+      end)
+
+    assert send_output =~ "Sender: codex-atp"
+    assert send_output =~ "Recipient: claude-123"
+    assert send_output =~ "Resolved address: atp://agent/agt_claude_123"
+    assert send_output =~ "Message: msg_cli_send"
+    assert send_output =~ "Delivery: dlv_cli_send"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/messages"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+
+      assert %{
+               "to" => "atp://agent/agt_codex_atp",
+               "payload" => %{
+                 "messageId" => send_message_id,
+                 "role" => "ROLE_USER",
+                 "parts" => [%{"text" => "override sender"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(send_message_id, "cli-msg-")
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "message" => %{
+          "id" => "msg_override",
+          "from" => "atp://agent/agt_claude_123",
+          "to" => "atp://agent/agt_codex_atp",
+          "created_at" => "2026-05-27T12:01:00Z",
+          "payload" => %{
+            "messageId" => send_message_id,
+            "role" => "ROLE_USER",
+            "parts" => [%{"text" => "override sender"}]
+          }
+        },
+        "carrier_status" => "queued",
+        "ack_status" => nil,
+        "terminal_at" => nil,
+        "deliveries" => [
+          %{"id" => "dlv_override", "status" => "pending"}
+        ]
+      })
+    end)
+
+    override_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["send", "codex-atp", "override sender", "--as", "claude-123"]) == 0
+      end)
+
+    assert override_output =~ "Sender: claude-123"
+    assert override_output =~ "Message: msg_override"
+
+    seed_active_alias!(atp_home, "claude-123")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/inbox/claims"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+      assert [claim_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(claim_key, "cli-inbox-")
+      assert Jason.decode!(Req.Test.raw_body(conn)) == %{"lease_seconds" => 60}
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "id" => "dlv_claimed",
+        "leased_until" => "2026-05-27T12:05:00Z",
+        "message" => %{
+          "id" => "msg_claimed",
+          "from" => "atp://agent/agt_codex_atp",
+          "to" => "atp://agent/agt_claude_123",
+          "created_at" => "2026-05-27T12:02:00Z",
+          "payload" => %{
+            "messageId" => "cli-inbox-message",
+            "role" => "ROLE_USER",
+            "parts" => [%{"text" => "please review"}]
+          }
+        }
+      })
+    end)
+
+    inbox_output = capture_io(fn -> assert Atp.CLI.run(["inbox"]) == 0 end)
+
+    assert inbox_output =~ "Delivery: dlv_claimed"
+    assert inbox_output =~ "Sender: codex-atp (atp://agent/agt_codex_atp)"
+    assert inbox_output =~ "Message: msg_claimed"
+    assert inbox_output =~ "Timestamp: 2026-05-27T12:02:00Z"
+    assert inbox_output =~ "Text: please review"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/deliveries/dlv_claimed/acks"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+      assert [ack_key] = get_req_header(conn, "idempotency-key")
+      assert String.starts_with?(ack_key, "cli-ack-")
+
+      assert %{
+               "status" => "completed",
+               "payload" => %{
+                 "messageId" => ack_message_id,
+                 "role" => "ROLE_AGENT",
+                 "contextId" => context_id,
+                 "parts" => [%{"text" => "done reviewing"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(ack_message_id, "cli-msg-")
+      assert context_id == "ctx_#{ack_message_id}"
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "ack" => %{
+          "id" => "ack_completed",
+          "delivery_id" => "dlv_claimed",
+          "message_id" => "msg_claimed",
+          "status" => "completed"
+        },
+        "message_status" => %{
+          "message" => %{"id" => "msg_claimed"},
+          "ack_status" => "completed",
+          "carrier_status" => "delivered"
+        }
+      })
+    end)
+
+    ack_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["ack", "dlv_claimed", "--completed", "done reviewing"]) == 0
+      end)
+
+    assert ack_output =~ "ACK completed."
+    assert ack_output =~ "Delivery: dlv_claimed"
+    assert ack_output =~ "Message: msg_claimed"
+    assert ack_output =~ "ACK: ack_completed"
+  end
+
+  test "send accepts a raw ATP address recipient", %{atp_home: atp_home} do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/api/messages"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      assert %{
+               "to" => "atp://agent/agt_external",
+               "payload" => %{
+                 "messageId" => send_message_id,
+                 "role" => "ROLE_USER",
+                 "parts" => [%{"text" => "hello raw"}]
+               }
+             } = Jason.decode!(Req.Test.raw_body(conn))
+
+      assert String.starts_with?(send_message_id, "cli-msg-")
+
+      conn
+      |> put_status(201)
+      |> Req.Test.json(%{
+        "message" => %{
+          "id" => "msg_raw",
+          "from" => "atp://agent/agt_codex_atp",
+          "to" => "atp://agent/agt_external",
+          "created_at" => "2026-05-27T12:03:00Z",
+          "payload" => %{
+            "messageId" => send_message_id,
+            "role" => "ROLE_USER",
+            "parts" => [%{"text" => "hello raw"}]
+          }
+        },
+        "carrier_status" => "queued",
+        "ack_status" => nil,
+        "terminal_at" => nil,
+        "deliveries" => [
+          %{"id" => "dlv_raw", "status" => "pending"}
+        ]
+      })
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["send", "atp://agent/agt_external", "hello raw"]) == 0
+      end)
+
+    assert output =~ "Recipient: atp://agent/agt_external"
+    assert output =~ "Recipient address: atp://agent/agt_external"
+    assert output =~ "Message: msg_raw"
+    assert output =~ "Delivery: dlv_raw"
+  end
+
   defp seed_initialized_state!(atp_home) do
     File.mkdir_p!(atp_home)
 
@@ -169,6 +416,15 @@ defmodule Atp.CLITest do
     """)
 
     File.chmod!(credentials_path, 0o600)
+  end
+
+  defp seed_active_alias!(atp_home, alias) do
+    config_path = Path.join(atp_home, "config.toml")
+
+    config_path
+    |> File.read!()
+    |> String.replace(~r/^active_alias = ".*"$/m, ~s(active_alias = "#{alias}"))
+    |> then(&File.write!(config_path, &1))
   end
 
   defp owner_only?(path) do
