@@ -248,15 +248,15 @@ defmodule Atp.CLI do
   end
 
   defp accept_session(session_id) do
-    with {:ok, body} <- post_session_action(session_id, "accept", %{}, "cli-session-accept") do
+    with {:ok, body} <- post_session_action(session_id, "accept", %{}) do
       {:ok, session_ack_output("accepted", session_id, body)}
     end
   end
 
   defp reject_session(session_id, reason) do
-    body = %{"payload" => agent_text_payload(reason)}
+    body = %{"payload" => agent_text_payload(reason, session_reject_message_id(session_id))}
 
-    with {:ok, body} <- post_session_action(session_id, "reject", body, "cli-session-reject") do
+    with {:ok, body} <- post_session_action(session_id, "reject", body) do
       {:ok, session_ack_output("rejected", session_id, body)}
     end
   end
@@ -278,7 +278,7 @@ defmodule Atp.CLI do
     end
   end
 
-  defp post_session_action(session_id, action, body, idempotency_prefix) do
+  defp post_session_action(session_id, action, body) do
     with {:ok, config} <- read_config(),
          {:ok, credentials} <- read_credentials(),
          {:ok, alias} <- active_alias(config),
@@ -288,7 +288,10 @@ defmodule Atp.CLI do
         config.server_url,
         "/api/sessions/#{session_id}/#{action}",
         body,
-        agent_headers(token, idempotency_prefix)
+        agent_headers_with_idempotency_key(
+          token,
+          session_action_idempotency_key(action, session_id)
+        )
       )
     end
   end
@@ -448,9 +451,9 @@ defmodule Atp.CLI do
 
   defp user_text_payload(text), do: text_payload("ROLE_USER", text)
 
-  defp agent_text_payload(text) do
-    message_id = cli_message_id()
+  defp agent_text_payload(text), do: agent_text_payload(text, cli_message_id())
 
+  defp agent_text_payload(text, message_id) do
     "ROLE_AGENT"
     |> text_payload(text, message_id)
     |> Map.put("contextId", "ctx_#{message_id}")
@@ -467,11 +470,21 @@ defmodule Atp.CLI do
   end
 
   defp agent_headers(token, idempotency_prefix) do
+    agent_headers_with_idempotency_key(token, unique_key(idempotency_prefix))
+  end
+
+  defp agent_headers_with_idempotency_key(token, idempotency_key) do
     [
       {"authorization", "Bearer #{token}"},
-      {"idempotency-key", unique_key(idempotency_prefix)}
+      {"idempotency-key", idempotency_key}
     ]
   end
+
+  defp session_action_idempotency_key(action, session_id) do
+    "cli-session-#{action}-#{session_id}"
+  end
+
+  defp session_reject_message_id(session_id), do: "cli-msg-session-reject-#{session_id}"
 
   defp unique_key(prefix), do: "#{prefix}-#{unique_suffix()}"
   defp cli_message_id, do: unique_key("cli-msg")

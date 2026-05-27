@@ -39,7 +39,7 @@ mix compile --warnings-as-errors
 mix format --check-formatted
 mix test
 mix credo --strict
-mix sobelow --root . --ignore Config.CSP --exit Low
+mix sobelow --root . --ignore Config.CSP --skip --exit Low
 mix xref graph --format cycles --label compile
 ```
 

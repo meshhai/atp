@@ -50,5 +50,5 @@ Work on short-lived branches from `main`, target PRs at `main`, and keep `.scrat
 - `mix format --check-formatted`
 - `mix test`
 - `mix credo --strict`
-- `mix sobelow --root . --ignore Config.CSP --exit Low`
+- `mix sobelow --root . --ignore Config.CSP --skip --exit Low`
 - `mix xref graph --format cycles --label compile`

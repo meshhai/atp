@@ -454,8 +454,7 @@ defmodule Atp.CLITest do
       assert conn.method == "POST"
       assert conn.request_path == "/api/sessions/ses_cli/accept"
       assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
-      assert [accept_key] = get_req_header(conn, "idempotency-key")
-      assert String.starts_with?(accept_key, "cli-session-accept-")
+      assert get_req_header(conn, "idempotency-key") == ["cli-session-accept-ses_cli"]
       assert Jason.decode!(Req.Test.raw_body(conn)) == %{}
 
       conn
@@ -533,8 +532,7 @@ defmodule Atp.CLITest do
       assert conn.method == "POST"
       assert conn.request_path == "/api/sessions/ses_reject/reject"
       assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
-      assert [reject_key] = get_req_header(conn, "idempotency-key")
-      assert String.starts_with?(reject_key, "cli-session-reject-")
+      assert get_req_header(conn, "idempotency-key") == ["cli-session-reject-ses_reject"]
 
       assert %{
                "payload" => %{
@@ -545,7 +543,7 @@ defmodule Atp.CLITest do
                }
              } = Jason.decode!(Req.Test.raw_body(conn))
 
-      assert String.starts_with?(reject_message_id, "cli-msg-")
+      assert reject_message_id == "cli-msg-session-reject-ses_reject"
       assert reject_context_id == "ctx_#{reject_message_id}"
 
       conn

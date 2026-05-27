@@ -165,10 +165,14 @@ defmodule Atp.SessionAPITest do
     assert accepted["ack"]["status"] == "accepted"
     assert accepted["ack"]["message_id"] == opened["message_status"]["message"]["id"]
     assert accepted["ack"]["delivery_id"] =~ "dlv_"
+    assert accepted["message_status"]["carrier_status"] == "delivered"
     assert accepted["message_status"]["ack_status"] == "accepted"
 
-    assert [%{"id" => delivery_id}] = accepted["message_status"]["deliveries"]
+    assert [%{"id" => delivery_id, "status" => "delivered", "delivered_at" => delivered_at}] =
+             accepted["message_status"]["deliveries"]
+
     assert delivery_id == accepted["ack"]["delivery_id"]
+    assert {:ok, _delivered_at, 0} = DateTime.from_iso8601(delivered_at)
 
     replayed_accept =
       build_conn()
@@ -212,7 +216,13 @@ defmodule Atp.SessionAPITest do
     assert rejected["session"]["status"] == "rejected"
     assert rejected["ack"]["status"] == "rejected"
     assert rejected["ack"]["payload"]["parts"] == [%{"text" => "not this time"}]
+    assert rejected["message_status"]["carrier_status"] == "delivered"
     assert rejected["message_status"]["ack_status"] == "rejected"
+
+    assert [%{"status" => "delivered", "delivered_at" => rejected_delivered_at}] =
+             rejected["message_status"]["deliveries"]
+
+    assert {:ok, _rejected_delivered_at, 0} = DateTime.from_iso8601(rejected_delivered_at)
 
     initiator_accept =
       build_conn()

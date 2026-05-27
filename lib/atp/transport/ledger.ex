@@ -901,6 +901,7 @@ defmodule Atp.Transport.Ledger do
          {:ok, opening_session} <- lock_opening_session(delivery.message),
          :ok <- expire_due_opening_session(opening_session, delivery.message, now),
          :ok <- validate_opening_session_ack(opening_session, ack_status),
+         {:ok, delivery} <- mark_acked_delivery_delivered(delivery, now),
          {:ok, ack} <- insert_ack(delivery, ack_status, payload),
          {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
          {:ok, _session} <- cache_opening_session_ack_status(opening_session, ack_status, now) do
@@ -910,6 +911,14 @@ defmodule Atp.Transport.Ledger do
       {:error, reason} -> Repo.rollback(reason)
     end
   end
+
+  defp mark_acked_delivery_delivered(%Delivery{mode: "polling", status: "leased"} = delivery, now) do
+    delivery
+    |> Ecto.Changeset.change(status: "delivered", delivered_at: now)
+    |> Repo.update()
+  end
+
+  defp mark_acked_delivery_delivered(%Delivery{} = delivery, _now), do: {:ok, delivery}
 
   defp fetch_locked_delivery(%Agent{} = agent, delivery_id) do
     Delivery
@@ -1013,11 +1022,19 @@ defmodule Atp.Transport.Ledger do
   defp cache_ack_status(%Message{} = message, ack_status, now) do
     message
     |> Ecto.Changeset.change(
+      carrier_status: delivered_carrier_status(message),
       current_ack_status: ack_status,
       terminal_at: terminal_ack_timestamp(ack_status, now)
     )
     |> Repo.update()
   end
+
+  defp delivered_carrier_status(%Message{carrier_status: status})
+       when status in ~w(queued delivery_failed) do
+    "delivered"
+  end
+
+  defp delivered_carrier_status(%Message{carrier_status: status}), do: status
 
   defp terminal_ack_timestamp(status, now) when status in @terminal_ack_statuses, do: now
   defp terminal_ack_timestamp(_status, _now), do: nil
