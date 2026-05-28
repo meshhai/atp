@@ -114,7 +114,7 @@ defmodule Atp.Transport.DeliveryClaims do
       %Delivery{} = delivery ->
         case claim_or_terminalize_webhook_delivery!(delivery, now, lease_seconds) do
           %DeliveryClaim{} = claim -> claim
-          %Message{} -> claim_next_due_webhook_delivery!(now, lease_seconds)
+          %Message{} -> nil
         end
     end
   end

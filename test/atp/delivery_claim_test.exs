@@ -287,6 +287,41 @@ defmodule Atp.DeliveryClaimTest do
     assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
   end
 
+  test "bounds terminal cleanup to one due webhook row per claim call", %{conn: conn} do
+    {terminal_delivery, _terminal_message, _terminal_agent, terminal_recipient} =
+      prepare_due_webhook_delivery_context!(conn, "bounded-terminal-cleanup")
+
+    polling_delivery =
+      claim_inbox!(
+        terminal_recipient["agent_api_key"]["token"],
+        "claim-bounded-terminal-cleanup",
+        %{"lease_seconds" => 60}
+      )
+
+    ack_delivery!(
+      terminal_recipient["agent_api_key"]["token"],
+      polling_delivery["id"],
+      "ack-bounded-terminal-cleanup",
+      %{"status" => "accepted"}
+    )
+
+    {claimable_delivery, _claimable_message, _claimable_agent} =
+      prepare_due_webhook_delivery!(conn, "bounded-terminal-next")
+
+    assert {:ok, nil} = Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    assert Repo.get!(Delivery, terminal_delivery.id).status == "failed"
+
+    persisted_claimable = Repo.get!(Delivery, claimable_delivery.id)
+    assert persisted_claimable.status == "retry_scheduled"
+    assert is_nil(persisted_claimable.claim_token)
+
+    assert {:ok, %DeliveryClaim{} = claim} =
+             Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    assert claim.delivery.id == claimable_delivery.id
+  end
+
   test "does not claim expired webhook messages and terminalizes their delivery", %{conn: conn} do
     {delivery, message, _recipient_agent} =
       prepare_due_webhook_delivery!(conn, "expired-terminal-claim")
