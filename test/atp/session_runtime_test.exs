@@ -26,6 +26,23 @@ defmodule Atp.SessionRuntimeTest do
   test "ATP application starts the session runtime registry and supervisor" do
     assert is_pid(Process.whereis(@session_registry))
     assert is_pid(Process.whereis(@session_supervisor))
+    assert is_pid(Process.whereis(Atp.Transport.WebhookDispatcher.TaskSupervisor))
+    assert is_pid(Process.whereis(Atp.Transport.WebhookDispatcher))
+  end
+
+  test "ATP application restarts the webhook dispatcher" do
+    old_dispatcher = Process.whereis(Atp.Transport.WebhookDispatcher)
+    assert is_pid(old_dispatcher)
+
+    dispatcher_ref = Process.monitor(old_dispatcher)
+    Process.exit(old_dispatcher, :kill)
+
+    assert_receive {:DOWN, ^dispatcher_ref, :process, ^old_dispatcher, :killed}, 500
+
+    assert eventually(fn ->
+             new_dispatcher = Process.whereis(Atp.Transport.WebhookDispatcher)
+             is_pid(new_dispatcher) and new_dispatcher != old_dispatcher
+           end)
   end
 
   test "disabled agent tokens are rejected before agent routes or runtime startup", %{conn: conn} do
@@ -1760,6 +1777,19 @@ defmodule Atp.SessionRuntimeTest do
       end
     end)
   end
+
+  defp eventually(fun, attempts \\ 20)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(25)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 
   defp register_session_agents!(conn, key) do
     account = create_account!(conn)

@@ -67,6 +67,32 @@ defmodule Atp.Transport.WebhookDelivery do
     {:ok, deliver_due_claims(limit)}
   end
 
+  @doc false
+  @spec deliver_claim(DeliveryClaim.t()) :: delivery_result()
+  def deliver_claim(
+        %DeliveryClaim{
+          delivery: %Delivery{} = delivery,
+          message: %Message{} = message,
+          recipient_agent: %Agent{} = recipient
+        } = claim
+      ) do
+    now = DateTime.utc_now(:microsecond)
+
+    cond do
+      delivery.status in ["delivered", "failed"] ->
+        {:ok, message}
+
+      acked?(message) ->
+        stop_delivery_after_ack!(claim)
+
+      DateTime.compare(message.expires_at, now) != :gt ->
+        expire_delivery!(claim, now)
+
+      true ->
+        attempt_delivery(claim, recipient, now)
+    end
+  end
+
   defp deliver_due_claims(limit) when is_integer(limit) and limit > 0 do
     claim_due_claims(limit, [])
   end
@@ -85,30 +111,6 @@ defmodule Atp.Transport.WebhookDelivery do
 
       {:error, reason} ->
         Enum.reverse([{:error, reason} | results])
-    end
-  end
-
-  defp deliver_claim(
-         %DeliveryClaim{
-           delivery: %Delivery{} = delivery,
-           message: %Message{} = message,
-           recipient_agent: %Agent{} = recipient
-         } = claim
-       ) do
-    now = DateTime.utc_now(:microsecond)
-
-    cond do
-      delivery.status in ["delivered", "failed"] ->
-        {:ok, message}
-
-      acked?(message) ->
-        stop_delivery_after_ack!(claim)
-
-      DateTime.compare(message.expires_at, now) != :gt ->
-        expire_delivery!(claim, now)
-
-      true ->
-        attempt_delivery(claim, recipient, now)
     end
   end
 

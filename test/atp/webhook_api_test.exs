@@ -1126,6 +1126,80 @@ defmodule Atp.WebhookAPITest do
     assert_delivered_delivery!(delivery_id)
   end
 
+  test "webhook dispatcher bounds concurrent durable delivery attempts", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      send(test_pid, {:bounded_dispatch_started, headers["atp-delivery-id"], self()})
+
+      receive do
+        :release_bounded_dispatch -> Plug.Conn.send_resp(request_conn, 204, "")
+      after
+        1_000 -> raise "timed out waiting to release bounded dispatcher webhook"
+      end
+    end)
+
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-bounded-dispatch-sender", %{})
+    recipient = register_agent!(account_token, "register-bounded-dispatch-recipient", %{})
+    configure_webhook!(recipient, "configure-bounded-dispatch-recipient")
+
+    first_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "bounded-dispatch-first",
+        a2a_user_text("bounded-dispatch-first", "first bounded dispatch")
+      )
+
+    second_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "bounded-dispatch-second",
+        a2a_user_text("bounded-dispatch-second", "second bounded dispatch")
+      )
+
+    third_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "bounded-dispatch-third",
+        a2a_user_text("bounded-dispatch-third", "third bounded dispatch")
+      )
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 3,
+         concurrency: 2,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    Sandbox.allow(Atp.Repo, self(), dispatcher)
+    Req.Test.allow(WebhookDelivery, self(), dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    assert_receive {:bounded_dispatch_started, ^first_id, first_worker}
+    assert_receive {:bounded_dispatch_started, ^second_id, second_worker}
+    refute_receive {:bounded_dispatch_started, ^third_id, _worker}, 100
+
+    send(first_worker, :release_bounded_dispatch)
+    assert_receive {:bounded_dispatch_started, ^third_id, third_worker}
+
+    send(second_worker, :release_bounded_dispatch)
+    send(third_worker, :release_bounded_dispatch)
+
+    assert_delivered_delivery!(first_id)
+    assert_delivered_delivery!(second_id)
+    assert_delivered_delivery!(third_id)
+  end
+
   test "disabled webhook dispatcher ignores dispatch ticks" do
     name = :atp_disabled_webhook_dispatcher_test
     pid = start_supervised!({WebhookDispatcher, enabled: false, name: name})
@@ -1229,6 +1303,11 @@ defmodule Atp.WebhookAPITest do
   end
 
   defp assert_delivered_delivery!(delivery_id) do
+    assert eventually(fn ->
+             delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
+             delivery.status == "delivered"
+           end)
+
     delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
 
     assert delivery.status == "delivered"
@@ -1237,4 +1316,17 @@ defmodule Atp.WebhookAPITest do
     assert is_nil(delivery.leased_until)
     assert delivery.attempt_count == 1
   end
+
+  defp eventually(fun, attempts \\ 20)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(25)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 end

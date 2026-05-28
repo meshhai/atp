@@ -8,6 +8,11 @@ defmodule Atp.Application do
     children = [
       Atp.Repo,
       Atp.Transport.Runtime.Supervisor,
+      %{
+        id: Atp.Transport.WebhookDispatcher.TaskSupervisor,
+        start:
+          {Task.Supervisor, :start_link, [[name: Atp.Transport.WebhookDispatcher.TaskSupervisor]]}
+      },
       Atp.Transport.WebhookDispatcher,
       AtpWeb.Endpoint
     ]
