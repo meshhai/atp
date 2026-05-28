@@ -12,8 +12,11 @@ defmodule Atp.Transport.DeliveryClaims do
 
   @spec claim_webhook_delivery(String.t(), keyword()) ::
           {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
-  def claim_webhook_delivery(delivery_id, opts \\ [])
-      when is_binary(delivery_id) and is_list(opts) do
+  def claim_webhook_delivery(delivery_id) when is_binary(delivery_id) do
+    claim_webhook_delivery(delivery_id, [])
+  end
+
+  def claim_webhook_delivery(delivery_id, opts) when is_binary(delivery_id) and is_list(opts) do
     lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
@@ -33,7 +36,11 @@ defmodule Atp.Transport.DeliveryClaims do
   end
 
   @spec claim_due_webhook_delivery(keyword()) :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
-  def claim_due_webhook_delivery(opts \\ []) when is_list(opts) do
+  def claim_due_webhook_delivery do
+    claim_due_webhook_delivery([])
+  end
+
+  def claim_due_webhook_delivery(opts) when is_list(opts) do
     lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 

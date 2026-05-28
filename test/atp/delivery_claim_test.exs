@@ -32,6 +32,24 @@ defmodule Atp.DeliveryClaimTest do
     assert persisted.attempt_count == 0
   end
 
+  test "claims webhook deliveries with default leases", %{conn: conn} do
+    {direct_delivery, _direct_message, _direct_agent} =
+      prepare_due_webhook_delivery!(conn, "default-direct-claim")
+
+    assert {:ok, %DeliveryClaim{} = direct_claim} =
+             Transport.DeliveryClaims.claim_webhook_delivery(direct_delivery.id)
+
+    assert direct_claim.delivery.id == direct_delivery.id
+
+    {due_delivery, _due_message, _due_agent} =
+      prepare_due_webhook_delivery!(conn, "default-due-claim")
+
+    assert {:ok, %DeliveryClaim{} = due_claim} =
+             Transport.DeliveryClaims.claim_due_webhook_delivery()
+
+    assert due_claim.delivery.id == due_delivery.id
+  end
+
   test "concurrent due webhook claimers cannot receive the same delivery", %{conn: conn} do
     {delivery, _message, _recipient_agent} = prepare_due_webhook_delivery!(conn, "claim-race")
 
@@ -194,6 +212,45 @@ defmodule Atp.DeliveryClaimTest do
     end
   end
 
+  test "rejects terminalization for stale claimed webhook deliveries", %{conn: conn} do
+    stale_cases = [
+      {"missing-delivery",
+       fn claim -> %{claim | delivery: %{claim.delivery | id: "dlv_missing"}} end},
+      {"nil-lease",
+       fn claim ->
+         claim.delivery
+         |> Ecto.Changeset.change(leased_until: nil)
+         |> Repo.update!()
+
+         claim
+       end},
+      {"not-acked", fn claim -> claim end}
+    ]
+
+    for {stale_case, stale_claim} <- stale_cases do
+      {_delivery, message, _recipient_agent} =
+        prepare_due_webhook_delivery!(conn, "stale-terminalize-#{stale_case}")
+
+      assert {:ok, %DeliveryClaim{} = claim} =
+               Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+      delivery_id = claim.delivery.id
+      claim = stale_claim.(claim)
+      original_delivery = Repo.get!(Delivery, delivery_id)
+      original_message = Repo.get!(Message, message.id)
+
+      assert {:error, :stale_delivery_claim} =
+               Transport.DeliveryClaims.terminalize_claimed_webhook_delivery(
+                 claim,
+                 :message_acked
+               )
+
+      assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
+      assert Repo.get!(Delivery, original_delivery.id) == original_delivery
+      assert Repo.get!(Message, original_message.id) == original_message
+    end
+  end
+
   test "rejects stale claimed webhook expiry without durable writes", %{conn: conn} do
     {delivery, message, _recipient_agent} =
       prepare_due_webhook_delivery!(conn, "stale-claimed-expiry")
@@ -228,6 +285,63 @@ defmodule Atp.DeliveryClaimTest do
     assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
     assert Repo.get!(Delivery, delivery.id) == original_delivery
     assert Repo.get!(Message, message.id) == original_message
+  end
+
+  test "terminalizes claimed webhook deliveries after ACK or expiry", %{conn: conn} do
+    {acked_delivery, acked_message, _acked_agent, _acked_recipient} =
+      prepare_due_webhook_delivery_context!(conn, "claimed-acked-terminal")
+
+    assert {:ok, %DeliveryClaim{} = acked_claim} =
+             Transport.claim_webhook_delivery(acked_delivery.id, lease_seconds: 90)
+
+    acked_message
+    |> Ecto.Changeset.change(current_ack_status: "accepted")
+    |> Repo.update!()
+
+    assert {:ok, %Message{} = terminal_acked_message} =
+             WebhookDelivery.deliver_claim(%{
+               acked_claim
+               | message: %{acked_claim.message | current_ack_status: "accepted"}
+             })
+
+    assert terminal_acked_message.id == acked_message.id
+
+    persisted_acked_delivery = Repo.get!(Delivery, acked_delivery.id)
+
+    assert persisted_acked_delivery.status == "failed"
+    assert persisted_acked_delivery.last_error == "message_acked"
+    assert is_nil(persisted_acked_delivery.claim_token)
+    assert is_nil(persisted_acked_delivery.claimed_at)
+    assert is_nil(persisted_acked_delivery.leased_until)
+
+    {expired_delivery, expired_message, _expired_agent} =
+      prepare_due_webhook_delivery!(conn, "claimed-expired-terminal")
+
+    assert {:ok, %DeliveryClaim{} = expired_claim} =
+             Transport.claim_webhook_delivery(expired_delivery.id, lease_seconds: 90)
+
+    expired_at = DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
+
+    expired_message
+    |> Ecto.Changeset.change(expires_at: expired_at)
+    |> Repo.update!()
+
+    assert {:ok, %Message{} = terminal_expired_message} =
+             WebhookDelivery.deliver_claim(%{
+               expired_claim
+               | message: %{expired_claim.message | expires_at: expired_at}
+             })
+
+    assert terminal_expired_message.id == expired_message.id
+    assert terminal_expired_message.carrier_status == "expired"
+
+    persisted_expired_delivery = Repo.get!(Delivery, expired_delivery.id)
+
+    assert persisted_expired_delivery.status == "failed"
+    assert persisted_expired_delivery.last_error == "message_expired"
+    assert is_nil(persisted_expired_delivery.claim_token)
+    assert is_nil(persisted_expired_delivery.claimed_at)
+    assert is_nil(persisted_expired_delivery.leased_until)
   end
 
   test "does not claim delivered or failed webhook deliveries", %{conn: conn} do

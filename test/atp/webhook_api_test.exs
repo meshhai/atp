@@ -1088,6 +1088,11 @@ defmodule Atp.WebhookAPITest do
     assert WebhookDelivery.deliver_due(limit: 0) == {:ok, []}
   end
 
+  test "due webhook delivery recovery surfaces claim errors" do
+    assert WebhookDelivery.deliver_due(limit: 1, lease_seconds: 0) ==
+             {:ok, [{:error, :invalid_lease}]}
+  end
+
   test "webhook dispatcher drains durable due delivery rows", %{conn: conn} do
     test_pid = self()
 

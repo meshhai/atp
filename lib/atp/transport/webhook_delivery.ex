@@ -63,8 +63,9 @@ defmodule Atp.Transport.WebhookDelivery do
   @spec deliver_due(keyword()) :: {:ok, [delivery_result()]}
   def deliver_due(opts) do
     limit = Keyword.get(opts, :limit, 50)
+    lease_seconds = Keyword.get(opts, :lease_seconds, @dispatch_lease_seconds)
 
-    {:ok, deliver_due_claims(limit)}
+    {:ok, deliver_due_claims(limit, lease_seconds)}
   end
 
   @doc false
@@ -93,21 +94,21 @@ defmodule Atp.Transport.WebhookDelivery do
     end
   end
 
-  defp deliver_due_claims(limit) when is_integer(limit) and limit > 0 do
-    claim_due_claims(limit, [])
+  defp deliver_due_claims(limit, lease_seconds) when is_integer(limit) and limit > 0 do
+    claim_due_claims(limit, [], lease_seconds)
   end
 
-  defp deliver_due_claims(_limit), do: []
+  defp deliver_due_claims(_limit, _lease_seconds), do: []
 
-  defp claim_due_claims(0, results), do: Enum.reverse(results)
+  defp claim_due_claims(0, results, _lease_seconds), do: Enum.reverse(results)
 
-  defp claim_due_claims(remaining, results) do
-    case DeliveryClaims.claim_due_webhook_delivery(lease_seconds: @dispatch_lease_seconds) do
+  defp claim_due_claims(remaining, results, lease_seconds) do
+    case DeliveryClaims.claim_due_webhook_delivery(lease_seconds: lease_seconds) do
       {:ok, nil} ->
         Enum.reverse(results)
 
       {:ok, %DeliveryClaim{} = claim} ->
-        claim_due_claims(remaining - 1, [deliver_claim(claim) | results])
+        claim_due_claims(remaining - 1, [deliver_claim(claim) | results], lease_seconds)
 
       {:error, reason} ->
         Enum.reverse([{:error, reason} | results])
