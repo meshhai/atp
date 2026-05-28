@@ -26,23 +26,6 @@ defmodule Atp.SessionRuntimeTest do
   test "ATP application starts the session runtime registry and supervisor" do
     assert is_pid(Process.whereis(@session_registry))
     assert is_pid(Process.whereis(@session_supervisor))
-    assert is_pid(Process.whereis(Atp.Transport.WebhookDispatcher.TaskSupervisor))
-    assert is_pid(Process.whereis(Atp.Transport.WebhookDispatcher))
-  end
-
-  test "ATP application restarts the webhook dispatcher" do
-    old_dispatcher = Process.whereis(Atp.Transport.WebhookDispatcher)
-    assert is_pid(old_dispatcher)
-
-    dispatcher_ref = Process.monitor(old_dispatcher)
-    Process.exit(old_dispatcher, :kill)
-
-    assert_receive {:DOWN, ^dispatcher_ref, :process, ^old_dispatcher, :killed}, 500
-
-    assert eventually(fn ->
-             new_dispatcher = Process.whereis(Atp.Transport.WebhookDispatcher)
-             is_pid(new_dispatcher) and new_dispatcher != old_dispatcher
-           end)
   end
 
   test "disabled agent tokens are rejected before agent routes or runtime startup", %{conn: conn} do
@@ -976,7 +959,7 @@ defmodule Atp.SessionRuntimeTest do
     assert %SessionState{session_id: ^session_id, last_sequence: 2} = :sys.get_state(pid)
   end
 
-  test "dispatcher session webhook delivery sees committed session state", %{
+  test "session webhook dispatch happens outside the session server call path", %{
     conn: conn
   } do
     %{initiator: initiator, recipient: recipient, session: session} =
@@ -1015,18 +998,12 @@ defmodule Atp.SessionRuntimeTest do
       })
       |> json_response(201)
 
-    assert reply["session"]["last_sequence"] == 2
-    assert reply["message_status"]["carrier_status"] == "queued"
-    assert [delivery] = reply["message_status"]["deliveries"]
-    refute_receive {:session_webhook_read, _in_transaction?, _last_sequence}, 100
-
-    dispatch_webhooks!()
-
     assert_receive {:session_webhook_read, false, 2}, 500
-    assert_delivered_delivery!(delivery["id"])
+    assert reply["session"]["last_sequence"] == 2
+    assert reply["message_status"]["carrier_status"] == "delivered"
   end
 
-  test "concurrent trusted session sends queue webhook delivery work", %{
+  test "concurrent trusted session webhook dispatch preserves session sequence order", %{
     conn: conn
   } do
     %{initiator: initiator, recipient: recipient, session: session} =
@@ -1065,7 +1042,10 @@ defmodule Atp.SessionRuntimeTest do
         "first ordered webhook"
       )
 
+    Req.Test.allow(WebhookDelivery, self(), first_task.pid)
     send(first_task.pid, :send_session_message)
+
+    assert_receive {:session_webhook_started, 2}, 500
 
     second_task =
       session_message_task(
@@ -1075,23 +1055,18 @@ defmodule Atp.SessionRuntimeTest do
         "second ordered webhook"
       )
 
+    Req.Test.allow(WebhookDelivery, self(), second_task.pid)
     send(second_task.pid, :send_session_message)
+
+    refute_receive {:session_webhook_started, 3}, 100
+    send(first_task.pid, :release_first_session_webhook)
+    assert_receive {:session_webhook_started, 3}, 500
 
     first_reply = Task.await(first_task, 5_000)
     second_reply = Task.await(second_task, 5_000)
 
-    refute_receive {:session_webhook_started, _sequence}, 100
-
     assert get_in(first_reply, ["message_status", "message", "session_sequence"]) == 2
     assert get_in(second_reply, ["message_status", "message", "session_sequence"]) == 3
-    assert get_in(first_reply, ["message_status", "carrier_status"]) == "queued"
-    assert get_in(second_reply, ["message_status", "carrier_status"]) == "queued"
-
-    assert [%{"status" => "retry_scheduled", "attempts" => []}] =
-             get_in(first_reply, ["message_status", "deliveries"])
-
-    assert [%{"status" => "retry_scheduled", "attempts" => []}] =
-             get_in(second_reply, ["message_status", "deliveries"])
   end
 
   test "webhook dispatcher does not bypass session sequence order while earlier webhook is in progress",
@@ -1113,7 +1088,7 @@ defmodule Atp.SessionRuntimeTest do
       {:ok, raw_body, read_conn} = Plug.Conn.read_body(request_conn)
       sequence = raw_body |> Jason.decode!() |> get_in(["message", "session_sequence"])
 
-      send(test_pid, {:dispatcher_order_webhook_started, sequence, self()})
+      send(test_pid, {:dispatcher_order_webhook_started, sequence})
 
       if sequence == 2 do
         receive do
@@ -1134,7 +1109,10 @@ defmodule Atp.SessionRuntimeTest do
         "first dispatcher ordered webhook"
       )
 
+    Req.Test.allow(WebhookDelivery, self(), first_task.pid)
     send(first_task.pid, :send_session_message)
+
+    assert_receive {:dispatcher_order_webhook_started, 2}, 500
 
     second_task =
       session_message_task(
@@ -1144,33 +1122,33 @@ defmodule Atp.SessionRuntimeTest do
         "second dispatcher ordered webhook"
       )
 
+    Req.Test.allow(WebhookDelivery, self(), second_task.pid)
     send(second_task.pid, :send_session_message)
+
+    assert %Delivery{status: "retry_scheduled"} =
+             assert_session_webhook_delivery!(session_id, 3)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true, dispatch_on_start?: false, batch_size: 10, interval_ms: 60_000, name: nil}
+      )
+
+    Sandbox.allow(Atp.Repo, self(), dispatcher)
+    Req.Test.allow(WebhookDelivery, self(), dispatcher)
+    send(dispatcher, :dispatch_due)
+    _state = :sys.get_state(dispatcher)
+
+    refute_receive {:dispatcher_order_webhook_started, 3}, 100
+
+    send(first_task.pid, :release_first_dispatcher_order_webhook)
+    assert_receive {:dispatcher_order_webhook_started, 3}, 500
 
     first_reply = Task.await(first_task, 5_000)
     second_reply = Task.await(second_task, 5_000)
 
     assert get_in(first_reply, ["message_status", "message", "session_sequence"]) == 2
     assert get_in(second_reply, ["message_status", "message", "session_sequence"]) == 3
-
-    assert %Delivery{status: "retry_scheduled", id: first_delivery_id} =
-             assert_session_webhook_delivery!(session_id, 2)
-
-    assert %Delivery{status: "retry_scheduled", id: second_delivery_id} =
-             assert_session_webhook_delivery!(session_id, 3)
-
-    dispatch_webhooks!(batch_size: 2, concurrency: 2)
-
-    assert_receive {:dispatcher_order_webhook_started, 2, first_worker}, 500
-
-    refute_receive {:dispatcher_order_webhook_started, 3, _worker}, 100
-
-    send(first_worker, :release_first_dispatcher_order_webhook)
-    assert_delivered_delivery!(first_delivery_id)
-
-    dispatch_webhooks!(batch_size: 2, concurrency: 2)
-
-    assert_receive {:dispatcher_order_webhook_started, 3, _second_worker}, 500
-    assert_delivered_delivery!(second_delivery_id)
   end
 
   test "concurrent public sends to the same session receive unique sequence numbers", %{
@@ -1632,41 +1610,6 @@ defmodule Atp.SessionRuntimeTest do
     assert_session_webhook_delivery!(session_id, session_sequence, deadline)
   end
 
-  defp assert_delivered_delivery!(delivery_id) do
-    assert eventually(fn ->
-             delivery = Repo.get!(Delivery, delivery_id)
-             delivery.status == "delivered"
-           end)
-  end
-
-  defp dispatch_webhooks!(opts \\ []) do
-    dispatcher_opts =
-      Keyword.merge(
-        [
-          enabled: true,
-          dispatch_on_start?: false,
-          batch_size: 1,
-          concurrency: 1,
-          interval_ms: 60_000,
-          name: nil
-        ],
-        opts
-      )
-
-    dispatcher =
-      start_supervised!(%{
-        id: {WebhookDispatcher, make_ref()},
-        start: {WebhookDispatcher, :start_link, [dispatcher_opts]},
-        restart: :temporary
-      })
-
-    Sandbox.allow(Repo, self(), dispatcher)
-    Req.Test.allow(WebhookDelivery, self(), dispatcher)
-    send(dispatcher, :dispatch_due)
-
-    dispatcher
-  end
-
   defp assert_session_webhook_delivery!(session_id, session_sequence, deadline) do
     case session_webhook_delivery(session_id, session_sequence) do
       %Delivery{} = delivery ->
@@ -1817,19 +1760,6 @@ defmodule Atp.SessionRuntimeTest do
       end
     end)
   end
-
-  defp eventually(fun, attempts \\ 20)
-
-  defp eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      true
-    else
-      Process.sleep(25)
-      eventually(fun, attempts - 1)
-    end
-  end
-
-  defp eventually(_fun, 0), do: false
 
   defp register_session_agents!(conn, key) do
     account = create_account!(conn)

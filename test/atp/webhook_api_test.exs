@@ -111,10 +111,6 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("long-webhook-message", "persist the long webhook URL")
       )
 
-    assert [delivery] = sent["deliveries"]
-    dispatch_webhooks!()
-    assert_attempted_delivery!(delivery["id"], 1)
-
     recipient_status =
       build_conn()
       |> authorize(agent_token)
@@ -174,9 +170,7 @@ defmodule Atp.WebhookAPITest do
     assert error_code(other_agent_update) == "not_found"
   end
 
-  test "trusted messages to active webhook endpoints are queued until dispatcher delivery", %{
-    conn: conn
-  } do
+  test "trusted messages to active webhook endpoints are signed and delivered", %{conn: conn} do
     test_pid = self()
 
     Req.Test.stub(WebhookDelivery, fn request_conn ->
@@ -204,16 +198,11 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("signed-webhook-message", "deliver by webhook")
       )
 
-    assert sent["carrier_status"] == "queued"
+    assert sent["carrier_status"] == "delivered"
     assert is_nil(sent["ack_status"])
     assert [sent_delivery] = sent["deliveries"]
-    assert sent_delivery["status"] == "retry_scheduled"
-    assert sent_delivery["attempt_count"] == 0
-    assert sent_delivery["attempts"] == []
-
-    refute_receive {:webhook_request, _headers, _raw_body}, 100
-
-    dispatch_webhooks!()
+    assert [sent_attempt] = sent_delivery["attempts"]
+    refute Map.has_key?(sent_attempt, "request_url")
 
     assert_receive {:webhook_request, headers, raw_body}
 
@@ -233,7 +222,6 @@ defmodule Atp.WebhookAPITest do
     assert signature == expected_signature
     assert body["delivery"]["mode"] == "webhook"
     assert body["message"] == sent["message"]
-    assert_delivered_delivery!(body["delivery"]["id"])
 
     status =
       build_conn()
@@ -307,8 +295,6 @@ defmodule Atp.WebhookAPITest do
           a2a_user_text("#{host}-webhook", "do not deliver to private dns")
         )
 
-      sent = dispatch_and_reload_message!(sender, sent)
-
       assert sent["carrier_status"] == "delivery_failed"
 
       assert [
@@ -365,13 +351,9 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("safe-connect-webhook", "connect to validated IP")
       )
 
-    assert sent["carrier_status"] == "queued"
-    assert [delivery] = sent["deliveries"]
-
-    dispatch_webhooks!()
+    assert sent["carrier_status"] == "delivered"
 
     assert_receive {:safe_webhook_request, "93.184.216.34", "/atp/webhook", "mode=safe", headers}
-    assert_delivered_delivery!(delivery["id"])
 
     assert headers["host"] == "recipient.example.test:8443"
   end
@@ -401,8 +383,6 @@ defmodule Atp.WebhookAPITest do
         recipient["address"],
         a2a_user_text("redirect-webhook", "do not follow redirects")
       )
-
-    sent = dispatch_and_reload_message!(sender, sent)
 
     assert sent["carrier_status"] == "delivery_failed"
 
@@ -512,9 +492,7 @@ defmodule Atp.WebhookAPITest do
     assert_delivered_delivery!(delivery_id)
   end
 
-  test "dispatcher webhook requests are sent after message and delivery state is committed", %{
-    conn: conn
-  } do
+  test "webhook requests are sent after message and delivery state is committed", %{conn: conn} do
     test_pid = self()
 
     Req.Test.stub(WebhookDelivery, fn request_conn ->
@@ -529,22 +507,14 @@ defmodule Atp.WebhookAPITest do
 
     configure_webhook!(recipient, "configure-commit-recipient-webhook")
 
-    sent =
-      send_message!(
-        sender["agent_api_key"]["token"],
-        "send-committed-webhook",
-        recipient["address"],
-        a2a_user_text("committed-webhook-message", "visible after commit")
-      )
-
-    assert sent["carrier_status"] == "queued"
-    assert [delivery] = sent["deliveries"]
-    refute_receive {:webhook_in_transaction?, _in_transaction?}, 100
-
-    dispatch_webhooks!()
+    send_message!(
+      sender["agent_api_key"]["token"],
+      "send-committed-webhook",
+      recipient["address"],
+      a2a_user_text("committed-webhook-message", "visible after commit")
+    )
 
     assert_receive {:webhook_in_transaction?, false}
-    assert_delivered_delivery!(delivery["id"])
   end
 
   test "recipient can ACK a signed webhook delivery id and cannot extend it as a lease", %{
@@ -568,8 +538,6 @@ defmodule Atp.WebhookAPITest do
         recipient["address"],
         a2a_user_text("webhook-ack-message", "ack by webhook delivery id")
       )
-
-    sent = dispatch_and_reload_message!(sender, sent)
 
     assert [
              %{
@@ -692,7 +660,7 @@ defmodule Atp.WebhookAPITest do
     recipient = register_agent!(account_token, "register-retry-recipient", %{})
 
     too_many =
-      send_after_configuring_webhook_and_dispatch!(
+      send_after_configuring_webhook!(
         sender,
         recipient,
         "/too-many",
@@ -703,7 +671,7 @@ defmodule Atp.WebhookAPITest do
     assert_retry_scheduled(too_many, 429, nil, 3)
 
     server_error =
-      send_after_configuring_webhook_and_dispatch!(
+      send_after_configuring_webhook!(
         sender,
         recipient,
         "/server-error",
@@ -714,7 +682,7 @@ defmodule Atp.WebhookAPITest do
     assert_retry_scheduled(server_error, 503, nil, 3)
 
     timeout =
-      send_after_configuring_webhook_and_dispatch!(
+      send_after_configuring_webhook!(
         sender,
         recipient,
         "/timeout",
@@ -725,7 +693,7 @@ defmodule Atp.WebhookAPITest do
     assert_retry_scheduled(timeout, nil, "timeout", 3)
 
     network_error =
-      send_after_configuring_webhook_and_dispatch!(
+      send_after_configuring_webhook!(
         sender,
         recipient,
         "/network-error",
@@ -736,7 +704,7 @@ defmodule Atp.WebhookAPITest do
     assert_retry_scheduled(network_error, nil, "closed", 3)
 
     bad_request =
-      send_after_configuring_webhook_and_dispatch!(
+      send_after_configuring_webhook!(
         sender,
         recipient,
         "/bad-request",
@@ -759,7 +727,7 @@ defmodule Atp.WebhookAPITest do
     basic_recipient = register_agent!(basic_token, "register-basic-retry-recipient", %{})
 
     basic_server_error =
-      send_after_configuring_webhook_and_dispatch!(
+      send_after_configuring_webhook!(
         basic_sender,
         basic_recipient,
         "/server-error",
@@ -789,14 +757,10 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("capped-server-error-webhook", "eventually fail")
       )
 
-    sent = dispatch_and_reload_message!(sender, sent)
-
     assert [%{"id" => delivery_id, "attempt_count" => 1, "max_attempts" => 3}] =
              sent["deliveries"]
 
-    schedule_retry_in_past!(delivery_id)
-    dispatch_webhooks!()
-    assert_attempted_delivery!(delivery_id, 2)
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
 
     after_second =
       build_conn()
@@ -806,9 +770,7 @@ defmodule Atp.WebhookAPITest do
 
     assert [%{"status" => "retry_scheduled", "attempt_count" => 2}] = after_second["deliveries"]
 
-    schedule_retry_in_past!(delivery_id)
-    dispatch_webhooks!()
-    assert_attempted_delivery!(delivery_id, 3)
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
 
     after_third =
       build_conn()
@@ -860,8 +822,8 @@ defmodule Atp.WebhookAPITest do
 
     assert polling_delivery["message"]["id"] == webhook_delivery.message_id
 
-    dispatch_webhooks!()
-    assert_attempted_delivery!(delivery_id, 1)
+    assert {:ok, delivered_message} = WebhookDelivery.deliver_now(delivery_id)
+    assert delivered_message.carrier_status == "delivered"
 
     status =
       build_conn()
@@ -901,16 +863,12 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("expired-server-error-webhook", "expires before retry")
       )
 
-    assert [%{"id" => delivery_id}] = sent["deliveries"]
-    dispatch_webhooks!()
     assert_receive :webhook_requested
-    assert_attempted_delivery!(delivery_id, 1)
+    assert [%{"id" => delivery_id}] = sent["deliveries"]
 
     expire_message!(sent["message"]["id"])
-    schedule_retry_in_past!(delivery_id)
 
-    dispatch_webhooks!()
-    assert_failed_delivery!(delivery_id, "message_expired")
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
     refute_receive :webhook_requested, 100
 
     status =
@@ -947,13 +905,11 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("accepted-retry-message", "polling ack should stop webhook retry")
       )
 
-    assert [%{"id" => accepted_webhook_delivery_id, "status" => "retry_scheduled"}] =
-             accepted["deliveries"]
-
-    dispatch_webhooks!()
     assert_receive {:webhook_requested, accepted_message_id}
     assert accepted_message_id == accepted["message"]["id"]
-    assert_attempted_delivery!(accepted_webhook_delivery_id, 1)
+
+    assert [%{"id" => accepted_webhook_delivery_id, "status" => "retry_scheduled"}] =
+             accepted["deliveries"]
 
     accepted_polling_delivery =
       claim_inbox!(recipient["agent_api_key"]["token"], "claim-accepted-retry-message", %{
@@ -967,9 +923,7 @@ defmodule Atp.WebhookAPITest do
       %{"status" => "accepted"}
     )
 
-    schedule_retry_in_past!(accepted_webhook_delivery_id)
-    dispatch_webhooks!()
-    assert_failed_delivery!(accepted_webhook_delivery_id, "message_acked")
+    assert {:ok, _message} = WebhookDelivery.deliver_now(accepted_webhook_delivery_id)
     refute_receive {:webhook_requested, ^accepted_message_id}, 100
 
     accepted_status =
@@ -991,13 +945,11 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("completed-retry-message", "terminal polling ack should stop webhook retry")
       )
 
-    assert [%{"id" => completed_webhook_delivery_id, "status" => "retry_scheduled"}] =
-             completed["deliveries"]
-
-    dispatch_webhooks!()
     assert_receive {:webhook_requested, completed_message_id}
     assert completed_message_id == completed["message"]["id"]
-    assert_attempted_delivery!(completed_webhook_delivery_id, 1)
+
+    assert [%{"id" => completed_webhook_delivery_id, "status" => "retry_scheduled"}] =
+             completed["deliveries"]
 
     completed_polling_delivery =
       claim_inbox!(recipient["agent_api_key"]["token"], "claim-completed-retry-message", %{
@@ -1011,9 +963,7 @@ defmodule Atp.WebhookAPITest do
       %{"status" => "completed"}
     )
 
-    schedule_retry_in_past!(completed_webhook_delivery_id)
-    dispatch_webhooks!()
-    assert_failed_delivery!(completed_webhook_delivery_id, "message_acked")
+    assert {:ok, _message} = WebhookDelivery.deliver_now(completed_webhook_delivery_id)
     refute_receive {:webhook_requested, ^completed_message_id}, 100
 
     completed_status =
@@ -1176,80 +1126,6 @@ defmodule Atp.WebhookAPITest do
     assert_delivered_delivery!(delivery_id)
   end
 
-  test "webhook dispatcher bounds concurrent durable delivery attempts", %{conn: conn} do
-    test_pid = self()
-
-    Req.Test.stub(WebhookDelivery, fn request_conn ->
-      headers = Map.new(request_conn.req_headers)
-      send(test_pid, {:bounded_dispatch_started, headers["atp-delivery-id"], self()})
-
-      receive do
-        :release_bounded_dispatch -> Plug.Conn.send_resp(request_conn, 204, "")
-      after
-        1_000 -> raise "timed out waiting to release bounded dispatcher webhook"
-      end
-    end)
-
-    account = create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = register_agent!(account_token, "register-bounded-dispatch-sender", %{})
-    recipient = register_agent!(account_token, "register-bounded-dispatch-recipient", %{})
-    configure_webhook!(recipient, "configure-bounded-dispatch-recipient")
-
-    first_id =
-      prepare_unsent_webhook_delivery!(
-        sender,
-        recipient,
-        "bounded-dispatch-first",
-        a2a_user_text("bounded-dispatch-first", "first bounded dispatch")
-      )
-
-    second_id =
-      prepare_unsent_webhook_delivery!(
-        sender,
-        recipient,
-        "bounded-dispatch-second",
-        a2a_user_text("bounded-dispatch-second", "second bounded dispatch")
-      )
-
-    third_id =
-      prepare_unsent_webhook_delivery!(
-        sender,
-        recipient,
-        "bounded-dispatch-third",
-        a2a_user_text("bounded-dispatch-third", "third bounded dispatch")
-      )
-
-    dispatcher =
-      start_supervised!(
-        {WebhookDispatcher,
-         enabled: true,
-         dispatch_on_start?: false,
-         batch_size: 3,
-         concurrency: 2,
-         interval_ms: 60_000,
-         name: nil}
-      )
-
-    Sandbox.allow(Atp.Repo, self(), dispatcher)
-    Req.Test.allow(WebhookDelivery, self(), dispatcher)
-    send(dispatcher, :dispatch_due)
-
-    assert_receive {:bounded_dispatch_started, ^first_id, first_worker}
-    assert_receive {:bounded_dispatch_started, ^second_id, second_worker}
-    refute_receive {:bounded_dispatch_started, ^third_id, _worker}, 100
-
-    send(first_worker, :release_bounded_dispatch)
-    assert_receive {:bounded_dispatch_started, ^third_id, third_worker}
-
-    send(second_worker, :release_bounded_dispatch)
-    send(third_worker, :release_bounded_dispatch)
-
-    assert_delivered_delivery!(first_id)
-    assert_delivered_delivery!(second_id)
-    assert_delivered_delivery!(third_id)
-  end
-
   test "disabled webhook dispatcher ignores dispatch ticks" do
     name = :atp_disabled_webhook_dispatcher_test
     pid = start_supervised!({WebhookDispatcher, enabled: false, name: name})
@@ -1273,65 +1149,6 @@ defmodule Atp.WebhookAPITest do
       recipient["address"],
       payload
     )
-  end
-
-  defp send_after_configuring_webhook_and_dispatch!(sender, recipient, path, key, payload) do
-    sender
-    |> send_after_configuring_webhook!(recipient, path, key, payload)
-    |> then(&dispatch_and_reload_message!(sender, &1))
-  end
-
-  defp dispatch_webhooks!(opts \\ []) do
-    dispatcher_opts =
-      Keyword.merge(
-        [
-          enabled: true,
-          dispatch_on_start?: false,
-          batch_size: 1,
-          concurrency: 1,
-          interval_ms: 60_000,
-          name: nil
-        ],
-        opts
-      )
-
-    dispatcher =
-      start_supervised!(%{
-        id: {WebhookDispatcher, make_ref()},
-        start: {WebhookDispatcher, :start_link, [dispatcher_opts]},
-        restart: :temporary
-      })
-
-    Sandbox.allow(Atp.Repo, self(), dispatcher)
-    Req.Test.allow(WebhookDelivery, self(), dispatcher)
-    send(dispatcher, :dispatch_due)
-
-    dispatcher
-  end
-
-  defp dispatch_and_reload_message!(sender, response, opts \\ []) do
-    [delivery] = response["deliveries"]
-    dispatch_webhooks!(opts)
-    assert_attempted_delivery!(delivery["id"], delivery["attempt_count"] + 1)
-
-    build_conn()
-    |> authorize(sender["agent_api_key"]["token"])
-    |> get("/api/messages/#{response["message"]["id"]}")
-    |> json_response(200)
-  end
-
-  defp assert_attempted_delivery!(delivery_id, attempt_count) do
-    assert eventually(fn ->
-             delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
-             delivery.attempt_count >= attempt_count and delivery.status != "leased"
-           end)
-  end
-
-  defp assert_failed_delivery!(delivery_id, last_error) do
-    assert eventually(fn ->
-             delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
-             delivery.status == "failed" and delivery.last_error == last_error
-           end)
   end
 
   defp assert_retry_scheduled(response, response_status, error_fragment, max_attempts) do
@@ -1411,24 +1228,7 @@ defmodule Atp.WebhookAPITest do
     delivery_id
   end
 
-  defp schedule_retry_in_past!(delivery_id) do
-    Atp.Transport.Delivery
-    |> Atp.Repo.get!(delivery_id)
-    |> Ecto.Changeset.change(
-      status: "retry_scheduled",
-      next_attempt_at: DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
-    )
-    |> Atp.Repo.update!()
-
-    delivery_id
-  end
-
   defp assert_delivered_delivery!(delivery_id) do
-    assert eventually(fn ->
-             delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
-             delivery.status == "delivered"
-           end)
-
     delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
 
     assert delivery.status == "delivered"
@@ -1437,17 +1237,4 @@ defmodule Atp.WebhookAPITest do
     assert is_nil(delivery.leased_until)
     assert delivery.attempt_count == 1
   end
-
-  defp eventually(fun, attempts \\ 20)
-
-  defp eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      true
-    else
-      Process.sleep(25)
-      eventually(fun, attempts - 1)
-    end
-  end
-
-  defp eventually(_fun, 0), do: false
 end

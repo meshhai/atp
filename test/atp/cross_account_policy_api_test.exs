@@ -1,8 +1,7 @@
 defmodule Atp.CrossAccountPolicyAPITest do
   use Atp.ConnCase, async: false
 
-  alias Atp.Transport.{Delivery, WebhookDelivery, WebhookDispatcher}
-  alias Ecto.Adapters.SQL.Sandbox
+  alias Atp.Transport.WebhookDelivery
 
   test "unknown cross-account messages are untrusted and inbox-only", %{conn: conn} do
     test_pid = self()
@@ -87,15 +86,11 @@ defmodule Atp.CrossAccountPolicyAPITest do
         a2a_user_text("allowed-cross-account", "trusted across accounts")
       )
 
-    assert sent["carrier_status"] == "queued"
+    assert sent["carrier_status"] == "delivered"
     assert sent["message"]["trust"] == "trusted"
-    assert [delivery] = sent["deliveries"]
-
-    dispatch_webhooks!()
 
     assert_receive {:webhook_request, body}
     assert body["message"] == sent["message"]
-    assert_delivered_delivery!(delivery["id"])
   end
 
   test "recipient can block a sender agent with carrier rejection and no delivery", %{conn: conn} do
@@ -367,41 +362,4 @@ defmodule Atp.CrossAccountPolicyAPITest do
     |> Ecto.Changeset.change(plan: "basic")
     |> Atp.Repo.update!()
   end
-
-  defp dispatch_webhooks! do
-    dispatcher =
-      start_supervised!(%{
-        id: {WebhookDispatcher, make_ref()},
-        start:
-          {WebhookDispatcher, :start_link,
-           [[enabled: true, dispatch_on_start?: false, batch_size: 1, concurrency: 1, name: nil]]},
-        restart: :temporary
-      })
-
-    Sandbox.allow(Atp.Repo, self(), dispatcher)
-    Req.Test.allow(WebhookDelivery, self(), dispatcher)
-    send(dispatcher, :dispatch_due)
-
-    dispatcher
-  end
-
-  defp assert_delivered_delivery!(delivery_id) do
-    assert eventually(fn ->
-             delivery = Atp.Repo.get!(Delivery, delivery_id)
-             delivery.status == "delivered"
-           end)
-  end
-
-  defp eventually(fun, attempts \\ 20)
-
-  defp eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      true
-    else
-      Process.sleep(25)
-      eventually(fun, attempts - 1)
-    end
-  end
-
-  defp eventually(_fun, 0), do: false
 end

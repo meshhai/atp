@@ -35,12 +35,7 @@ config :atp, Atp.Transport.WebhookDelivery,
     _host -> {:ok, [{93, 184, 216, 34}]}
   end
 
-config :atp, Atp.Transport.WebhookDispatcher,
-  enabled: false,
-  interval_ms: 5_000,
-  batch_size: 50,
-  lease_seconds: 60,
-  concurrency: 5
+config :atp, Atp.Transport.WebhookDispatcher, enabled: false
 
 config :logger, level: :warning
 config :phoenix, :plug_init_mode, :runtime

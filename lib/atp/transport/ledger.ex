@@ -702,17 +702,29 @@ defmodule Atp.Transport.Ledger do
     prepare_trusted_webhook_delivery(message, recipient)
   end
 
-  defp finish_prepared_webhook_delivery(%Agent{}, status, body, _delivery_id) do
+  defp finish_prepared_webhook_delivery(%Agent{}, status, body, nil), do: {:ok, status, body}
+
+  defp finish_prepared_webhook_delivery(%Agent{} = viewer, _status, _body, delivery_id) do
+    with {:ok, message} <- WebhookDelivery.deliver_now(delivery_id) do
+      {:ok, 201, Response.message_status(message, viewer)}
+    end
+  end
+
+  defp finish_prepared_session_webhook_delivery(%Agent{}, status, body, {_session_id, nil}) do
     {:ok, status, body}
   end
 
   defp finish_prepared_session_webhook_delivery(
-         %Agent{},
-         status,
-         body,
-         {_session_id, _delivery_id}
+         %Agent{} = viewer,
+         _status,
+         _body,
+         {session_id, delivery_id}
        ) do
-    {:ok, status, body}
+    with {:ok, message} <- WebhookDelivery.deliver_now(delivery_id) do
+      session = Repo.get!(Session, session_id)
+
+      {:ok, 201, Response.session_message(session, message, viewer)}
+    end
   end
 
   defp expire_opening_message(%Message{carrier_status: status} = message, now)

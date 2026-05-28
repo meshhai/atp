@@ -1,8 +1,7 @@
 defmodule Atp.SessionAPITest do
   use Atp.ConnCase, async: false
 
-  alias Atp.Transport.{Delivery, Runtime, WebhookDelivery, WebhookDispatcher}
-  alias Ecto.Adapters.SQL.Sandbox
+  alias Atp.Transport.{Runtime, WebhookDelivery}
 
   test "opening a session creates a pending two-party session and opening message", %{
     conn: conn
@@ -369,6 +368,7 @@ defmodule Atp.SessionAPITest do
     )
 
     {:ok, session_pid} = Runtime.ensure_session_started(opened["session"]["id"])
+    Req.Test.allow(WebhookDelivery, self(), session_pid)
 
     on_exit(fn ->
       DynamicSupervisor.terminate_child(Runtime.SessionSupervisor, session_pid)
@@ -384,19 +384,7 @@ defmodule Atp.SessionAPITest do
       |> json_response(201)
 
     assert [delivery_status] = reply["message_status"]["deliveries"]
-    assert delivery_status["attempts"] == []
-
-    dispatch_webhooks!()
-    assert_delivered_delivery!(delivery_status["id"])
-
-    sender_status =
-      build_conn()
-      |> authorize(initiator["agent_api_key"]["token"])
-      |> get("/api/messages/#{reply["message_status"]["message"]["id"]}")
-      |> json_response(200)
-
-    assert [sender_delivery_status] = sender_status["deliveries"]
-    assert [attempt] = sender_delivery_status["attempts"]
+    assert [attempt] = delivery_status["attempts"]
     refute Map.has_key?(attempt, "request_url")
   end
 
@@ -561,41 +549,4 @@ defmodule Atp.SessionAPITest do
 
     assert error_code(unrelated_write) == "not_found"
   end
-
-  defp dispatch_webhooks! do
-    dispatcher =
-      start_supervised!(%{
-        id: {WebhookDispatcher, make_ref()},
-        start:
-          {WebhookDispatcher, :start_link,
-           [[enabled: true, dispatch_on_start?: false, batch_size: 1, concurrency: 1, name: nil]]},
-        restart: :temporary
-      })
-
-    Sandbox.allow(Atp.Repo, self(), dispatcher)
-    Req.Test.allow(WebhookDelivery, self(), dispatcher)
-    send(dispatcher, :dispatch_due)
-
-    dispatcher
-  end
-
-  defp assert_delivered_delivery!(delivery_id) do
-    assert eventually(fn ->
-             delivery = Atp.Repo.get!(Delivery, delivery_id)
-             delivery.status == "delivered"
-           end)
-  end
-
-  defp eventually(fun, attempts \\ 20)
-
-  defp eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      true
-    else
-      Process.sleep(25)
-      eventually(fun, attempts - 1)
-    end
-  end
-
-  defp eventually(_fun, 0), do: false
 end
