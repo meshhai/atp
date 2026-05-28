@@ -73,7 +73,38 @@ defmodule Atp.Transport.DeliveryClaims do
     end)
   end
 
-  defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds >= 0
+  @spec terminalize_claimed_webhook_delivery(
+          DeliveryClaim.t(),
+          :message_acked | :message_expired,
+          keyword()
+        ) ::
+          {:ok, Message.t()} | {:error, term()}
+  def terminalize_claimed_webhook_delivery(
+        %DeliveryClaim{delivery: %Delivery{id: delivery_id}} = claim,
+        reason,
+        opts \\ []
+      )
+      when is_binary(delivery_id) and reason in [:message_acked, :message_expired] and
+             is_list(opts) do
+    now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
+
+    Repo.transaction(fn ->
+      case fetch_locked_webhook_claim_delivery(delivery_id) do
+        nil ->
+          Repo.rollback(:stale_delivery_claim)
+
+        %Delivery{} = delivery ->
+          with :ok <- validate_webhook_delivery_claim(delivery, claim, now),
+               :ok <- validate_webhook_terminal_reason(delivery.message, reason, now) do
+            terminalize_claimed_webhook_delivery!(delivery, reason, now)
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+      end
+    end)
+  end
+
+  defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0
 
   defp claim_next_due_webhook_delivery!(now, lease_seconds) do
     case Repo.one(claimable_webhook_delivery_query(now)) do
@@ -252,6 +283,20 @@ defmodule Atp.Transport.DeliveryClaims do
          %AttemptResult{} = result,
          now
        ) do
+    with :ok <- validate_webhook_delivery_claim(delivery, claim, now) do
+      if result.attempt_number == claim.attempt_number do
+        :ok
+      else
+        {:error, :stale_delivery_claim}
+      end
+    end
+  end
+
+  defp validate_webhook_delivery_claim(
+         %Delivery{} = delivery,
+         %DeliveryClaim{} = claim,
+         now
+       ) do
     cond do
       delivery.id != claim.delivery.id ->
         {:error, :stale_delivery_claim}
@@ -271,12 +316,17 @@ defmodule Atp.Transport.DeliveryClaims do
       not current_webhook_claim_lease?(delivery, claim, now) ->
         {:error, :stale_delivery_claim}
 
-      result.attempt_number != claim.attempt_number ->
-        {:error, :stale_delivery_claim}
-
       true ->
         :ok
     end
+  end
+
+  defp validate_webhook_terminal_reason(%Message{} = message, :message_acked, _now) do
+    if acked?(message), do: :ok, else: {:error, :stale_delivery_claim}
+  end
+
+  defp validate_webhook_terminal_reason(%Message{} = message, :message_expired, now) do
+    if expired?(message, now), do: :ok, else: {:error, :stale_delivery_claim}
   end
 
   defp current_webhook_claim_lease?(
@@ -319,6 +369,49 @@ defmodule Atp.Transport.DeliveryClaims do
       last_error: result.error
     )
     |> Repo.update!()
+  end
+
+  defp terminalize_claimed_webhook_delivery!(
+         %Delivery{} = delivery,
+         :message_acked,
+         _now
+       ) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "message_acked"
+    )
+    |> Repo.update!()
+
+    delivery.message
+  end
+
+  defp terminalize_claimed_webhook_delivery!(
+         %Delivery{message: %Message{} = message} = delivery,
+         :message_expired,
+         now
+       ) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "message_expired"
+    )
+    |> Repo.update!()
+
+    Message
+    |> where([persisted_message], persisted_message.id == ^message.id)
+    |> where([persisted_message], persisted_message.carrier_status != "delivered")
+    |> Repo.update_all(set: [carrier_status: "expired", terminal_at: now, updated_at: now])
+
+    Repo.get!(Message, message.id)
   end
 
   defp update_claimed_webhook_message!(%Message{} = message, %AttemptResult{

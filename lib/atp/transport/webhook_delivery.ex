@@ -83,10 +83,10 @@ defmodule Atp.Transport.WebhookDelivery do
         {:ok, message}
 
       acked?(message) ->
-        stop_delivery_after_ack!(claim)
+        DeliveryClaims.terminalize_claimed_webhook_delivery(claim, :message_acked, now: now)
 
       DateTime.compare(message.expires_at, now) != :gt ->
-        expire_delivery!(claim, now)
+        DeliveryClaims.terminalize_claimed_webhook_delivery(claim, :message_expired, now: now)
 
       true ->
         attempt_delivery(claim, recipient, now)
@@ -296,41 +296,6 @@ defmodule Atp.Transport.WebhookDelivery do
 
   defp retry_delay(next_attempt_number) do
     Enum.at(@retry_delays_seconds, next_attempt_number - 1, @max_retry_delay_seconds)
-  end
-
-  defp expire_delivery!(%DeliveryClaim{delivery: delivery, message: message}, now) do
-    delivery
-    |> Ecto.Changeset.change(
-      status: "failed",
-      claim_token: nil,
-      claimed_at: nil,
-      leased_until: nil,
-      next_attempt_at: nil,
-      last_error: "message_expired"
-    )
-    |> Repo.update!()
-
-    Message
-    |> where([persisted_message], persisted_message.id == ^message.id)
-    |> where([persisted_message], persisted_message.carrier_status != "delivered")
-    |> Repo.update_all(set: [carrier_status: "expired", terminal_at: now, updated_at: now])
-
-    {:ok, Repo.get!(Message, message.id)}
-  end
-
-  defp stop_delivery_after_ack!(%DeliveryClaim{delivery: delivery, message: message}) do
-    delivery
-    |> Ecto.Changeset.change(
-      status: "failed",
-      claim_token: nil,
-      claimed_at: nil,
-      leased_until: nil,
-      next_attempt_at: nil,
-      last_error: "message_acked"
-    )
-    |> Repo.update!()
-
-    {:ok, message}
   end
 
   defp request_body(%Delivery{} = delivery, %Message{} = message) do
