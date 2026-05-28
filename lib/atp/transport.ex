@@ -39,6 +39,15 @@ defmodule Atp.Transport do
           {:ok, Atp.Transport.DeliveryClaim.t() | nil} | {:error, term()}
   defdelegate claim_due_webhook_delivery(opts \\ []), to: Ledger
 
+  @doc false
+  @spec finish_claimed_webhook_delivery(
+          Atp.Transport.DeliveryClaim.t(),
+          Atp.Transport.WebhookDelivery.AttemptResult.t(),
+          keyword()
+        ) ::
+          {:ok, Atp.Transport.Message.t()} | {:error, term()}
+  defdelegate finish_claimed_webhook_delivery(claim, result, opts \\ []), to: Ledger
+
   @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   defdelegate extend_delivery(agent, delivery_id, params, idempotency_key, route), to: Ledger

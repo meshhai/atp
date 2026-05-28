@@ -7,6 +7,7 @@ defmodule Atp.Transport.WebhookDelivery do
   alias Atp.Identity.WebhookURL.ConnectTarget
   alias Atp.Repo
   alias Atp.Transport.{Delivery, Message, MessageEnvelope, WebhookAttempt, WebhookSignature}
+  alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @content_type "application/json"
   @free_attempts 3
@@ -284,7 +285,7 @@ defmodule Atp.Transport.WebhookDelivery do
 
   defp classify_result({:ok, %{status: status}}, now, _message, attempt_number, _max_attempts)
        when status >= 200 and status <= 299 do
-    %{
+    %AttemptResult{
       attempt_number: attempt_number,
       response_status: status,
       error: nil,
@@ -325,7 +326,7 @@ defmodule Atp.Transport.WebhookDelivery do
     next_attempt_at = DateTime.add(now, retry_delay(next_attempt_number), :second)
 
     if retry_allowed?(attempt_number, max_attempts, next_attempt_at, message) do
-      %{
+      %AttemptResult{
         attempt_number: attempt_number,
         response_status: response_status,
         error: error,
@@ -345,7 +346,7 @@ defmodule Atp.Transport.WebhookDelivery do
   end
 
   defp failed_result(attempt_number, response_status, error) do
-    %{
+    %AttemptResult{
       attempt_number: attempt_number,
       response_status: response_status,
       error: error,

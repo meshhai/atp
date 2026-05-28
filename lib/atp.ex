@@ -22,6 +22,7 @@ defmodule Atp do
          Session,
          WebhookAttempt,
          WebhookDelivery,
+         WebhookDelivery.AttemptResult,
          WebhookDispatcher,
          WebhookSignature
        ]},
