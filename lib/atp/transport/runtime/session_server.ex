@@ -193,14 +193,6 @@ defmodule Atp.Transport.Runtime.SessionServer do
     {result, state}
   end
 
-  defp ordered_webhook_dispatch?(
-         %{commit_value: {session_id, webhook_delivery_id}},
-         session_id
-       )
-       when is_binary(webhook_delivery_id) do
-    true
-  end
-
   defp ordered_webhook_dispatch?(_prepared, _session_id), do: false
 
   @impl true
