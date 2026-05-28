@@ -34,6 +34,11 @@ defmodule Atp.Transport do
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate claim_inbox(agent, params, idempotency_key, route), to: Ledger
 
+  @doc false
+  @spec claim_due_webhook_delivery(keyword()) ::
+          {:ok, Atp.Transport.DeliveryClaim.t() | nil} | {:error, term()}
+  defdelegate claim_due_webhook_delivery(opts \\ []), to: Ledger
+
   @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   defdelegate extend_delivery(agent, delivery_id, params, idempotency_key, route), to: Ledger

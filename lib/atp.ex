@@ -16,6 +16,7 @@ defmodule Atp do
       {Transport,
        [
          Delivery,
+         DeliveryClaim,
          Message,
          MessageEnvelope,
          Session,

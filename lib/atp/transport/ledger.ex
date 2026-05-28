@@ -15,6 +15,7 @@ defmodule Atp.Transport.Ledger do
   alias Atp.Transport.{
     Ack,
     Delivery,
+    DeliveryClaim,
     Message,
     Payload,
     Response,
@@ -25,6 +26,7 @@ defmodule Atp.Transport.Ledger do
 
   @default_message_ttl_seconds 7 * 24 * 60 * 60
   @default_lease_seconds 60
+  @default_webhook_claim_lease_seconds 60
   @terminal_ack_statuses ~w(completed failed rejected)
   @ack_statuses ~w(accepted completed failed rejected)
 
@@ -412,6 +414,24 @@ defmodule Atp.Transport.Ledger do
     end)
   end
 
+  @doc false
+  @spec claim_due_webhook_delivery(keyword()) :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
+  def claim_due_webhook_delivery(opts \\ []) when is_list(opts) do
+    lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
+    now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
+
+    if valid_lease_seconds?(lease_seconds) do
+      Repo.transaction(fn ->
+        case Repo.one(claimable_webhook_delivery_query(now)) do
+          nil -> nil
+          %Delivery{} = delivery -> claim_webhook_delivery!(delivery, now, lease_seconds)
+        end
+      end)
+    else
+      {:error, :invalid_lease}
+    end
+  end
+
   @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   def extend_delivery(%Agent{} = agent, delivery_id, params, idempotency_key, route)
@@ -600,6 +620,8 @@ defmodule Atp.Transport.Ledger do
     end
   end
 
+  defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds >= 0
+
   defp fetch_ack_status(%{"status" => status}) when status in @ack_statuses, do: {:ok, status}
   defp fetch_ack_status(%{"status" => _status}), do: {:error, :invalid_ack_status}
   defp fetch_ack_status(_params), do: {:error, :ack_status_required}
@@ -662,6 +684,71 @@ defmodule Atp.Transport.Ledger do
     message
     |> Ecto.Changeset.change(carrier_status: "delivered")
     |> Repo.update!()
+  end
+
+  defp claimable_webhook_delivery_query(now) do
+    Delivery
+    |> join(:inner, [delivery], message in assoc(delivery, :message), as: :message)
+    |> where([delivery], delivery.mode == "webhook")
+    |> where(^due_webhook_delivery_filter(now))
+    |> where(^webhook_session_order_filter())
+    |> order_by([delivery], asc: delivery.inserted_at)
+    |> limit(1)
+    |> lock("FOR UPDATE SKIP LOCKED")
+  end
+
+  defp due_webhook_delivery_filter(now) do
+    dynamic(
+      [delivery],
+      (delivery.status == "retry_scheduled" and
+         (is_nil(delivery.next_attempt_at) or delivery.next_attempt_at <= ^now)) or
+        (delivery.status == "leased" and not is_nil(delivery.leased_until) and
+           delivery.leased_until <= ^now)
+    )
+  end
+
+  defp webhook_session_order_filter do
+    dynamic(
+      [message: message],
+      is_nil(message.session_id) or is_nil(message.session_sequence) or
+        not exists(
+          from(prior_delivery in Delivery,
+            join: prior_message in Message,
+            on: prior_message.id == prior_delivery.message_id,
+            where: prior_delivery.mode == "webhook",
+            where: prior_delivery.status not in ["delivered", "failed"],
+            where: prior_message.session_id == parent_as(:message).session_id,
+            where: prior_message.session_sequence < parent_as(:message).session_sequence,
+            select: 1
+          )
+        )
+    )
+  end
+
+  defp claim_webhook_delivery!(%Delivery{} = delivery, now, lease_seconds) do
+    claim_token = ID.generate("dcl")
+    leased_until = DateTime.add(now, lease_seconds, :second)
+    attempt_number = delivery.attempt_count + 1
+
+    claimed_delivery =
+      delivery
+      |> Ecto.Changeset.change(
+        status: "leased",
+        claim_token: claim_token,
+        claimed_at: now,
+        leased_until: leased_until
+      )
+      |> Repo.update!()
+      |> Repo.preload([:message, :recipient_agent], force: true)
+
+    %DeliveryClaim{
+      delivery: claimed_delivery,
+      message: claimed_delivery.message,
+      recipient_agent: claimed_delivery.recipient_agent,
+      claim_token: claim_token,
+      leased_until: leased_until,
+      attempt_number: attempt_number
+    }
   end
 
   defp prepare_trusted_webhook_delivery(
