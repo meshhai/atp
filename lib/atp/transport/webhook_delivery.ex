@@ -6,7 +6,16 @@ defmodule Atp.Transport.WebhookDelivery do
   alias Atp.Identity.{Account, Agent, ID, WebhookURL}
   alias Atp.Identity.WebhookURL.ConnectTarget
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, Message, MessageEnvelope, WebhookAttempt, WebhookSignature}
+
+  alias Atp.Transport.{
+    Delivery,
+    DeliveryClaim,
+    DeliveryClaims,
+    Message,
+    MessageEnvelope,
+    WebhookSignature
+  }
+
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @content_type "application/json"
@@ -35,9 +44,12 @@ defmodule Atp.Transport.WebhookDelivery do
 
   @spec deliver_now(String.t()) :: delivery_result()
   def deliver_now(delivery_id) when is_binary(delivery_id) do
-    case acquire_webhook_delivery(delivery_id) do
+    case DeliveryClaims.claim_webhook_delivery(delivery_id,
+           lease_seconds: @dispatch_lease_seconds
+         ) do
       {:error, reason} -> {:error, reason}
-      %Delivery{} = delivery -> deliver_prepared(delivery)
+      {:ok, %Message{} = message} -> {:ok, message}
+      {:ok, %DeliveryClaim{} = claim} -> deliver_claim(claim)
     end
   end
 
@@ -53,115 +65,39 @@ defmodule Atp.Transport.WebhookDelivery do
     limit = Keyword.get(opts, :limit, 50)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
-    results =
-      limit
-      |> due_delivery_ids(now)
-      |> Enum.map(&deliver_now/1)
-
-    {:ok, results}
+    {:ok, deliver_due_claims(limit, now)}
   end
 
-  defp due_delivery_ids(limit, now) when is_integer(limit) and limit > 0 do
-    {:ok, ids} =
-      Repo.transaction(fn ->
-        Delivery
-        |> join(:inner, [delivery], message in assoc(delivery, :message), as: :message)
-        |> where([delivery], delivery.mode == "webhook")
-        |> where(^due_delivery_filter(now))
-        |> where(^session_order_filter())
-        |> order_by([delivery], asc: delivery.inserted_at)
-        |> limit(^limit)
-        |> lock("FOR UPDATE SKIP LOCKED")
-        |> select([delivery], delivery.id)
-        |> Repo.all()
-      end)
-
-    ids
+  defp deliver_due_claims(limit, now) when is_integer(limit) and limit > 0 do
+    claim_due_claims(limit, now, [])
   end
 
-  defp due_delivery_ids(_limit, _now), do: []
+  defp deliver_due_claims(_limit, _now), do: []
 
-  defp due_delivery_filter(now) do
-    dynamic(
-      [delivery],
-      (delivery.status == "retry_scheduled" and
-         (is_nil(delivery.next_attempt_at) or delivery.next_attempt_at <= ^now)) or
-        (delivery.status == "leased" and not is_nil(delivery.leased_until) and
-           delivery.leased_until <= ^now)
-    )
-  end
+  defp claim_due_claims(0, _now, results), do: Enum.reverse(results)
 
-  defp session_order_filter do
-    dynamic(
-      [message: message],
-      is_nil(message.session_id) or is_nil(message.session_sequence) or
-        not exists(
-          from(prior_delivery in Delivery,
-            join: prior_message in Message,
-            on: prior_message.id == prior_delivery.message_id,
-            where: prior_delivery.mode == "webhook",
-            where: prior_delivery.status not in ["delivered", "failed"],
-            where: prior_message.session_id == parent_as(:message).session_id,
-            where: prior_message.session_sequence < parent_as(:message).session_sequence,
-            select: 1
-          )
-        )
-    )
-  end
+  defp claim_due_claims(remaining, now, results) do
+    case DeliveryClaims.claim_due_webhook_delivery(
+           lease_seconds: @dispatch_lease_seconds,
+           now: now
+         ) do
+      {:ok, nil} ->
+        Enum.reverse(results)
 
-  defp acquire_webhook_delivery(delivery_id) do
-    now = DateTime.utc_now(:microsecond)
-    dispatch_lease_until = DateTime.add(now, @dispatch_lease_seconds, :second)
+      {:ok, %DeliveryClaim{} = claim} ->
+        claim_due_claims(remaining - 1, now, [deliver_claim(claim) | results])
 
-    {:ok, result} =
-      Repo.transaction(fn ->
-        acquire_locked_webhook_delivery(delivery_id, now, dispatch_lease_until)
-      end)
-
-    result
-  end
-
-  defp acquire_locked_webhook_delivery(delivery_id, now, dispatch_lease_until) do
-    case locked_webhook_delivery(delivery_id) do
-      nil ->
-        {:error, :not_found}
-
-      %Delivery{status: status} = delivery when status in ["delivered", "failed"] ->
-        delivery
-
-      %Delivery{status: "leased", leased_until: %DateTime{} = leased_until} = delivery ->
-        lease_webhook_delivery_or_conflict(delivery, leased_until, now, dispatch_lease_until)
-
-      %Delivery{} = delivery ->
-        lease_delivery!(delivery, dispatch_lease_until)
+      {:error, reason} ->
+        Enum.reverse([{:error, reason} | results])
     end
   end
 
-  defp lease_webhook_delivery_or_conflict(delivery, leased_until, now, dispatch_lease_until) do
-    if DateTime.compare(leased_until, now) == :gt do
-      {:error, :delivery_in_progress}
-    else
-      lease_delivery!(delivery, dispatch_lease_until)
-    end
-  end
-
-  defp locked_webhook_delivery(delivery_id) do
-    Delivery
-    |> where([delivery], delivery.id == ^delivery_id and delivery.mode == "webhook")
-    |> lock("FOR UPDATE")
-    |> preload([:message, :recipient_agent])
-    |> Repo.one()
-  end
-
-  defp lease_delivery!(%Delivery{} = delivery, dispatch_lease_until) do
-    delivery
-    |> Ecto.Changeset.change(status: "leased", leased_until: dispatch_lease_until)
-    |> Repo.update!()
-  end
-
-  defp deliver_prepared(
-         %Delivery{message: %Message{} = message, recipient_agent: %Agent{} = recipient} =
-           delivery
+  defp deliver_claim(
+         %DeliveryClaim{
+           delivery: %Delivery{} = delivery,
+           message: %Message{} = message,
+           recipient_agent: %Agent{} = recipient
+         } = claim
        ) do
     now = DateTime.utc_now(:microsecond)
 
@@ -170,20 +106,24 @@ defmodule Atp.Transport.WebhookDelivery do
         {:ok, message}
 
       acked?(message) ->
-        stop_delivery_after_ack!(delivery, message)
+        stop_delivery_after_ack!(claim)
 
       DateTime.compare(message.expires_at, now) != :gt ->
-        expire_delivery!(delivery, message, now)
+        expire_delivery!(claim, now)
 
       true ->
-        attempt_delivery(delivery, message, recipient, now)
+        attempt_delivery(claim, recipient, now)
     end
   end
 
   defp acked?(%Message{current_ack_status: status}), do: not is_nil(status)
 
-  defp attempt_delivery(%Delivery{} = delivery, %Message{} = message, %Agent{} = recipient, now) do
-    attempt_number = delivery.attempt_count + 1
+  defp attempt_delivery(
+         %DeliveryClaim{delivery: delivery, message: message, attempt_number: attempt_number} =
+           claim,
+         %Agent{} = recipient,
+         now
+       ) do
     max_attempts = delivery.max_attempts || max_attempts(recipient)
     body = request_body(delivery, message)
     raw_body = Jason.encode!(body)
@@ -209,9 +149,7 @@ defmodule Atp.Transport.WebhookDelivery do
           )
       end
 
-    insert_attempt!(delivery, message, recipient, request_result)
-    update_delivery!(delivery, request_result)
-    update_message(message, request_result)
+    DeliveryClaims.finish_claimed_webhook_delivery(claim, request_result)
   end
 
   defp max_attempts(%Agent{} = recipient) do
@@ -362,50 +300,12 @@ defmodule Atp.Transport.WebhookDelivery do
     Enum.at(@retry_delays_seconds, next_attempt_number - 1, @max_retry_delay_seconds)
   end
 
-  defp insert_attempt!(%Delivery{} = delivery, %Message{} = message, %Agent{} = recipient, result) do
-    %WebhookAttempt{id: ID.generate("wha")}
-    |> WebhookAttempt.changeset(%{
-      delivery_id: delivery.id,
-      message_id: message.id,
-      recipient_agent_id: recipient.id,
-      attempt_number: result.attempt_number,
-      request_url: recipient.webhook_url,
-      response_status: result.response_status,
-      error: result.error,
-      result: result.result,
-      next_attempt_at: result.next_attempt_at
-    })
-    |> Repo.insert!()
-  end
-
-  defp update_delivery!(%Delivery{} = delivery, result) do
-    delivery
-    |> Ecto.Changeset.change(
-      attempt_count: result.attempt_number,
-      status: result.delivery_status,
-      leased_until: nil,
-      next_attempt_at: result.next_attempt_at,
-      delivered_at: result.delivered_at,
-      last_error: result.error
-    )
-    |> Repo.update!()
-  end
-
-  defp update_message(%Message{} = message, %{message_status: message_status}) do
-    now = DateTime.utc_now(:microsecond)
-
-    Message
-    |> where([persisted_message], persisted_message.id == ^message.id)
-    |> where([persisted_message], persisted_message.carrier_status != "delivered")
-    |> Repo.update_all(set: [carrier_status: message_status, updated_at: now])
-
-    {:ok, Repo.get!(Message, message.id)}
-  end
-
-  defp expire_delivery!(%Delivery{} = delivery, %Message{} = message, now) do
+  defp expire_delivery!(%DeliveryClaim{delivery: delivery, message: message}, now) do
     delivery
     |> Ecto.Changeset.change(
       status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
       leased_until: nil,
       next_attempt_at: nil,
       last_error: "message_expired"
@@ -420,10 +320,12 @@ defmodule Atp.Transport.WebhookDelivery do
     {:ok, Repo.get!(Message, message.id)}
   end
 
-  defp stop_delivery_after_ack!(%Delivery{} = delivery, %Message{} = message) do
+  defp stop_delivery_after_ack!(%DeliveryClaim{delivery: delivery, message: message}) do
     delivery
     |> Ecto.Changeset.change(
       status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
       leased_until: nil,
       next_attempt_at: nil,
       last_error: "message_acked"
