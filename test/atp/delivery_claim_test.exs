@@ -175,7 +175,151 @@ defmodule Atp.DeliveryClaimTest do
     end
   end
 
+  test "does not claim delivered or failed webhook deliveries", %{conn: conn} do
+    terminal_statuses = ["delivered", "failed"]
+
+    for status <- terminal_statuses do
+      {delivery, message, _recipient_agent} =
+        prepare_due_webhook_delivery!(conn, "terminal-delivery-#{status}")
+
+      delivery
+      |> Ecto.Changeset.change(status: status)
+      |> Repo.update!()
+
+      assert {:ok, %Message{} = skipped_message} =
+               Transport.claim_webhook_delivery(delivery.id, lease_seconds: 90)
+
+      assert skipped_message.id == message.id
+
+      persisted = Repo.get!(Delivery, delivery.id)
+
+      assert persisted.status == status
+      assert is_nil(persisted.claim_token)
+      assert is_nil(persisted.claimed_at)
+      assert is_nil(persisted.leased_until)
+      assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
+    end
+  end
+
+  test "does not claim ACKed webhook messages and terminalizes their delivery", %{conn: conn} do
+    {delivery, message, _recipient_agent, recipient} =
+      prepare_due_webhook_delivery_context!(conn, "acked-terminal-claim")
+
+    polling_delivery =
+      claim_inbox!(recipient["agent_api_key"]["token"], "claim-acked-terminal-message", %{
+        "lease_seconds" => 60
+      })
+
+    ack_delivery!(
+      recipient["agent_api_key"]["token"],
+      polling_delivery["id"],
+      "ack-acked-terminal-message",
+      %{"status" => "accepted"}
+    )
+
+    assert {:ok, nil} = Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    persisted_delivery = Repo.get!(Delivery, delivery.id)
+    persisted_message = Repo.get!(Message, message.id)
+
+    assert persisted_delivery.status == "failed"
+    assert persisted_delivery.last_error == "message_acked"
+    assert persisted_delivery.attempt_count == 0
+    assert is_nil(persisted_delivery.claim_token)
+    assert is_nil(persisted_delivery.claimed_at)
+    assert is_nil(persisted_delivery.leased_until)
+    assert persisted_message.current_ack_status == "accepted"
+    assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
+  end
+
+  test "does not claim expired webhook messages and terminalizes their delivery", %{conn: conn} do
+    {delivery, message, _recipient_agent} =
+      prepare_due_webhook_delivery!(conn, "expired-terminal-claim")
+
+    message
+    |> Ecto.Changeset.change(
+      expires_at: DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
+    )
+    |> Repo.update!()
+
+    assert {:ok, nil} = Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    persisted_delivery = Repo.get!(Delivery, delivery.id)
+    persisted_message = Repo.get!(Message, message.id)
+
+    assert persisted_delivery.status == "failed"
+    assert persisted_delivery.last_error == "message_expired"
+    assert persisted_delivery.attempt_count == 0
+    assert is_nil(persisted_delivery.claim_token)
+    assert is_nil(persisted_delivery.claimed_at)
+    assert is_nil(persisted_delivery.leased_until)
+    assert persisted_message.carrier_status == "expired"
+    assert %DateTime{} = persisted_message.terminal_at
+    assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
+  end
+
+  test "reclaims expired webhook delivery leases with a new claim token", %{conn: conn} do
+    {delivery, _message, _recipient_agent} =
+      prepare_due_webhook_delivery!(conn, "expired-lease-reclaim")
+
+    assert {:ok, %DeliveryClaim{} = first_claim} =
+             Transport.claim_webhook_delivery(delivery.id, lease_seconds: 60)
+
+    first_claim.delivery
+    |> Ecto.Changeset.change(
+      leased_until: DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
+    )
+    |> Repo.update!()
+
+    assert {:ok, %DeliveryClaim{} = reclaimed_claim} =
+             Transport.claim_due_webhook_delivery(lease_seconds: 120)
+
+    assert reclaimed_claim.delivery.id == delivery.id
+    assert reclaimed_claim.claim_token =~ "dcl_"
+    assert reclaimed_claim.claim_token != first_claim.claim_token
+    assert reclaimed_claim.attempt_number == first_claim.attempt_number
+
+    persisted_delivery = Repo.get!(Delivery, delivery.id)
+
+    assert persisted_delivery.status == "leased"
+    assert persisted_delivery.claim_token == reclaimed_claim.claim_token
+    assert persisted_delivery.claimed_at == reclaimed_claim.delivery.claimed_at
+    assert persisted_delivery.leased_until == reclaimed_claim.leased_until
+  end
+
+  test "does not claim later session webhook deliveries before earlier deliveries resolve", %{
+    conn: conn
+  } do
+    {first_delivery, second_delivery} = prepare_ordered_session_webhook_deliveries!(conn)
+
+    assert {:ok, %DeliveryClaim{} = first_claim} =
+             Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    assert first_claim.delivery.id == first_delivery.id
+    assert {:ok, nil} = Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    delivered_at = DateTime.utc_now(:microsecond)
+
+    assert {:ok, %Message{}} =
+             Transport.finish_claimed_webhook_delivery(
+               first_claim,
+               delivered_attempt_result(first_claim, delivered_at)
+             )
+
+    assert {:ok, %DeliveryClaim{} = second_claim} =
+             Transport.claim_due_webhook_delivery(lease_seconds: 90)
+
+    assert second_claim.delivery.id == second_delivery.id
+  end
+
   defp prepare_due_webhook_delivery!(conn, key) do
+    {delivery, message, recipient_agent, _recipient} =
+      prepare_due_webhook_delivery_context!(conn, key)
+
+    {delivery, message, recipient_agent}
+  end
+
+  defp prepare_due_webhook_delivery_context!(conn, key) do
     account = create_account!(conn)
     account_token = account["account_api_key"]["token"]
     sender = register_agent!(account_token, "register-#{key}-sender", %{})
@@ -202,7 +346,7 @@ defmodule Atp.DeliveryClaimTest do
 
     assert {:ok, delivery} = WebhookDelivery.prepare(message, recipient_agent)
 
-    {delivery, message, recipient_agent}
+    {delivery, message, recipient_agent, recipient}
   end
 
   defp delivered_attempt_result(%DeliveryClaim{} = claim, delivered_at) do
@@ -223,5 +367,73 @@ defmodule Atp.DeliveryClaimTest do
     |> Repo.get!(agent_id)
     |> Ecto.Changeset.change(webhook_active: active?)
     |> Repo.update!()
+  end
+
+  defp prepare_ordered_session_webhook_deliveries!(conn) do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    initiator = register_agent!(account_token, "register-session-order-initiator", %{})
+    recipient = register_agent!(account_token, "register-session-order-recipient", %{})
+
+    configure_webhook!(
+      recipient,
+      "configure-session-order-recipient",
+      "https://recipient.example.test/atp/session-order"
+    )
+
+    set_webhook_active!(recipient["id"], false)
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-session-order",
+        recipient["address"],
+        a2a_user_text("session-order-opening", "open ordered session")
+      )
+
+    opening_delivery =
+      claim_inbox!(recipient["agent_api_key"]["token"], "claim-session-order-opening", %{
+        "lease_seconds" => 60
+      })
+
+    ack_delivery!(
+      recipient["agent_api_key"]["token"],
+      opening_delivery["id"],
+      "ack-session-order-opening",
+      %{"status" => "accepted"}
+    )
+
+    first =
+      send_session_message!(
+        initiator["agent_api_key"]["token"],
+        opened["session"]["id"],
+        "send-session-order-first",
+        a2a_user_text("session-order-first", "first ordered webhook")
+      )
+
+    second =
+      send_session_message!(
+        initiator["agent_api_key"]["token"],
+        opened["session"]["id"],
+        "send-session-order-second",
+        a2a_user_text("session-order-second", "second ordered webhook")
+      )
+
+    recipient_agent = set_webhook_active!(recipient["id"], true)
+    first_message = Repo.get!(Message, first["message_status"]["message"]["id"])
+    second_message = Repo.get!(Message, second["message_status"]["message"]["id"])
+
+    assert {:ok, first_delivery} = WebhookDelivery.prepare(first_message, recipient_agent)
+    assert {:ok, second_delivery} = WebhookDelivery.prepare(second_message, recipient_agent)
+
+    {first_delivery, second_delivery}
+  end
+
+  defp send_session_message!(agent_token, session_id, key, payload) do
+    build_conn()
+    |> authorize(agent_token)
+    |> idempotency_key(key)
+    |> post("/api/sessions/#{session_id}/messages", %{"payload" => payload})
+    |> json_response(201)
   end
 end
