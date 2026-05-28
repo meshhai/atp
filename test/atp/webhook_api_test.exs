@@ -1030,6 +1030,60 @@ defmodule Atp.WebhookAPITest do
     assert_delivered_delivery!(stale_id)
   end
 
+  test "due webhook delivery recovery uses a fresh lease for each claimed row", %{conn: conn} do
+    test_pid = self()
+    stale_batch_now = DateTime.add(DateTime.utc_now(:microsecond), -120, :second)
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery = Atp.Repo.get!(Delivery, headers["atp-delivery-id"])
+
+      send(
+        test_pid,
+        {:fresh_due_claim, headers["atp-delivery-id"], delivery.claimed_at, delivery.leased_until}
+      )
+
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-fresh-due-sender", %{})
+    recipient = register_agent!(account_token, "register-fresh-due-recipient", %{})
+    configure_webhook!(recipient, "configure-fresh-due-recipient")
+
+    first_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "fresh-due-first",
+        a2a_user_text("fresh-due-first", "first delivery")
+      )
+
+    second_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "fresh-due-second",
+        a2a_user_text("fresh-due-second", "second delivery")
+      )
+
+    assert {:ok, [{:ok, _first_message}, {:ok, _second_message}]} =
+             WebhookDelivery.deliver_due(limit: 2, now: stale_batch_now)
+
+    assert_receive {:fresh_due_claim, ^first_id, first_claimed_at, first_leased_until}
+    assert_receive {:fresh_due_claim, ^second_id, second_claimed_at, second_leased_until}
+
+    assert DateTime.compare(first_claimed_at, stale_batch_now) == :gt
+    assert DateTime.compare(second_claimed_at, stale_batch_now) == :gt
+    assert DateTime.compare(first_leased_until, DateTime.utc_now(:microsecond)) == :gt
+    assert DateTime.compare(second_leased_until, DateTime.utc_now(:microsecond)) == :gt
+
+    assert_delivered_delivery!(first_id)
+    assert_delivered_delivery!(second_id)
+    assert Atp.Repo.aggregate(Atp.Transport.WebhookAttempt, :count, :id) == 2
+  end
+
   test "due webhook delivery recovery ignores invalid limits" do
     assert WebhookDelivery.deliver_due(limit: 0) == {:ok, []}
   end
