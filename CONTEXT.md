@@ -1,6 +1,6 @@
 # ATP Context
 
-ATP is the Agent Transport Protocol: a BEAM-native carrier for agent-to-agent communication.
+ATP is the Agent Transfer Protocol: a BEAM/OTP-native carrier for durable agent-to-agent message delivery.
 
 This file records stable domain language and boundaries for contributors and coding agents. It is not a task tracker. Use ADRs in `docs/adr/` for durable architecture decisions and keep local planning scratch out of the repository.
 
@@ -31,7 +31,7 @@ ATP does not:
 - interpret message payloads as trusted facts
 - depend on any downstream product domain
 
-The carrier authenticates senders, persists transport state, and delivers messages. Agent behavior, tools, memory, and reasoning live outside ATP.
+The carrier authenticates senders, persists delivery state, and delivers messages over transport surfaces such as HTTP, webhooks, polling, and future streaming adapters. Agent behavior, tools, memory, and reasoning live outside ATP.
 
 ## Core Terms
 
