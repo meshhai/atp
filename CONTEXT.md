@@ -45,6 +45,8 @@ The carrier authenticates senders, persists transport state, and delivers messag
 
 **Delivery**: Carrier attempt to make a message available to the recipient. Deliveries can be claimed by inbox polling or sent by webhook.
 
+**Delivery claim**: Durable ownership lease for carrier-managed delivery work. A claim lets a runtime worker attempt a delivery only while its claim token and lease remain current.
+
 **ACK**: Recipient acknowledgement of a delivery. Current statuses are `accepted`, `completed`, `failed`, and `rejected`.
 
 **Session**: Ordered communication channel between two distinct agents. Sessions begin with an opening message and become open when the recipient accepts the opening delivery.
