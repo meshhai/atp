@@ -20,18 +20,14 @@ defmodule Atp.Transport.DeliveryClaims do
     lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
-    if valid_lease_seconds?(lease_seconds) do
-      Repo.transaction(fn ->
-        case locked_webhook_delivery(delivery_id) do
-          nil ->
-            Repo.rollback(:not_found)
+    case validate_lease_seconds(lease_seconds) do
+      :ok ->
+        Repo.transaction(fn ->
+          claim_locked_webhook_delivery!(delivery_id, now, lease_seconds)
+        end)
 
-          %Delivery{} = delivery ->
-            claim_or_terminalize_webhook_delivery!(delivery, now, lease_seconds)
-        end
-      end)
-    else
-      {:error, :invalid_lease}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -44,12 +40,14 @@ defmodule Atp.Transport.DeliveryClaims do
     lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
-    if valid_lease_seconds?(lease_seconds) do
-      Repo.transaction(fn ->
-        claim_next_due_webhook_delivery!(now, lease_seconds)
-      end)
-    else
-      {:error, :invalid_lease}
+    case validate_lease_seconds(lease_seconds) do
+      :ok ->
+        Repo.transaction(fn ->
+          claim_next_due_webhook_delivery!(now, lease_seconds)
+        end)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -64,19 +62,7 @@ defmodule Atp.Transport.DeliveryClaims do
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
     Repo.transaction(fn ->
-      case fetch_locked_webhook_claim_delivery(delivery_id) do
-        nil ->
-          Repo.rollback(:stale_delivery_claim)
-
-        %Delivery{} = delivery ->
-          with :ok <- validate_webhook_delivery_claim(delivery, claim, result, now) do
-            insert_claimed_webhook_attempt!(claim, result)
-            update_claimed_webhook_delivery!(delivery, result)
-            update_claimed_webhook_message!(delivery.message, result)
-          else
-            {:error, reason} -> Repo.rollback(reason)
-          end
-      end
+      finish_locked_webhook_delivery!(delivery_id, claim, result, now)
     end)
   end
 
@@ -96,22 +82,67 @@ defmodule Atp.Transport.DeliveryClaims do
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
     Repo.transaction(fn ->
-      case fetch_locked_webhook_claim_delivery(delivery_id) do
-        nil ->
-          Repo.rollback(:stale_delivery_claim)
-
-        %Delivery{} = delivery ->
-          with :ok <- validate_webhook_delivery_claim(delivery, claim, now),
-               :ok <- validate_webhook_terminal_reason(delivery.message, reason, now) do
-            terminalize_claimed_webhook_delivery!(delivery, reason, now)
-          else
-            {:error, reason} -> Repo.rollback(reason)
-          end
-      end
+      terminalize_locked_webhook_delivery!(delivery_id, claim, reason, now)
     end)
   end
 
   defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0
+
+  defp validate_lease_seconds(seconds) do
+    if valid_lease_seconds?(seconds), do: :ok, else: {:error, :invalid_lease}
+  end
+
+  defp claim_locked_webhook_delivery!(delivery_id, now, lease_seconds) do
+    case locked_webhook_delivery(delivery_id) do
+      nil ->
+        Repo.rollback(:not_found)
+
+      %Delivery{} = delivery ->
+        claim_or_terminalize_webhook_delivery!(delivery, now, lease_seconds)
+    end
+  end
+
+  defp finish_locked_webhook_delivery!(delivery_id, claim, result, now) do
+    case fetch_locked_webhook_claim_delivery(delivery_id) do
+      nil ->
+        Repo.rollback(:stale_delivery_claim)
+
+      %Delivery{} = delivery ->
+        finish_validated_webhook_delivery!(delivery, claim, result, now)
+    end
+  end
+
+  defp finish_validated_webhook_delivery!(delivery, claim, result, now) do
+    case validate_webhook_delivery_claim(delivery, claim, result, now) do
+      :ok ->
+        insert_claimed_webhook_attempt!(claim, result)
+        update_claimed_webhook_delivery!(delivery, result)
+        update_claimed_webhook_message!(delivery.message, result)
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
+
+  defp terminalize_locked_webhook_delivery!(delivery_id, claim, reason, now) do
+    case fetch_locked_webhook_claim_delivery(delivery_id) do
+      nil ->
+        Repo.rollback(:stale_delivery_claim)
+
+      %Delivery{} = delivery ->
+        terminalize_validated_webhook_delivery!(delivery, claim, reason, now)
+    end
+  end
+
+  defp terminalize_validated_webhook_delivery!(delivery, claim, reason, now) do
+    case validate_webhook_terminal_claim(delivery, claim, reason, now) do
+      :ok ->
+        terminalize_claimed_webhook_delivery!(delivery, reason, now)
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
 
   defp claim_next_due_webhook_delivery!(now, lease_seconds) do
     case Repo.one(claimable_webhook_delivery_query(now)) do
@@ -325,6 +356,13 @@ defmodule Atp.Transport.DeliveryClaims do
 
       true ->
         :ok
+    end
+  end
+
+  defp validate_webhook_terminal_claim(delivery, claim, reason, now) do
+    case validate_webhook_delivery_claim(delivery, claim, now) do
+      :ok -> validate_webhook_terminal_reason(delivery.message, reason, now)
+      {:error, reason} -> {:error, reason}
     end
   end
 
