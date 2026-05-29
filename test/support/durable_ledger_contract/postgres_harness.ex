@@ -9,11 +9,73 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   @endpoint AtpWeb.Endpoint
 
+  import Ecto.Query
   import Phoenix.ConnTest
 
   alias Atp.Identity.Agent
   alias Atp.Repo
   alias Atp.Transport.{Delivery, Message, WebhookAttempt, WebhookDelivery}
+
+  @spec prepare_direct_message_pair!(Plug.Conn.t(), String.t()) :: {Agent.t(), Agent.t()}
+  def prepare_direct_message_pair!(conn, key) do
+    account = Atp.ConnCase.create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+    {get_agent!(sender["id"]), get_agent!(recipient["id"])}
+  end
+
+  @spec prepare_active_webhook_direct_message_pair!(Plug.Conn.t(), String.t()) ::
+          {Agent.t(), Agent.t()}
+  def prepare_active_webhook_direct_message_pair!(conn, key) do
+    account = Atp.ConnCase.create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+    Atp.ConnCase.configure_webhook!(
+      recipient,
+      "configure-#{key}-webhook",
+      "https://recipient.example.test/atp/#{key}"
+    )
+
+    {get_agent!(sender["id"]), get_agent!(recipient["id"])}
+  end
+
+  @spec prepare_direct_message_principal_scope!(Plug.Conn.t(), String.t()) ::
+          {Agent.t(), Agent.t(), Agent.t()}
+  def prepare_direct_message_principal_scope!(conn, key) do
+    account = Atp.ConnCase.create_account!(conn)
+    promote_to_basic!(account)
+
+    account_token = account["account_api_key"]["token"]
+    first_sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-first", %{})
+    second_sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-second", %{})
+    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+    {get_agent!(first_sender["id"]), get_agent!(second_sender["id"]), get_agent!(recipient["id"])}
+  end
+
+  @spec expect_successful_webhook_delivery!(pid()) :: :ok
+  def expect_successful_webhook_delivery!(test_pid) when is_pid(test_pid) do
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      {:ok, body, request_conn} = Plug.Conn.read_body(request_conn)
+      send(test_pid, {:contract_direct_webhook_request, Jason.decode!(body)})
+
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    :ok
+  end
+
+  @spec carrier_counts() :: %{messages: non_neg_integer(), deliveries: non_neg_integer()}
+  def carrier_counts do
+    %{
+      messages: Repo.aggregate(Message, :count, :id),
+      deliveries: Repo.aggregate(Delivery, :count, :id)
+    }
+  end
 
   @spec prepare_due_webhook_delivery!(Plug.Conn.t(), String.t()) ::
           {Delivery.t(), Message.t(), Agent.t()}
@@ -143,6 +205,14 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     |> Repo.update!()
   end
 
+  @spec disable_agent!(Agent.t()) :: Agent.t()
+  def disable_agent!(%Agent{id: agent_id}) do
+    agent_id
+    |> get_agent!()
+    |> Ecto.Changeset.change(status: "disabled")
+    |> Repo.update!()
+  end
+
   @spec ack_delivery_through_polling!(map(), String.t(), String.t()) :: map()
   def ack_delivery_through_polling!(recipient, claim_key, ack_key) do
     polling_delivery =
@@ -164,6 +234,14 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec get_message!(String.t()) :: Message.t()
   def get_message!(message_id), do: Repo.get!(Message, message_id)
 
+  @spec get_deliveries_for_message!(String.t()) :: [Delivery.t()]
+  def get_deliveries_for_message!(message_id) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message_id)
+    |> order_by([delivery], asc: delivery.inserted_at)
+    |> Repo.all()
+  end
+
   @spec get_webhook_attempt_by_delivery!(String.t()) :: WebhookAttempt.t()
   def get_webhook_attempt_by_delivery!(delivery_id) do
     Repo.get_by!(WebhookAttempt, delivery_id: delivery_id)
@@ -171,6 +249,15 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   @spec webhook_attempt_count() :: non_neg_integer()
   def webhook_attempt_count, do: Repo.aggregate(WebhookAttempt, :count, :id)
+
+  defp get_agent!(agent_id), do: Repo.get!(Agent, agent_id)
+
+  defp promote_to_basic!(account) do
+    Atp.Identity.Account
+    |> Repo.get!(account["id"])
+    |> Ecto.Changeset.change(plan: "basic")
+    |> Repo.update!()
+  end
 
   defp set_webhook_active!(agent_id, active?) do
     Agent
