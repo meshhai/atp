@@ -14,11 +14,13 @@ At the same time, ATP cannot keep correctness only in memory. External clients n
 
 ## Decision
 
-ATP uses a BEAM/OTP live plane over a durable Postgres ledger.
+ATP uses a BEAM/OTP live plane over a durable ledger.
 
 The BEAM live plane owns active carrier lifecycle such as active session processes, per-session ordering, timers, process recovery, and live routing decisions.
 
 The durable ledger owns external truth: accounts, agents, messages, deliveries, ACKs, sessions, idempotency, sender policy, webhook attempts, and recovery state.
+
+ADR 0003 clarifies that the durable ledger is a storage-engine-neutral carrier contract. Postgres/Ecto is the current implementation, not a protocol requirement.
 
 HTTP APIs, webhooks, polling, CLIs, and SDKs are edge adapters into the carrier. They are not the runtime center of ATP.
 
