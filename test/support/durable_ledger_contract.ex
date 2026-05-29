@@ -56,6 +56,16 @@ defmodule Atp.Support.DurableLedgerContract do
         )
       end
 
+      test "contract: direct ACKed and expired messages terminalize without attempts", %{
+        conn: conn
+      } do
+        DurableLedgerContract.assert_direct_claim_terminalization(
+          @ledger_adapter,
+          conn,
+          "direct-terminal"
+        )
+      end
+
       test "contract: session webhook delivery order is preserved", %{conn: conn} do
         DurableLedgerContract.assert_session_ordering(@ledger_adapter, conn, "session-order")
       end
@@ -243,6 +253,71 @@ defmodule Atp.Support.DurableLedgerContract do
     assert persisted_expired_delivery.last_error == "message_expired"
     assert persisted_expired_delivery.attempt_count == 0
     assert is_nil(persisted_expired_delivery.claim_token)
+    assert persisted_expired_message.carrier_status == "expired"
+    assert %DateTime{} = persisted_expired_message.terminal_at
+    assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
+
+    :ok
+  end
+
+  @spec assert_direct_claim_terminalization(module(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_direct_claim_terminalization(adapter, conn, key)
+      when is_atom(adapter) and is_binary(key) do
+    {acked_delivery, acked_message, _acked_agent, recipient} =
+      prepare_due_webhook_delivery_context!(conn, "#{key}-acked")
+
+    polling_delivery =
+      Atp.ConnCase.claim_inbox!(recipient["agent_api_key"]["token"], "#{key}-claim-inbox", %{
+        "lease_seconds" => 60
+      })
+
+    Atp.ConnCase.ack_delivery!(
+      recipient["agent_api_key"]["token"],
+      polling_delivery["id"],
+      "#{key}-ack",
+      %{"status" => "accepted"}
+    )
+
+    assert {:ok, %Message{} = terminal_acked_message} =
+             claim_delivery(adapter, acked_delivery.id, lease_seconds: 90)
+
+    assert terminal_acked_message.id == acked_message.id
+
+    persisted_acked_delivery = Repo.get!(Delivery, acked_delivery.id)
+    persisted_acked_message = Repo.get!(Message, acked_message.id)
+
+    assert persisted_acked_delivery.status == "failed"
+    assert persisted_acked_delivery.last_error == "message_acked"
+    assert persisted_acked_delivery.attempt_count == 0
+    assert is_nil(persisted_acked_delivery.claim_token)
+    assert is_nil(persisted_acked_delivery.claimed_at)
+    assert is_nil(persisted_acked_delivery.leased_until)
+    assert persisted_acked_message.current_ack_status == "accepted"
+
+    {expired_delivery, expired_message, _expired_agent} =
+      prepare_due_webhook_delivery!(conn, "#{key}-expired")
+
+    expired_message
+    |> Ecto.Changeset.change(
+      expires_at: DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
+    )
+    |> Repo.update!()
+
+    assert {:ok, %Message{} = terminal_expired_message} =
+             claim_delivery(adapter, expired_delivery.id, lease_seconds: 90)
+
+    assert terminal_expired_message.id == expired_message.id
+    assert terminal_expired_message.carrier_status == "expired"
+
+    persisted_expired_delivery = Repo.get!(Delivery, expired_delivery.id)
+    persisted_expired_message = Repo.get!(Message, expired_message.id)
+
+    assert persisted_expired_delivery.status == "failed"
+    assert persisted_expired_delivery.last_error == "message_expired"
+    assert persisted_expired_delivery.attempt_count == 0
+    assert is_nil(persisted_expired_delivery.claim_token)
+    assert is_nil(persisted_expired_delivery.claimed_at)
+    assert is_nil(persisted_expired_delivery.leased_until)
     assert persisted_expired_message.carrier_status == "expired"
     assert %DateTime{} = persisted_expired_message.terminal_at
     assert Repo.aggregate(WebhookAttempt, :count, :id) == 0
