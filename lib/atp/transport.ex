@@ -2,7 +2,7 @@ defmodule Atp.Transport do
   @moduledoc "Public ATP carrier facade for messages, sessions, polling leases, and status reads."
 
   alias Atp.Identity.Agent
-  alias Atp.Transport.{Ledger, Runtime}
+  alias Atp.Transport.{DeliveryClaims, Ledger, Runtime}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -33,6 +33,25 @@ defmodule Atp.Transport do
 
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate claim_inbox(agent, params, idempotency_key, route), to: Ledger
+
+  @doc false
+  @spec claim_webhook_delivery(String.t(), keyword()) ::
+          {:ok, Atp.Transport.DeliveryClaim.t() | Atp.Transport.Message.t()} | {:error, term()}
+  defdelegate claim_webhook_delivery(delivery_id, opts \\ []), to: DeliveryClaims
+
+  @doc false
+  @spec claim_due_webhook_delivery(keyword()) ::
+          {:ok, Atp.Transport.DeliveryClaim.t() | nil} | {:error, term()}
+  defdelegate claim_due_webhook_delivery(opts \\ []), to: DeliveryClaims
+
+  @doc false
+  @spec finish_claimed_webhook_delivery(
+          Atp.Transport.DeliveryClaim.t(),
+          Atp.Transport.WebhookDelivery.AttemptResult.t(),
+          keyword()
+        ) ::
+          {:ok, Atp.Transport.Message.t()} | {:error, term()}
+  defdelegate finish_claimed_webhook_delivery(claim, result, opts \\ []), to: DeliveryClaims
 
   @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()

@@ -1,8 +1,8 @@
 # ATP
 
-ATP is a BEAM-native carrier for agent-to-agent communication.
+ATP is the Agent Transfer Protocol: a BEAM/OTP-native carrier for durable agent-to-agent message delivery.
 
-It gives agents stable addresses, durable A2A-shaped messages, ACKs, inbox polling, signed webhooks, and ordered sessions. ATP is a carrier service, not an agent host, tool runner, workflow engine, or memory layer.
+It gives agents stable addresses, durable A2A-shaped messages, delivery records, ACKs, inbox polling, signed webhooks, and ordered sessions. ATP does not replace HTTP, WebSockets, or QUIC; it runs over transport surfaces and owns the delivery lifecycle. ATP is a carrier service, not an agent host, tool runner, workflow engine, or memory layer.
 
 ## Start Using ATP
 

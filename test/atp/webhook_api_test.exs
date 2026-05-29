@@ -480,6 +480,8 @@ defmodule Atp.WebhookAPITest do
 
     active_delivery = Atp.Repo.get!(Delivery, delivery_id)
     assert active_delivery.status == "leased"
+    assert active_delivery.claim_token =~ "dcl_"
+    assert %DateTime{} = active_delivery.claimed_at
     assert DateTime.compare(active_delivery.leased_until, DateTime.utc_now(:microsecond)) == :gt
 
     assert WebhookDelivery.deliver_now(delivery_id) == {:error, :delivery_in_progress}
@@ -981,7 +983,14 @@ defmodule Atp.WebhookAPITest do
 
     Req.Test.stub(WebhookDelivery, fn request_conn ->
       headers = Map.new(request_conn.req_headers)
-      send(test_pid, {:due_webhook_request, headers["atp-delivery-id"]})
+      delivery = Atp.Repo.get!(Delivery, headers["atp-delivery-id"])
+
+      send(
+        test_pid,
+        {:due_webhook_request, headers["atp-delivery-id"], delivery.claim_token,
+         delivery.claimed_at}
+      )
+
       Plug.Conn.send_resp(request_conn, 204, "")
     end)
 
@@ -1011,15 +1020,77 @@ defmodule Atp.WebhookAPITest do
     assert {:ok, [{:ok, _prepared_message}, {:ok, _stale_message}]} =
              WebhookDelivery.deliver_due(limit: 10)
 
-    assert_receive {:due_webhook_request, ^prepared_id}
-    assert_receive {:due_webhook_request, ^stale_id}
+    assert_receive {:due_webhook_request, ^prepared_id, prepared_claim_token, %DateTime{}}
+    assert prepared_claim_token =~ "dcl_"
+
+    assert_receive {:due_webhook_request, ^stale_id, stale_claim_token, %DateTime{}}
+    assert stale_claim_token =~ "dcl_"
 
     assert_delivered_delivery!(prepared_id)
     assert_delivered_delivery!(stale_id)
   end
 
+  test "due webhook delivery recovery uses a fresh lease for each claimed row", %{conn: conn} do
+    test_pid = self()
+    stale_batch_now = DateTime.add(DateTime.utc_now(:microsecond), -120, :second)
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery = Atp.Repo.get!(Delivery, headers["atp-delivery-id"])
+
+      send(
+        test_pid,
+        {:fresh_due_claim, headers["atp-delivery-id"], delivery.claimed_at, delivery.leased_until}
+      )
+
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-fresh-due-sender", %{})
+    recipient = register_agent!(account_token, "register-fresh-due-recipient", %{})
+    configure_webhook!(recipient, "configure-fresh-due-recipient")
+
+    first_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "fresh-due-first",
+        a2a_user_text("fresh-due-first", "first delivery")
+      )
+
+    second_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "fresh-due-second",
+        a2a_user_text("fresh-due-second", "second delivery")
+      )
+
+    assert {:ok, [{:ok, _first_message}, {:ok, _second_message}]} =
+             WebhookDelivery.deliver_due(limit: 2, now: stale_batch_now)
+
+    assert_receive {:fresh_due_claim, ^first_id, first_claimed_at, first_leased_until}
+    assert_receive {:fresh_due_claim, ^second_id, second_claimed_at, second_leased_until}
+
+    assert DateTime.compare(first_claimed_at, stale_batch_now) == :gt
+    assert DateTime.compare(second_claimed_at, stale_batch_now) == :gt
+    assert DateTime.compare(first_leased_until, DateTime.utc_now(:microsecond)) == :gt
+    assert DateTime.compare(second_leased_until, DateTime.utc_now(:microsecond)) == :gt
+
+    assert_delivered_delivery!(first_id)
+    assert_delivered_delivery!(second_id)
+    assert Atp.Repo.aggregate(Atp.Transport.WebhookAttempt, :count, :id) == 2
+  end
+
   test "due webhook delivery recovery ignores invalid limits" do
     assert WebhookDelivery.deliver_due(limit: 0) == {:ok, []}
+  end
+
+  test "due webhook delivery recovery surfaces claim errors" do
+    assert WebhookDelivery.deliver_due(limit: 1, lease_seconds: 0) ==
+             {:ok, [{:error, :invalid_lease}]}
   end
 
   test "webhook dispatcher drains durable due delivery rows", %{conn: conn} do
@@ -1166,6 +1237,8 @@ defmodule Atp.WebhookAPITest do
     delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
 
     assert delivery.status == "delivered"
+    assert is_nil(delivery.claim_token)
+    assert is_nil(delivery.claimed_at)
     assert is_nil(delivery.leased_until)
     assert delivery.attempt_count == 1
   end

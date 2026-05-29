@@ -1,5 +1,5 @@
 defmodule Atp.Transport.Delivery do
-  @moduledoc "Concrete ATP polling delivery lease for one message."
+  @moduledoc "Concrete ATP delivery row for polling leases and webhook attempts."
 
   use Ecto.Schema
 
@@ -19,6 +19,8 @@ defmodule Atp.Transport.Delivery do
 
     field(:mode, :string)
     field(:status, :string)
+    field(:claim_token, :string)
+    field(:claimed_at, :utc_datetime_usec)
     field(:leased_until, :utc_datetime_usec)
     field(:attempt_count, :integer, default: 0)
     field(:max_attempts, :integer)
@@ -37,6 +39,8 @@ defmodule Atp.Transport.Delivery do
           recipient_agent_id: String.t(),
           mode: String.t(),
           status: String.t(),
+          claim_token: String.t() | nil,
+          claimed_at: DateTime.t() | nil,
           leased_until: DateTime.t() | nil,
           attempt_count: non_neg_integer(),
           max_attempts: pos_integer() | nil,
@@ -44,6 +48,7 @@ defmodule Atp.Transport.Delivery do
           delivered_at: DateTime.t() | nil,
           last_error: String.t() | nil,
           message: Message.t() | Ecto.Association.NotLoaded.t(),
+          recipient_agent: Agent.t() | Ecto.Association.NotLoaded.t(),
           webhook_attempts: [WebhookAttempt.t()] | Ecto.Association.NotLoaded.t()
         }
 
@@ -55,6 +60,8 @@ defmodule Atp.Transport.Delivery do
       :recipient_agent_id,
       :mode,
       :status,
+      :claim_token,
+      :claimed_at,
       :leased_until,
       :attempt_count,
       :max_attempts,
