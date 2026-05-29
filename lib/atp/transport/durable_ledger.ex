@@ -12,13 +12,32 @@ defmodule Atp.Transport.DurableLedger do
   Callbacks use transport structs and avoid exposing storage-engine mechanics.
   """
 
+  alias Atp.Identity.{Agent, Idempotency}
   alias Atp.Transport.{DeliveryClaim, Message}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
+  @type direct_message_after_commit :: Idempotency.prepared_after_commit() | nil
+  @type direct_message_intake_result ::
+          {:ok, pos_integer(), map(), direct_message_after_commit()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
   @type finish_result :: {:ok, Message.t()} | {:error, term()}
+
+  @doc """
+  Accepts one direct message into the durable carrier ledger.
+
+  Implementations must validate the request, apply idempotency for the sender,
+  route, key, and body, resolve the recipient, enforce sender policy, persist
+  the message, prepare delivery work, and return stable retry results.
+
+  Implementations may return prepared post-commit work for the caller to
+  complete, but they must not perform active webhook dispatch themselves. This
+  capability is for direct messages only; session opening and session message
+  sends are separate carrier operations.
+  """
+  @callback accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
+              direct_message_intake_result()
 
   @doc """
   Claims the next due webhook delivery eligible for carrier work.
@@ -63,6 +82,13 @@ defmodule Atp.Transport.DurableLedger do
     :atp
     |> Application.get_env(__MODULE__, [])
     |> Keyword.get(:adapter, Atp.Transport.DurableLedger.Postgres)
+  end
+
+  @spec accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
+          direct_message_intake_result()
+  def accept_direct_message(%Agent{} = sender, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    adapter().accept_direct_message(sender, params, idempotency_key, route)
   end
 
   @spec claim_due_webhook_delivery(keyword()) :: due_claim_result()

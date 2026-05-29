@@ -1,10 +1,9 @@
 defmodule Atp.Transport.Ledger do
   @moduledoc """
-  Durable ATP carrier operations for messages, sessions, polling leases, and status reads.
+  Durable ATP carrier operations for sessions, polling leases, and status reads.
 
-  This module owns the current Postgres-backed implementation. The public
-  `Atp.Transport` facade and runtime seam delegate here until later runtime
-  slices move active session ownership into supervised processes.
+  This module owns remaining Postgres-backed carrier operations that have not
+  moved behind semantic durable ledger callbacks yet.
   """
 
   import Ecto.Query
@@ -32,24 +31,6 @@ defmodule Atp.Transport.Ledger do
   @type prepared_api_result ::
           {:ok, pos_integer(), map(), Idempotency.prepared_after_commit() | nil}
           | {:error, term()}
-
-  @spec send_message(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
-  def send_message(%Agent{} = sender, params, idempotency_key, route) when is_map(params) do
-    with {:ok, recipient_address} <- fetch_to_address(params),
-         {:ok, payload} <- fetch_payload(params),
-         :ok <- Payload.validate_a2a(payload) do
-      sender
-      |> Idempotency.run_after_commit(
-        route,
-        idempotency_key,
-        params,
-        fn -> persist_message_send(sender, recipient_address, payload) end,
-        fn status, body, webhook_delivery_id ->
-          finish_prepared_webhook_delivery(sender, status, body, webhook_delivery_id)
-        end
-      )
-    end
-  end
 
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   def open_session(%Agent{} = initiator, params, idempotency_key, route) when is_map(params) do
@@ -90,22 +71,6 @@ defmodule Atp.Transport.Ledger do
     with {:ok, status, body, prepared} <-
            prepare_session_message_send(sender, session_id, params, idempotency_key, route) do
       finish_prepared_session_message_send(sender, status, body, prepared)
-    end
-  end
-
-  defp persist_message_send(%Agent{} = sender, recipient_address, payload) do
-    with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
-         :ok <-
-           SenderPolicies.enforce_unknown_sender_rate_limit(
-             sender,
-             recipient,
-             trust,
-             blocked?
-           ),
-         {:ok, message} <- insert_message(sender, recipient, trust, blocked?, payload),
-         {:ok, webhook_delivery_id} <-
-           prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
-      {:ok, 201, Response.message_status(message, sender), webhook_delivery_id}
     end
   end
 
@@ -560,7 +525,7 @@ defmodule Atp.Transport.Ledger do
          trust,
          blocked?,
          payload,
-         session_attrs \\ %{}
+         session_attrs
        ) do
     now = DateTime.utc_now(:microsecond)
 
@@ -680,14 +645,6 @@ defmodule Atp.Transport.Ledger do
 
   defp prepare_deliverable_webhook_delivery(%Message{} = message, %Agent{} = recipient, false) do
     prepare_trusted_webhook_delivery(message, recipient)
-  end
-
-  defp finish_prepared_webhook_delivery(%Agent{}, status, body, nil), do: {:ok, status, body}
-
-  defp finish_prepared_webhook_delivery(%Agent{} = viewer, _status, _body, delivery_id) do
-    with {:ok, message} <- WebhookDelivery.deliver_now(delivery_id) do
-      {:ok, 201, Response.message_status(message, viewer)}
-    end
   end
 
   defp finish_prepared_session_webhook_delivery(%Agent{}, status, body, {_session_id, nil}) do

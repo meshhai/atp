@@ -8,14 +8,61 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   import Ecto.Query
 
-  alias Atp.Identity.ID
+  alias Atp.Identity.{Agent, ID, Idempotency}
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, DeliveryClaim, DurableLedger, Message, WebhookAttempt}
+
+  alias Atp.Transport.{
+    Delivery,
+    DeliveryClaim,
+    DurableLedger,
+    Message,
+    Payload,
+    Response,
+    SenderPolicies,
+    WebhookAttempt,
+    WebhookDelivery
+  }
+
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @behaviour DurableLedger
 
+  @default_message_ttl_seconds 7 * 24 * 60 * 60
   @default_webhook_claim_lease_seconds 60
+
+  @impl DurableLedger
+  @spec accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.direct_message_intake_result()
+  def accept_direct_message(%Agent{} = sender, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    with {:ok, recipient_address} <- fetch_to_address(params),
+         {:ok, payload} <- fetch_payload(params),
+         :ok <- Payload.validate_a2a(payload) do
+      sender
+      |> Idempotency.run_prepared_after_commit(
+        route,
+        idempotency_key,
+        params,
+        fn -> persist_direct_message_send(sender, recipient_address, payload) end
+      )
+    end
+  end
+
+  defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
+    with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
+         :ok <-
+           SenderPolicies.enforce_unknown_sender_rate_limit(
+             sender,
+             recipient,
+             trust,
+             blocked?
+           ),
+         {:ok, message} <- insert_direct_message(sender, recipient, trust, blocked?, payload),
+         {:ok, webhook_delivery_id} <-
+           prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
+      {:ok, 201, Response.message_status(message, sender), webhook_delivery_id}
+    end
+  end
 
   @impl DurableLedger
   @spec claim_webhook_delivery(String.t(), keyword()) :: DurableLedger.claim_result()
@@ -85,6 +132,80 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     Repo.transaction(fn ->
       terminalize_locked_webhook_delivery!(delivery_id, claim, reason, now)
     end)
+  end
+
+  defp fetch_to_address(%{"to" => address}) when is_binary(address) do
+    case String.trim(address) do
+      "" -> {:error, :recipient_required}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp fetch_to_address(_params), do: {:error, :recipient_required}
+
+  defp fetch_payload(%{"payload" => payload}), do: {:ok, payload}
+  defp fetch_payload(_params), do: {:error, :payload_required}
+
+  defp fetch_recipient(%Agent{} = sender, address) do
+    case Repo.get_by(Agent, address: address, status: "active") do
+      %Agent{} = recipient ->
+        SenderPolicies.resolve(sender, recipient)
+        |> then(fn {trust, blocked?} -> {:ok, recipient, trust, blocked?} end)
+
+      nil ->
+        {:error, :recipient_not_found}
+    end
+  end
+
+  defp insert_direct_message(
+         %Agent{} = sender,
+         %Agent{} = recipient,
+         trust,
+         blocked?,
+         payload
+       ) do
+    now = DateTime.utc_now(:microsecond)
+
+    %Message{id: ID.generate("msg")}
+    |> Message.changeset(%{
+      sender_account_id: sender.account_id,
+      recipient_account_id: recipient.account_id,
+      sender_agent_id: sender.id,
+      recipient_agent_id: recipient.id,
+      sender_address: sender.address,
+      recipient_address: recipient.address,
+      trust: trust,
+      payload: payload,
+      content_type: Payload.content_type(),
+      carrier_status: carrier_status(blocked?),
+      terminal_at: terminal_timestamp(blocked?, now),
+      expires_at: DateTime.add(now, @default_message_ttl_seconds, :second)
+    })
+    |> Repo.insert()
+  end
+
+  defp carrier_status(true), do: "rejected"
+  defp carrier_status(false), do: "queued"
+
+  defp terminal_timestamp(true, now), do: now
+  defp terminal_timestamp(false, _now), do: nil
+
+  defp prepare_trusted_webhook_delivery(
+         %Message{trust: "trusted"} = message,
+         %Agent{webhook_active: true, webhook_url: url, webhook_secret: secret} = recipient
+       )
+       when is_binary(url) and is_binary(secret) do
+    with {:ok, delivery} <- WebhookDelivery.prepare(message, recipient) do
+      {:ok, delivery.id}
+    end
+  end
+
+  defp prepare_trusted_webhook_delivery(%Message{}, %Agent{}), do: {:ok, nil}
+
+  defp prepare_deliverable_webhook_delivery(%Message{}, %Agent{}, true), do: {:ok, nil}
+
+  defp prepare_deliverable_webhook_delivery(%Message{} = message, %Agent{} = recipient, false) do
+    prepare_trusted_webhook_delivery(message, recipient)
   end
 
   defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0

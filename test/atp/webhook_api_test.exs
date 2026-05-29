@@ -265,6 +265,61 @@ defmodule Atp.WebhookAPITest do
     assert delivery_id == body["delivery"]["id"]
   end
 
+  test "direct send replay to active webhooks returns the committed response once", %{
+    conn: conn
+  } do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      {:ok, body, request_conn} = Plug.Conn.read_body(request_conn)
+
+      send(test_pid, {:webhook_request, Jason.decode!(body)})
+
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-webhook-replay-sender", %{})
+    recipient = register_agent!(account_token, "register-webhook-replay-recipient", %{})
+
+    configure_webhook!(
+      recipient,
+      "configure-webhook-replay-recipient",
+      "https://recipient.example.test/atp/replay"
+    )
+
+    params = %{
+      "to" => recipient["address"],
+      "payload" => a2a_user_text("webhook-replay-message", "deliver once")
+    }
+
+    first =
+      build_conn()
+      |> authorize(sender["agent_api_key"]["token"])
+      |> idempotency_key("send-webhook-replay")
+      |> post("/api/messages", params)
+      |> json_response(201)
+
+    assert_receive {:webhook_request, webhook_body}
+    assert webhook_body["message"] == first["message"]
+
+    replay =
+      build_conn()
+      |> authorize(sender["agent_api_key"]["token"])
+      |> idempotency_key("send-webhook-replay")
+      |> post("/api/messages", params)
+      |> json_response(201)
+
+    assert replay == first
+    assert first["carrier_status"] == "delivered"
+
+    assert [%{"mode" => "webhook", "status" => "delivered", "attempt_count" => 1}] =
+             first["deliveries"]
+
+    refute_receive {:webhook_request, _body}, 100
+  end
+
   test "webhook delivery rejects DNS targets that resolve to private addresses", %{conn: conn} do
     test_pid = self()
 
