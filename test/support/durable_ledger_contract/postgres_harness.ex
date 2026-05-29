@@ -14,7 +14,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   alias Atp.Identity.Agent
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, Message, WebhookAttempt, WebhookDelivery}
+  alias Atp.Transport.{Delivery, Message, SenderPolicies, WebhookAttempt, WebhookDelivery}
 
   @spec prepare_direct_message_pair!(Plug.Conn.t(), String.t()) :: {Agent.t(), Agent.t()}
   def prepare_direct_message_pair!(conn, key) do
@@ -211,6 +211,17 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     |> get_agent!()
     |> Ecto.Changeset.change(status: "disabled")
     |> Repo.update!()
+  end
+
+  @spec block_sender_agent!(Agent.t(), Agent.t()) :: :ok
+  def block_sender_agent!(%Agent{} = sender, %Agent{} = recipient) do
+    {:ok, _policy} =
+      SenderPolicies.upsert(recipient, %{
+        "effect" => "block",
+        "sender_agent_id" => sender.id
+      })
+
+    :ok
   end
 
   @spec ack_delivery_through_polling!(map(), String.t(), String.t()) :: map()

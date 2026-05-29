@@ -20,7 +20,7 @@ defmodule Atp.DurableLedgerTest do
         route
       })
 
-      {:ok, 201, %{"id" => "msg_configured"}}
+      {:ok, 201, %{"id" => "msg_configured"}, nil}
     end
 
     @impl DurableLedger
@@ -95,7 +95,7 @@ defmodule Atp.DurableLedgerTest do
       test_pid: self()
     }
 
-    assert {:ok, 201, %{"id" => "msg_configured"}} =
+    assert {:ok, 201, %{"id" => "msg_configured"}, nil} =
              DurableLedger.accept_direct_message(
                sender,
                params,
@@ -224,6 +224,7 @@ defmodule Atp.DurableLedgerTest do
     assert direct_intake_doc =~ "idempotency"
     assert direct_intake_doc =~ "sender policy"
     assert direct_intake_doc =~ "delivery work"
+    assert direct_intake_doc =~ "must not perform active webhook dispatch"
     refute direct_intake_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
   end
 

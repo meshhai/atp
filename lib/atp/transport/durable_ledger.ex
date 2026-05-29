@@ -12,11 +12,13 @@ defmodule Atp.Transport.DurableLedger do
   Callbacks use transport structs and avoid exposing storage-engine mechanics.
   """
 
-  alias Atp.Identity.Agent
+  alias Atp.Identity.{Agent, Idempotency}
   alias Atp.Transport.{DeliveryClaim, Message}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
-  @type direct_message_intake_result :: {:ok, pos_integer(), map()} | {:error, term()}
+  @type direct_message_after_commit :: Idempotency.prepared_after_commit() | nil
+  @type direct_message_intake_result ::
+          {:ok, pos_integer(), map(), direct_message_after_commit()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -27,7 +29,10 @@ defmodule Atp.Transport.DurableLedger do
 
   Implementations must validate the request, apply idempotency for the sender,
   route, key, and body, resolve the recipient, enforce sender policy, persist
-  the message, prepare delivery work, and return stable retry results. This
+  the message, prepare delivery work, and return stable retry results.
+
+  Implementations may return prepared post-commit work for the caller to
+  complete, but they must not perform active webhook dispatch themselves. This
   capability is for direct messages only; session opening and session message
   sends are separate carrier operations.
   """

@@ -39,14 +39,11 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          {:ok, payload} <- fetch_payload(params),
          :ok <- Payload.validate_a2a(payload) do
       sender
-      |> Idempotency.run_after_commit(
+      |> Idempotency.run_prepared_after_commit(
         route,
         idempotency_key,
         params,
-        fn -> persist_direct_message_send(sender, recipient_address, payload) end,
-        fn status, body, webhook_delivery_id ->
-          finish_prepared_direct_webhook_delivery(sender, status, body, webhook_delivery_id)
-        end
+        fn -> persist_direct_message_send(sender, recipient_address, payload) end
       )
     end
   end
@@ -209,21 +206,6 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp prepare_deliverable_webhook_delivery(%Message{} = message, %Agent{} = recipient, false) do
     prepare_trusted_webhook_delivery(message, recipient)
-  end
-
-  defp finish_prepared_direct_webhook_delivery(%Agent{}, status, body, nil) do
-    {:ok, status, body}
-  end
-
-  defp finish_prepared_direct_webhook_delivery(
-         %Agent{} = viewer,
-         _status,
-         _body,
-         delivery_id
-       ) do
-    with {:ok, message} <- WebhookDelivery.deliver_now(delivery_id) do
-      {:ok, 201, Response.message_status(message, viewer)}
-    end
   end
 
   defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0

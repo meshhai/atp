@@ -1,6 +1,6 @@
 defmodule Atp.Support.DurableLedgerContract do
   @moduledoc """
-  Reusable ExUnit contract for durable ledger delivery claim adapters.
+  Reusable ExUnit contract for durable ledger adapters.
 
   Adapter-specific test modules `use` this contract with an `:adapter` and a
   `:harness`. The shared contract exercises carrier semantics through the
@@ -12,6 +12,7 @@ defmodule Atp.Support.DurableLedgerContract do
     adapter = Keyword.fetch!(opts, :adapter)
     harness = Keyword.fetch!(opts, :harness)
     case_template = Keyword.get(opts, :case_template, Atp.ConnCase)
+    cases = contract_cases()
 
     quote do
       use unquote(case_template), async: false
@@ -21,154 +22,64 @@ defmodule Atp.Support.DurableLedgerContract do
       @ledger_adapter unquote(adapter)
       @ledger_harness unquote(harness)
 
-      test "contract: one claimant receives a due delivery and active leases block duplicate work",
-           %{conn: conn} do
-        DurableLedgerContract.assert_single_claimant(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "single-claimant"
-        )
-      end
-
-      test "contract: expired delivery leases can be reclaimed", %{conn: conn} do
-        DurableLedgerContract.assert_lease_reclaim(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "lease-reclaim"
-        )
-      end
-
-      test "contract: stale claims cannot finish or terminalize delivery", %{conn: conn} do
-        DurableLedgerContract.assert_stale_claim_rejection(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "stale-claim"
-        )
-      end
-
-      test "contract: attempts atomically update delivery and message state", %{conn: conn} do
-        DurableLedgerContract.assert_attempt_recording(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "attempt-recording"
-        )
-      end
-
-      test "contract: claimed ACKed and expired messages terminalize without attempts", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_claim_terminalization(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "claimed-terminal"
-        )
-      end
-
-      test "contract: due ACKed and expired messages terminalize without attempts", %{conn: conn} do
-        DurableLedgerContract.assert_due_claim_terminalization(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "due-terminal"
-        )
-      end
-
-      test "contract: direct ACKed and expired messages terminalize without attempts", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_direct_claim_terminalization(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-terminal"
-        )
-      end
-
-      test "contract: direct message intake replays stable idempotent responses", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_direct_message_idempotent_replay(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-replay"
-        )
-      end
-
-      test "contract: direct message intake rejects idempotency body conflicts", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_direct_message_idempotency_conflict(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-conflict"
-        )
-      end
-
-      test "contract: direct message idempotency is scoped by sender principal", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_direct_message_idempotency_principal_scope(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-principal-scope"
-        )
-      end
-
-      test "contract: invalid direct message payloads do not create carrier work", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_invalid_direct_message_payload_no_carrier_work(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-invalid-payload"
-        )
-      end
-
-      test "contract: missing direct message recipients do not create carrier work", %{
-        conn: conn
-      } do
-        DurableLedgerContract.assert_missing_direct_message_recipient_no_carrier_work(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-missing-recipient"
-        )
-      end
-
-      test "contract: successful direct message intake creates message state and delivery work",
-           %{
-             conn: conn
-           } do
-        DurableLedgerContract.assert_successful_direct_message_intake(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "direct-success"
-        )
-      end
-
-      test "contract: session webhook delivery order is preserved", %{conn: conn} do
-        DurableLedgerContract.assert_session_ordering(
-          @ledger_adapter,
-          @ledger_harness,
-          conn,
-          "session-order"
-        )
-      end
+      unquote_splicing(
+        for {name, assertion, key} <- cases do
+          quote do
+            test unquote(name), %{conn: conn} do
+              apply(DurableLedgerContract, unquote(assertion), [
+                @ledger_adapter,
+                @ledger_harness,
+                conn,
+                unquote(key)
+              ])
+            end
+          end
+        end
+      )
     end
+  end
+
+  @spec contract_cases() :: [{String.t(), atom(), String.t()}]
+  def contract_cases do
+    [
+      {"contract: one claimant receives a due delivery and active leases block duplicate work",
+       :assert_single_claimant, "single-claimant"},
+      {"contract: expired delivery leases can be reclaimed", :assert_lease_reclaim,
+       "lease-reclaim"},
+      {"contract: stale claims cannot finish or terminalize delivery",
+       :assert_stale_claim_rejection, "stale-claim"},
+      {"contract: attempts atomically update delivery and message state",
+       :assert_attempt_recording, "attempt-recording"},
+      {"contract: claimed ACKed and expired messages terminalize without attempts",
+       :assert_claim_terminalization, "claimed-terminal"},
+      {"contract: due ACKed and expired messages terminalize without attempts",
+       :assert_due_claim_terminalization, "due-terminal"},
+      {"contract: direct ACKed and expired messages terminalize without attempts",
+       :assert_direct_claim_terminalization, "direct-terminal"},
+      {"contract: direct message intake replays stable idempotent responses",
+       :assert_direct_message_idempotent_replay, "direct-replay"},
+      {"contract: concurrent direct message retries create one committed message",
+       :assert_concurrent_direct_message_idempotency, "direct-concurrent"},
+      {"contract: direct message intake rejects idempotency body conflicts",
+       :assert_direct_message_idempotency_conflict, "direct-conflict"},
+      {"contract: direct message idempotency is scoped by sender principal",
+       :assert_direct_message_idempotency_principal_scope, "direct-principal-scope"},
+      {"contract: invalid direct message payloads do not create carrier work",
+       :assert_invalid_direct_message_payload_no_carrier_work, "direct-invalid-payload"},
+      {"contract: missing direct message recipients do not create carrier work",
+       :assert_missing_direct_message_recipient_no_carrier_work, "direct-missing-recipient"},
+      {"contract: blocked direct message intake creates no delivery work",
+       :assert_blocked_direct_message_no_delivery_work, "direct-blocked"},
+      {"contract: successful direct message intake creates message state and delivery work",
+       :assert_successful_direct_message_intake, "direct-success"},
+      {"contract: session webhook delivery order is preserved", :assert_session_ordering,
+       "session-order"}
+    ]
   end
 
   import ExUnit.Assertions
 
+  alias Atp.Identity.Idempotency
   alias Atp.Transport.{Delivery, DeliveryClaim, Message, WebhookAttempt}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
@@ -395,10 +306,49 @@ defmodule Atp.Support.DurableLedgerContract do
     before_counts = harness.carrier_counts()
 
     assert {:ok, 201, first_body} =
-             accept_direct_message(adapter, sender, params, "#{key}-send")
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
 
     assert {:ok, 201, replay_body} =
-             accept_direct_message(adapter, sender, params, "#{key}-send")
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
+
+    assert replay_body == first_body
+    assert first_body["message"]["from"] == sender.address
+    assert first_body["message"]["to"] == recipient.address
+    assert carrier_delta(before_counts, harness.carrier_counts()) == %{deliveries: 0, messages: 1}
+
+    :ok
+  end
+
+  @spec assert_concurrent_direct_message_idempotency(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_concurrent_direct_message_idempotency(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    params = direct_message_params(recipient, "#{key}-message", "retry-safe under concurrency")
+    before_counts = harness.carrier_counts()
+
+    results =
+      1..2
+      |> Task.async_stream(
+        fn _index ->
+          accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
+        end,
+        max_concurrency: 2,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert [{:ok, 201, first_body}] =
+             Enum.filter(results, &match?({:ok, 201, _body}, &1))
+
+    assert Enum.count(results, &(&1 == {:error, :idempotency_in_progress})) == 1
+
+    assert {:ok, 201, replay_body} =
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
 
     assert replay_body == first_body
     assert first_body["message"]["from"] == sender.address
@@ -420,7 +370,7 @@ defmodule Atp.Support.DurableLedgerContract do
     before_counts = harness.carrier_counts()
 
     assert {:ok, 201, _body} =
-             accept_direct_message(
+             accept_and_complete_direct_message(
                adapter,
                sender,
                direct_message_params(recipient, "#{key}-original", "original"),
@@ -428,7 +378,7 @@ defmodule Atp.Support.DurableLedgerContract do
              )
 
     assert {:error, :idempotency_conflict} =
-             accept_direct_message(
+             accept_and_complete_direct_message(
                adapter,
                sender,
                direct_message_params(recipient, "#{key}-changed", "changed"),
@@ -455,10 +405,10 @@ defmodule Atp.Support.DurableLedgerContract do
     before_counts = harness.carrier_counts()
 
     assert {:ok, 201, first_body} =
-             accept_direct_message(adapter, first_sender, params, "#{key}-send")
+             accept_and_complete_direct_message(adapter, first_sender, params, "#{key}-send")
 
     assert {:ok, 201, second_body} =
-             accept_direct_message(adapter, second_sender, params, "#{key}-send")
+             accept_and_complete_direct_message(adapter, second_sender, params, "#{key}-send")
 
     assert first_body["message"]["from"] == first_sender.address
     assert second_body["message"]["from"] == second_sender.address
@@ -480,7 +430,7 @@ defmodule Atp.Support.DurableLedgerContract do
     before_counts = harness.carrier_counts()
 
     assert {:error, :invalid_a2a_message} =
-             accept_direct_message(
+             accept_and_complete_direct_message(
                adapter,
                sender,
                %{"to" => recipient.address, "payload" => %{"text" => "not an A2A message"}},
@@ -504,7 +454,7 @@ defmodule Atp.Support.DurableLedgerContract do
     before_counts = harness.carrier_counts()
 
     assert {:error, :recipient_not_found} =
-             accept_direct_message(
+             accept_and_complete_direct_message(
                adapter,
                sender,
                %{
@@ -517,7 +467,7 @@ defmodule Atp.Support.DurableLedgerContract do
     disabled_recipient = harness.disable_agent!(recipient)
 
     assert {:error, :recipient_not_found} =
-             accept_direct_message(
+             accept_and_complete_direct_message(
                adapter,
                sender,
                direct_message_params(disabled_recipient, "#{key}-disabled", "disabled"),
@@ -529,28 +479,62 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_blocked_direct_message_no_delivery_work(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) ::
+          :ok
+  def assert_blocked_direct_message_no_delivery_work(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    harness.block_sender_agent!(sender, recipient)
+
+    params = direct_message_params(recipient, "#{key}-message", "blocked")
+    before_counts = harness.carrier_counts()
+
+    assert {:ok, 201, body} =
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
+
+    assert body["carrier_status"] == "rejected"
+    assert body["message"]["from"] == sender.address
+    assert body["message"]["to"] == recipient.address
+    assert body["message"]["trust"] == "untrusted"
+    assert body["deliveries"] == []
+
+    message = harness.get_message!(body["message"]["id"])
+
+    assert message.carrier_status == "rejected"
+    assert message.trust == "untrusted"
+    assert %DateTime{} = message.terminal_at
+    assert harness.get_deliveries_for_message!(message.id) == []
+    assert carrier_delta(before_counts, harness.carrier_counts()) == %{deliveries: 0, messages: 1}
+
+    :ok
+  end
+
   @spec assert_successful_direct_message_intake(module(), harness(), Plug.Conn.t(), String.t()) ::
           :ok
   def assert_successful_direct_message_intake(adapter, harness, conn, key)
       when is_atom(adapter) and is_atom(harness) and is_binary(key) do
-    test_pid = self()
-    harness.expect_successful_webhook_delivery!(test_pid)
-
     {sender, recipient} = harness.prepare_active_webhook_direct_message_pair!(conn, key)
     params = direct_message_params(recipient, "#{key}-message", "deliver by webhook")
     before_counts = harness.carrier_counts()
 
-    assert {:ok, 201, body} = accept_direct_message(adapter, sender, params, "#{key}-send")
+    assert {:ok, 201, body, prepared} =
+             accept_direct_message(adapter, sender, params, "#{key}-send")
 
-    assert body["carrier_status"] == "delivered"
+    assert body["carrier_status"] == "queued"
     assert body["message"]["from"] == sender.address
     assert body["message"]["to"] == recipient.address
     assert body["message"]["trust"] == "trusted"
     assert body["message"]["payload"] == params["payload"]
     assert [delivery_status] = body["deliveries"]
     assert delivery_status["mode"] == "webhook"
-    assert delivery_status["status"] == "delivered"
-    assert delivery_status["attempt_count"] == 1
+    assert delivery_status["status"] == "retry_scheduled"
+    assert delivery_status["attempt_count"] == 0
+    assert is_binary(prepared.commit_value)
 
     message = harness.get_message!(body["message"]["id"])
 
@@ -560,7 +544,7 @@ defmodule Atp.Support.DurableLedgerContract do
     assert message.recipient_address == recipient.address
     assert message.payload == params["payload"]
     assert message.content_type == "application/a2a+json"
-    assert message.carrier_status == "delivered"
+    assert message.carrier_status == "queued"
     assert message.trust == "trusted"
     assert is_nil(message.current_ack_status)
     assert is_nil(message.session_id)
@@ -570,14 +554,13 @@ defmodule Atp.Support.DurableLedgerContract do
     assert [%Delivery{} = delivery] = harness.get_deliveries_for_message!(message.id)
     assert delivery.recipient_agent_id == recipient.id
     assert delivery.mode == "webhook"
-    assert delivery.status == "delivered"
-    assert delivery.attempt_count == 1
+    assert delivery.status == "retry_scheduled"
+    assert delivery.attempt_count == 0
     assert delivery.max_attempts >= 1
-
-    assert_receive {:contract_direct_webhook_request, webhook_body}
-    assert webhook_body["message"]["id"] == message.id
-    assert webhook_body["delivery"]["id"] == delivery.id
+    assert prepared.commit_value == delivery.id
     assert carrier_delta(before_counts, harness.carrier_counts()) == %{deliveries: 1, messages: 1}
+
+    assert {:ok, 201, ^body} = complete_prepared_direct_message(prepared)
 
     :ok
   end
@@ -735,6 +718,25 @@ defmodule Atp.Support.DurableLedgerContract do
 
   defp accept_direct_message(adapter, sender, params, key),
     do: adapter.accept_direct_message(sender, params, key, @direct_message_route)
+
+  defp accept_and_complete_direct_message(adapter, sender, params, key) do
+    case accept_direct_message(adapter, sender, params, key) do
+      {:ok, _status, _body, prepared} when is_map(prepared) ->
+        complete_prepared_direct_message(prepared)
+
+      {:ok, status, body, nil} ->
+        {:ok, status, body}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp complete_prepared_direct_message(%{} = prepared) do
+    Idempotency.complete_prepared_after_commit(prepared, fn status, body, _commit_value ->
+      {:ok, status, body}
+    end)
+  end
 
   defp carrier_delta(before_counts, after_counts) do
     %{
