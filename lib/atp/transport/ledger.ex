@@ -15,7 +15,7 @@ defmodule Atp.Transport.Ledger do
   alias Atp.Transport.{
     Ack,
     Delivery,
-    DeliveryClaims,
+    DurableLedger,
     Message,
     Payload,
     Response,
@@ -416,12 +416,12 @@ defmodule Atp.Transport.Ledger do
   @doc false
   @spec claim_webhook_delivery(String.t(), keyword()) ::
           {:ok, Atp.Transport.DeliveryClaim.t() | Message.t()} | {:error, term()}
-  defdelegate claim_webhook_delivery(delivery_id, opts \\ []), to: DeliveryClaims
+  defdelegate claim_webhook_delivery(delivery_id, opts \\ []), to: DurableLedger
 
   @doc false
   @spec claim_due_webhook_delivery(keyword()) ::
           {:ok, Atp.Transport.DeliveryClaim.t() | nil} | {:error, term()}
-  defdelegate claim_due_webhook_delivery(opts \\ []), to: DeliveryClaims
+  defdelegate claim_due_webhook_delivery(opts \\ []), to: DurableLedger
 
   @doc false
   @spec finish_claimed_webhook_delivery(
@@ -430,7 +430,7 @@ defmodule Atp.Transport.Ledger do
           keyword()
         ) ::
           {:ok, Message.t()} | {:error, term()}
-  defdelegate finish_claimed_webhook_delivery(claim, result, opts \\ []), to: DeliveryClaims
+  defdelegate finish_claimed_webhook_delivery(claim, result, opts \\ []), to: DurableLedger
 
   @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()

@@ -17,6 +17,8 @@ defmodule Atp do
        [
          Delivery,
          DeliveryClaim,
+         DurableLedger,
+         DurableLedger.Postgres,
          Message,
          MessageEnvelope,
          Session,
