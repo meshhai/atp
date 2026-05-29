@@ -7,7 +7,10 @@ defmodule Atp.Transport do
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
   @spec send_message(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
-  defdelegate send_message(sender, params, idempotency_key, route), to: Ledger
+  def send_message(%Agent{} = sender, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    DurableLedger.accept_direct_message(sender, params, idempotency_key, route)
+  end
 
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate open_session(initiator, params, idempotency_key, route), to: Runtime

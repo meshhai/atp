@@ -2,6 +2,7 @@ defmodule Atp.DurableLedgerTest do
   use ExUnit.Case, async: false
 
   alias Atp.Identity.Agent
+  alias Atp.Transport
   alias Atp.Transport.{Delivery, DeliveryClaim, Message}
   alias Atp.Transport.DurableLedger
   alias Atp.Transport.WebhookDelivery.AttemptResult
@@ -114,6 +115,45 @@ defmodule Atp.DurableLedgerTest do
         }
       },
       "direct-message-key",
+      "POST /api/messages"
+    }
+  end
+
+  test "transport facade delegates direct message intake to the durable ledger" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    sender = %Agent{
+      id: "agt_transport_sender",
+      account_id: "acc_transport",
+      address: "atp://agent/agt_transport_sender",
+      status: "active"
+    }
+
+    params = %{
+      "to" => "atp://agent/agt_transport_recipient",
+      "payload" => %{
+        "messageId" => "msg_transport",
+        "role" => "ROLE_USER",
+        "parts" => [%{"text" => "hello"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"id" => "msg_configured"}} =
+             Transport.send_message(sender, params, nil, "POST /api/messages")
+
+    assert_received {
+      :accept_direct_message,
+      ^sender,
+      %{
+        "to" => "atp://agent/agt_transport_recipient",
+        "payload" => %{
+          "messageId" => "msg_transport",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => "hello"}]
+        }
+      },
+      nil,
       "POST /api/messages"
     }
   end
