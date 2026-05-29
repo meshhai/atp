@@ -25,13 +25,13 @@ defmodule Atp.DurableLedgerTest do
 
     @impl DurableLedger
     def claim_due_webhook_delivery(opts) do
-      send(Keyword.fetch!(opts, :test_pid), {:claim_due_webhook_delivery, opts})
+      notify_test_pid(opts, {:claim_due_webhook_delivery, opts})
       {:ok, nil}
     end
 
     @impl DurableLedger
     def claim_webhook_delivery(delivery_id, opts) do
-      send(Keyword.fetch!(opts, :test_pid), {:claim_webhook_delivery, delivery_id, opts})
+      notify_test_pid(opts, {:claim_webhook_delivery, delivery_id, opts})
       {:error, :not_found}
     end
 
@@ -55,6 +55,13 @@ defmodule Atp.DurableLedgerTest do
       })
 
       {:error, :stale_delivery_claim}
+    end
+
+    defp notify_test_pid(opts, message) do
+      case Keyword.fetch(opts, :test_pid) do
+        {:ok, test_pid} -> send(test_pid, message)
+        :error -> :ok
+      end
     end
   end
 
@@ -170,6 +177,9 @@ defmodule Atp.DurableLedgerTest do
 
     assert_received {:claim_webhook_delivery, "dlv_configured", opts}
     assert Keyword.fetch!(opts, :test_pid) == self()
+
+    assert {:ok, nil} = DurableLedger.claim_due_webhook_delivery()
+    assert {:error, :not_found} = DurableLedger.claim_webhook_delivery("dlv_default_opts")
 
     claim = %DeliveryClaim{
       delivery: %Delivery{id: "dlv_configured"},

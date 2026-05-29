@@ -57,18 +57,6 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     {get_agent!(first_sender["id"]), get_agent!(second_sender["id"]), get_agent!(recipient["id"])}
   end
 
-  @spec expect_successful_webhook_delivery!(pid()) :: :ok
-  def expect_successful_webhook_delivery!(test_pid) when is_pid(test_pid) do
-    Req.Test.stub(WebhookDelivery, fn request_conn ->
-      {:ok, body, request_conn} = Plug.Conn.read_body(request_conn)
-      send(test_pid, {:contract_direct_webhook_request, Jason.decode!(body)})
-
-      Plug.Conn.send_resp(request_conn, 204, "")
-    end)
-
-    :ok
-  end
-
   @spec carrier_counts() :: %{messages: non_neg_integer(), deliveries: non_neg_integer()}
   def carrier_counts do
     %{
