@@ -96,7 +96,8 @@ defmodule Atp.ArchitectureTest do
     refute delivery_claims_source =~ "Ecto.Query"
     refute delivery_claims_source =~ "FOR UPDATE"
     refute delivery_claims_source =~ "FOR UPDATE SKIP LOCKED"
-    assert delivery_claims_source =~ "DurableLedger.Postgres"
+    refute delivery_claims_source =~ "DurableLedger.Postgres"
+    assert delivery_claims_source =~ "DurableLedger"
   end
 
   defp allowed_dependency_apps do

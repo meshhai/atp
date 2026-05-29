@@ -2,7 +2,7 @@ defmodule Atp.DurableLedgerTest do
   use ExUnit.Case, async: false
 
   alias Atp.Identity.Agent
-  alias Atp.Transport.{Delivery, DeliveryClaim, Message}
+  alias Atp.Transport.{Delivery, DeliveryClaim, DeliveryClaims, Message}
   alias Atp.Transport.DurableLedger
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
@@ -108,6 +108,25 @@ defmodule Atp.DurableLedgerTest do
              )
 
     assert_received {:terminalize_claimed_webhook_delivery, ^claim, :message_acked, opts}
+    assert Keyword.fetch!(opts, :test_pid) == self()
+  end
+
+  test "legacy delivery claims facade delegates to configured durable ledger adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    assert {:ok, nil} =
+             DeliveryClaims.claim_due_webhook_delivery(test_pid: self())
+
+    assert_received {:claim_due_webhook_delivery, opts}
+    assert Keyword.fetch!(opts, :test_pid) == self()
+
+    assert {:error, :not_found} =
+             DeliveryClaims.claim_webhook_delivery(
+               "dlv_legacy",
+               test_pid: self()
+             )
+
+    assert_received {:claim_webhook_delivery, "dlv_legacy", opts}
     assert Keyword.fetch!(opts, :test_pid) == self()
   end
 
