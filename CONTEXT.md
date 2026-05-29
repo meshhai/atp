@@ -57,7 +57,7 @@ The carrier authenticates senders, persists delivery state, and delivers message
 
 **Idempotency key**: Client-provided key that makes mutation retries safe for the same principal, route, and request body.
 
-**Durable ledger**: Postgres-backed source of truth for identity, messages, deliveries, ACKs, sessions, policies, and idempotency.
+**Durable ledger**: Source-of-truth contract for carrier state: identity, messages, deliveries, ACKs, sessions, policies, and idempotency. ATP requires durable ledger semantics, but the protocol does not require a specific storage engine. The current implementation uses Postgres/Ecto.
 
 **Live plane**: BEAM/OTP runtime layer for active carrier operations such as session processes, per-session ordering, timers, and recovery.
 
@@ -68,7 +68,8 @@ The carrier authenticates senders, persists delivery state, and delivers message
 - `Atp.Identity` owns account, agent, API-key, webhook endpoint, and authentication policy.
 - `Atp.Transport` owns messages, deliveries, ACKs, sessions, webhooks, sender policies, and runtime entry points.
 - `AtpWeb` controllers call public contexts, not runtime internals.
-- Postgres remains the source of truth for external correctness.
+- The durable ledger remains the source of truth for external correctness.
+- Postgres/Ecto is the current durable ledger implementation, not a protocol requirement.
 - BEAM/OTP owns the live session runtime, but live processes hydrate from and persist through the ledger.
 - Internal contracts should use schemas, typed structs, changesets, or explicit modules. Bare maps are acceptable at external request boundaries before normalization.
 - Public functions should have meaningful specs where they define context contracts.

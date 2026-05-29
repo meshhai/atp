@@ -10,7 +10,7 @@ defmodule Atp.Transport.WebhookDelivery do
   alias Atp.Transport.{
     Delivery,
     DeliveryClaim,
-    DeliveryClaims,
+    DurableLedger,
     Message,
     MessageEnvelope,
     WebhookSignature
@@ -44,7 +44,7 @@ defmodule Atp.Transport.WebhookDelivery do
 
   @spec deliver_now(String.t()) :: delivery_result()
   def deliver_now(delivery_id) when is_binary(delivery_id) do
-    case DeliveryClaims.claim_webhook_delivery(delivery_id,
+    case DurableLedger.claim_webhook_delivery(delivery_id,
            lease_seconds: @dispatch_lease_seconds
          ) do
       {:error, reason} -> {:error, reason}
@@ -84,10 +84,10 @@ defmodule Atp.Transport.WebhookDelivery do
         {:ok, message}
 
       acked?(message) ->
-        DeliveryClaims.terminalize_claimed_webhook_delivery(claim, :message_acked, now: now)
+        DurableLedger.terminalize_claimed_webhook_delivery(claim, :message_acked, now: now)
 
       DateTime.compare(message.expires_at, now) != :gt ->
-        DeliveryClaims.terminalize_claimed_webhook_delivery(claim, :message_expired, now: now)
+        DurableLedger.terminalize_claimed_webhook_delivery(claim, :message_expired, now: now)
 
       true ->
         attempt_delivery(claim, recipient, now)
@@ -103,7 +103,7 @@ defmodule Atp.Transport.WebhookDelivery do
   defp claim_due_claims(0, results, _lease_seconds), do: Enum.reverse(results)
 
   defp claim_due_claims(remaining, results, lease_seconds) do
-    case DeliveryClaims.claim_due_webhook_delivery(lease_seconds: lease_seconds) do
+    case DurableLedger.claim_due_webhook_delivery(lease_seconds: lease_seconds) do
       {:ok, nil} ->
         Enum.reverse(results)
 
@@ -148,7 +148,7 @@ defmodule Atp.Transport.WebhookDelivery do
           )
       end
 
-    DeliveryClaims.finish_claimed_webhook_delivery(claim, request_result)
+    DurableLedger.finish_claimed_webhook_delivery(claim, request_result)
   end
 
   defp max_attempts(%Agent{} = recipient) do

@@ -1,21 +1,24 @@
-defmodule Atp.Transport.DeliveryClaims do
-  @moduledoc false
+defmodule Atp.Transport.DurableLedger.Postgres do
+  @moduledoc """
+  Default durable ledger adapter backed by Postgres/Ecto.
+
+  Ecto and database locking remain implementation details of this adapter. It
+  exposes only the carrier operations defined by `Atp.Transport.DurableLedger`.
+  """
 
   import Ecto.Query
 
   alias Atp.Identity.ID
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, DeliveryClaim, Message, WebhookAttempt}
+  alias Atp.Transport.{Delivery, DeliveryClaim, DurableLedger, Message, WebhookAttempt}
   alias Atp.Transport.WebhookDelivery.AttemptResult
+
+  @behaviour DurableLedger
 
   @default_webhook_claim_lease_seconds 60
 
-  @spec claim_webhook_delivery(String.t(), keyword()) ::
-          {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
-  def claim_webhook_delivery(delivery_id) when is_binary(delivery_id) do
-    claim_webhook_delivery(delivery_id, [])
-  end
-
+  @impl DurableLedger
+  @spec claim_webhook_delivery(String.t(), keyword()) :: DurableLedger.claim_result()
   def claim_webhook_delivery(delivery_id, opts) when is_binary(delivery_id) and is_list(opts) do
     lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
@@ -31,11 +34,8 @@ defmodule Atp.Transport.DeliveryClaims do
     end
   end
 
-  @spec claim_due_webhook_delivery(keyword()) :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
-  def claim_due_webhook_delivery do
-    claim_due_webhook_delivery([])
-  end
-
+  @impl DurableLedger
+  @spec claim_due_webhook_delivery(keyword()) :: DurableLedger.due_claim_result()
   def claim_due_webhook_delivery(opts) when is_list(opts) do
     lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
@@ -51,12 +51,13 @@ defmodule Atp.Transport.DeliveryClaims do
     end
   end
 
+  @impl DurableLedger
   @spec finish_claimed_webhook_delivery(DeliveryClaim.t(), AttemptResult.t(), keyword()) ::
-          {:ok, Message.t()} | {:error, term()}
+          DurableLedger.finish_result()
   def finish_claimed_webhook_delivery(
         %DeliveryClaim{delivery: %Delivery{id: delivery_id}} = claim,
         %AttemptResult{} = result,
-        opts \\ []
+        opts
       )
       when is_binary(delivery_id) and is_list(opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
@@ -66,16 +67,16 @@ defmodule Atp.Transport.DeliveryClaims do
     end)
   end
 
+  @impl DurableLedger
   @spec terminalize_claimed_webhook_delivery(
           DeliveryClaim.t(),
-          :message_acked | :message_expired,
+          DurableLedger.terminalization_reason(),
           keyword()
-        ) ::
-          {:ok, Message.t()} | {:error, term()}
+        ) :: DurableLedger.finish_result()
   def terminalize_claimed_webhook_delivery(
         %DeliveryClaim{delivery: %Delivery{id: delivery_id}} = claim,
         reason,
-        opts \\ []
+        opts
       )
       when is_binary(delivery_id) and reason in [:message_acked, :message_expired] and
              is_list(opts) do

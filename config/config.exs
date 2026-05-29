@@ -4,6 +4,8 @@ config :atp,
   ecto_repos: [Atp.Repo],
   generators: [timestamp_type: :utc_datetime_usec]
 
+config :atp, Atp.Transport.DurableLedger, adapter: Atp.Transport.DurableLedger.Postgres
+
 config :atp, AtpWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,

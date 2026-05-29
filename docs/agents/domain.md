@@ -40,7 +40,7 @@ If a concept is missing from the glossary, either avoid inventing new language o
 - `Atp.Identity` owns account, agent, API-key, webhook endpoint, and authentication policy.
 - `Atp.Transport` owns messages, deliveries, ACKs, sessions, webhooks, sender policies, and runtime entry points.
 - `AtpWeb` controllers should call public contexts, not runtime internals.
-- Postgres is the durable source of truth.
+- The durable ledger is the source of truth. Postgres/Ecto is the current implementation, not a protocol requirement.
 - BEAM/OTP owns the live runtime, but live processes hydrate from and persist through the durable ledger.
 - Keep ATP product-neutral. Do not introduce downstream product assumptions.
 

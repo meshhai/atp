@@ -83,6 +83,16 @@ defmodule Atp.ArchitectureTest do
     assert matches == []
   end
 
+  test "Postgres durable ledger adapter owns webhook claim persistence" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+
+    assert postgres_source =~ "Atp.Repo"
+    assert postgres_source =~ "Ecto.Query"
+    assert postgres_source =~ "FOR UPDATE"
+    assert postgres_source =~ "FOR UPDATE SKIP LOCKED"
+    refute File.exists?("lib/atp/transport/delivery_claims.ex")
+  end
+
   defp allowed_dependency_apps do
     [
       :bandit,

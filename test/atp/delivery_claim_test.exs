@@ -37,7 +37,7 @@ defmodule Atp.DeliveryClaimTest do
       prepare_due_webhook_delivery!(conn, "default-direct-claim")
 
     assert {:ok, %DeliveryClaim{} = direct_claim} =
-             Transport.DeliveryClaims.claim_webhook_delivery(direct_delivery.id)
+             Transport.claim_webhook_delivery(direct_delivery.id)
 
     assert direct_claim.delivery.id == direct_delivery.id
 
@@ -45,7 +45,7 @@ defmodule Atp.DeliveryClaimTest do
       prepare_due_webhook_delivery!(conn, "default-due-claim")
 
     assert {:ok, %DeliveryClaim{} = due_claim} =
-             Transport.DeliveryClaims.claim_due_webhook_delivery()
+             Transport.claim_due_webhook_delivery()
 
     assert due_claim.delivery.id == due_delivery.id
   end
@@ -240,7 +240,7 @@ defmodule Atp.DeliveryClaimTest do
       original_message = Repo.get!(Message, message.id)
 
       assert {:error, :stale_delivery_claim} =
-               Transport.DeliveryClaims.terminalize_claimed_webhook_delivery(
+               Transport.DurableLedger.terminalize_claimed_webhook_delivery(
                  claim,
                  :message_acked
                )
