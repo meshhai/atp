@@ -10,6 +10,19 @@ defmodule Atp.DurableLedgerTest do
     @behaviour DurableLedger
 
     @impl DurableLedger
+    def accept_direct_message(sender, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :accept_direct_message,
+        sender,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201, %{"id" => "msg_configured"}}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(opts) do
       send(Keyword.fetch!(opts, :test_pid), {:claim_due_webhook_delivery, opts})
       {:ok, nil}
@@ -59,6 +72,50 @@ defmodule Atp.DurableLedgerTest do
 
   test "default durable ledger adapter is the Postgres implementation" do
     assert DurableLedger.adapter() == Atp.Transport.DurableLedger.Postgres
+  end
+
+  test "durable ledger delegates direct message intake to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    sender = %Agent{
+      id: "agt_configured_sender",
+      account_id: "acc_configured",
+      address: "atp://agent/agt_configured_sender",
+      status: "active"
+    }
+
+    params = %{
+      "to" => "atp://agent/agt_configured_recipient",
+      "payload" => %{
+        "messageId" => "msg_configured",
+        "role" => "ROLE_USER",
+        "parts" => [%{"text" => "hello"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"id" => "msg_configured"}} =
+             DurableLedger.accept_direct_message(
+               sender,
+               params,
+               "direct-message-key",
+               "POST /api/messages"
+             )
+
+    assert_received {
+      :accept_direct_message,
+      ^sender,
+      %{
+        "to" => "atp://agent/agt_configured_recipient",
+        "payload" => %{
+          "messageId" => "msg_configured",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => "hello"}]
+        }
+      },
+      "direct-message-key",
+      "POST /api/messages"
+    }
   end
 
   test "durable ledger delegates delivery claim operations to configured adapter" do
@@ -112,7 +169,7 @@ defmodule Atp.DurableLedgerTest do
   end
 
   test "durable ledger contract documents carrier guarantees" do
-    {:docs_v1, _annotation, :elixir, _format, %{"en" => module_doc}, _metadata, _docs} =
+    {:docs_v1, _annotation, :elixir, _format, %{"en" => module_doc}, _metadata, docs} =
       Code.fetch_docs(DurableLedger)
 
     assert module_doc =~ "atomic"
@@ -120,5 +177,20 @@ defmodule Atp.DurableLedgerTest do
     assert module_doc =~ "stale-claim rejection"
     assert module_doc =~ "session-order eligibility"
     assert module_doc =~ "storage engine"
+
+    direct_intake_doc = callback_doc(docs, :accept_direct_message, 4)
+
+    assert direct_intake_doc =~ "direct message"
+    assert direct_intake_doc =~ "idempotency"
+    assert direct_intake_doc =~ "sender policy"
+    assert direct_intake_doc =~ "delivery work"
+    refute direct_intake_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+  end
+
+  defp callback_doc(docs, name, arity) do
+    Enum.find_value(docs, fn
+      {{:callback, ^name, ^arity}, _line, _signatures, %{"en" => doc}, _metadata} -> doc
+      _doc -> nil
+    end)
   end
 end

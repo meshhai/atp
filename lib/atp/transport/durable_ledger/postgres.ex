@@ -8,14 +8,22 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   import Ecto.Query
 
-  alias Atp.Identity.ID
+  alias Atp.Identity.{Agent, ID}
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, DeliveryClaim, DurableLedger, Message, WebhookAttempt}
+  alias Atp.Transport.{Delivery, DeliveryClaim, DurableLedger, Ledger, Message, WebhookAttempt}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @behaviour DurableLedger
 
   @default_webhook_claim_lease_seconds 60
+
+  @impl DurableLedger
+  @spec accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.direct_message_intake_result()
+  def accept_direct_message(%Agent{} = sender, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    Ledger.send_message(sender, params, idempotency_key, route)
+  end
 
   @impl DurableLedger
   @spec claim_webhook_delivery(String.t(), keyword()) :: DurableLedger.claim_result()
