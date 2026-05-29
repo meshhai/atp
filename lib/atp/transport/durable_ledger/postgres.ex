@@ -2,36 +2,474 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   @moduledoc """
   Default durable ledger adapter backed by Postgres/Ecto.
 
-  Ecto and database locking remain implementation details of the current
-  delivery claim implementation. This adapter exposes only the carrier
-  operations defined by `Atp.Transport.DurableLedger`.
+  Ecto and database locking remain implementation details of this adapter. It
+  exposes only the carrier operations defined by `Atp.Transport.DurableLedger`.
   """
 
-  @behaviour Atp.Transport.DurableLedger
+  import Ecto.Query
 
-  alias Atp.Transport.{DeliveryClaim, DeliveryClaims, Message}
+  alias Atp.Identity.ID
+  alias Atp.Repo
+  alias Atp.Transport.{Delivery, DeliveryClaim, DurableLedger, Message, WebhookAttempt}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
-  @impl true
-  @spec claim_due_webhook_delivery(keyword()) ::
-          {:ok, DeliveryClaim.t() | nil} | {:error, term()}
-  defdelegate claim_due_webhook_delivery(opts), to: DeliveryClaims
+  @behaviour DurableLedger
 
-  @impl true
-  @spec claim_webhook_delivery(String.t(), keyword()) ::
-          {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
-  defdelegate claim_webhook_delivery(delivery_id, opts), to: DeliveryClaims
+  @default_webhook_claim_lease_seconds 60
 
-  @impl true
+  @impl DurableLedger
+  @spec claim_webhook_delivery(String.t(), keyword()) :: DurableLedger.claim_result()
+  def claim_webhook_delivery(delivery_id, opts) when is_binary(delivery_id) and is_list(opts) do
+    lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
+    now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
+
+    case validate_lease_seconds(lease_seconds) do
+      :ok ->
+        Repo.transaction(fn ->
+          claim_locked_webhook_delivery!(delivery_id, now, lease_seconds)
+        end)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl DurableLedger
+  @spec claim_due_webhook_delivery(keyword()) :: DurableLedger.due_claim_result()
+  def claim_due_webhook_delivery(opts) when is_list(opts) do
+    lease_seconds = Keyword.get(opts, :lease_seconds, @default_webhook_claim_lease_seconds)
+    now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
+
+    case validate_lease_seconds(lease_seconds) do
+      :ok ->
+        Repo.transaction(fn ->
+          claim_next_due_webhook_delivery!(now, lease_seconds)
+        end)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl DurableLedger
   @spec finish_claimed_webhook_delivery(DeliveryClaim.t(), AttemptResult.t(), keyword()) ::
-          {:ok, Message.t()} | {:error, term()}
-  defdelegate finish_claimed_webhook_delivery(claim, result, opts), to: DeliveryClaims
+          DurableLedger.finish_result()
+  def finish_claimed_webhook_delivery(
+        %DeliveryClaim{delivery: %Delivery{id: delivery_id}} = claim,
+        %AttemptResult{} = result,
+        opts
+      )
+      when is_binary(delivery_id) and is_list(opts) do
+    now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
-  @impl true
+    Repo.transaction(fn ->
+      finish_locked_webhook_delivery!(delivery_id, claim, result, now)
+    end)
+  end
+
+  @impl DurableLedger
   @spec terminalize_claimed_webhook_delivery(
           DeliveryClaim.t(),
-          Atp.Transport.DurableLedger.terminalization_reason(),
+          DurableLedger.terminalization_reason(),
           keyword()
-        ) :: {:ok, Message.t()} | {:error, term()}
-  defdelegate terminalize_claimed_webhook_delivery(claim, reason, opts), to: DeliveryClaims
+        ) :: DurableLedger.finish_result()
+  def terminalize_claimed_webhook_delivery(
+        %DeliveryClaim{delivery: %Delivery{id: delivery_id}} = claim,
+        reason,
+        opts
+      )
+      when is_binary(delivery_id) and reason in [:message_acked, :message_expired] and
+             is_list(opts) do
+    now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
+
+    Repo.transaction(fn ->
+      terminalize_locked_webhook_delivery!(delivery_id, claim, reason, now)
+    end)
+  end
+
+  defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0
+
+  defp validate_lease_seconds(seconds) do
+    if valid_lease_seconds?(seconds), do: :ok, else: {:error, :invalid_lease}
+  end
+
+  defp claim_locked_webhook_delivery!(delivery_id, now, lease_seconds) do
+    case locked_webhook_delivery(delivery_id) do
+      nil ->
+        Repo.rollback(:not_found)
+
+      %Delivery{} = delivery ->
+        claim_or_terminalize_webhook_delivery!(delivery, now, lease_seconds)
+    end
+  end
+
+  defp finish_locked_webhook_delivery!(delivery_id, claim, result, now) do
+    case fetch_locked_webhook_claim_delivery(delivery_id) do
+      nil ->
+        Repo.rollback(:stale_delivery_claim)
+
+      %Delivery{} = delivery ->
+        finish_validated_webhook_delivery!(delivery, claim, result, now)
+    end
+  end
+
+  defp finish_validated_webhook_delivery!(delivery, claim, result, now) do
+    case validate_webhook_delivery_claim(delivery, claim, result, now) do
+      :ok ->
+        insert_claimed_webhook_attempt!(claim, result)
+        update_claimed_webhook_delivery!(delivery, result)
+        update_claimed_webhook_message!(delivery.message, result)
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
+
+  defp terminalize_locked_webhook_delivery!(delivery_id, claim, reason, now) do
+    case fetch_locked_webhook_claim_delivery(delivery_id) do
+      nil ->
+        Repo.rollback(:stale_delivery_claim)
+
+      %Delivery{} = delivery ->
+        terminalize_validated_webhook_delivery!(delivery, claim, reason, now)
+    end
+  end
+
+  defp terminalize_validated_webhook_delivery!(delivery, claim, reason, now) do
+    case validate_webhook_terminal_claim(delivery, claim, reason, now) do
+      :ok ->
+        terminalize_claimed_webhook_delivery!(delivery, reason, now)
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
+
+  defp claim_next_due_webhook_delivery!(now, lease_seconds) do
+    case Repo.one(claimable_webhook_delivery_query(now)) do
+      nil ->
+        nil
+
+      %Delivery{} = delivery ->
+        case claim_or_terminalize_webhook_delivery!(delivery, now, lease_seconds) do
+          %DeliveryClaim{} = claim -> claim
+          %Message{} -> nil
+        end
+    end
+  end
+
+  defp locked_webhook_delivery(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id and delivery.mode == "webhook")
+    |> lock("FOR UPDATE")
+    |> preload([:message, :recipient_agent])
+    |> Repo.one()
+  end
+
+  defp claimable_webhook_delivery_query(now) do
+    Delivery
+    |> join(:inner, [delivery], message in assoc(delivery, :message), as: :message)
+    |> where([delivery], delivery.mode == "webhook")
+    |> where(^due_webhook_delivery_filter(now))
+    |> where(^webhook_session_order_filter())
+    |> order_by([delivery], asc: delivery.inserted_at)
+    |> limit(1)
+    |> lock("FOR UPDATE SKIP LOCKED")
+  end
+
+  defp due_webhook_delivery_filter(now) do
+    dynamic(
+      [delivery],
+      (delivery.status == "retry_scheduled" and
+         (is_nil(delivery.next_attempt_at) or delivery.next_attempt_at <= ^now)) or
+        (delivery.status == "leased" and not is_nil(delivery.leased_until) and
+           delivery.leased_until <= ^now)
+    )
+  end
+
+  defp webhook_session_order_filter do
+    dynamic(
+      [message: message],
+      is_nil(message.session_id) or is_nil(message.session_sequence) or
+        not exists(
+          from(prior_delivery in Delivery,
+            join: prior_message in Message,
+            on: prior_message.id == prior_delivery.message_id,
+            where: prior_delivery.mode == "webhook",
+            where: prior_delivery.status not in ["delivered", "failed"],
+            where: prior_message.session_id == parent_as(:message).session_id,
+            where: prior_message.session_sequence < parent_as(:message).session_sequence,
+            select: 1
+          )
+        )
+    )
+  end
+
+  defp claim_or_terminalize_webhook_delivery!(
+         %Delivery{} = delivery,
+         %DateTime{} = now,
+         lease_seconds
+       ) do
+    delivery = Repo.preload(delivery, :message)
+
+    cond do
+      delivery.status in ["delivered", "failed"] ->
+        delivery.message
+
+      active_webhook_claim?(delivery, now) ->
+        Repo.rollback(:delivery_in_progress)
+
+      acked?(delivery.message) ->
+        stop_delivery_after_ack!(delivery)
+
+      expired?(delivery.message, now) ->
+        expire_delivery!(delivery, now)
+
+      true ->
+        claim_webhook_delivery!(delivery, now, lease_seconds)
+    end
+  end
+
+  defp active_webhook_claim?(
+         %Delivery{status: "leased", leased_until: %DateTime{} = leased_until},
+         now
+       ) do
+    DateTime.compare(leased_until, now) == :gt
+  end
+
+  defp active_webhook_claim?(%Delivery{}, _now), do: false
+
+  defp acked?(%Message{current_ack_status: status}), do: not is_nil(status)
+
+  defp expired?(%Message{expires_at: %DateTime{} = expires_at}, now) do
+    DateTime.compare(expires_at, now) != :gt
+  end
+
+  defp claim_webhook_delivery!(%Delivery{} = delivery, now, lease_seconds) do
+    claim_token = ID.generate("dcl")
+    leased_until = DateTime.add(now, lease_seconds, :second)
+    attempt_number = delivery.attempt_count + 1
+
+    claimed_delivery =
+      delivery
+      |> Ecto.Changeset.change(
+        status: "leased",
+        claim_token: claim_token,
+        claimed_at: now,
+        leased_until: leased_until
+      )
+      |> Repo.update!()
+      |> Repo.preload([:message, :recipient_agent], force: true)
+
+    %DeliveryClaim{
+      delivery: claimed_delivery,
+      message: claimed_delivery.message,
+      recipient_agent: claimed_delivery.recipient_agent,
+      claim_token: claim_token,
+      leased_until: leased_until,
+      attempt_number: attempt_number
+    }
+  end
+
+  defp stop_delivery_after_ack!(%Delivery{message: %Message{} = message} = delivery) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "message_acked"
+    )
+    |> Repo.update!()
+
+    message
+  end
+
+  defp expire_delivery!(%Delivery{message: %Message{} = message} = delivery, now) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "message_expired"
+    )
+    |> Repo.update!()
+
+    Message
+    |> where([persisted_message], persisted_message.id == ^message.id)
+    |> where([persisted_message], persisted_message.carrier_status != "delivered")
+    |> Repo.update_all(set: [carrier_status: "expired", terminal_at: now, updated_at: now])
+
+    Repo.get!(Message, message.id)
+  end
+
+  defp fetch_locked_webhook_claim_delivery(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id)
+    |> where([delivery], delivery.mode == "webhook")
+    |> join(:inner, [delivery], message in assoc(delivery, :message))
+    |> preload([_delivery, message], message: message)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp validate_webhook_delivery_claim(
+         %Delivery{} = delivery,
+         %DeliveryClaim{} = claim,
+         %AttemptResult{} = result,
+         now
+       ) do
+    with :ok <- validate_webhook_delivery_claim(delivery, claim, now) do
+      if result.attempt_number == claim.attempt_number do
+        :ok
+      else
+        {:error, :stale_delivery_claim}
+      end
+    end
+  end
+
+  defp validate_webhook_delivery_claim(
+         %Delivery{} = delivery,
+         %DeliveryClaim{} = claim,
+         now
+       ) do
+    cond do
+      delivery.id != claim.delivery.id ->
+        {:error, :stale_delivery_claim}
+
+      delivery.message_id != claim.message.id ->
+        {:error, :stale_delivery_claim}
+
+      delivery.recipient_agent_id != claim.recipient_agent.id ->
+        {:error, :stale_delivery_claim}
+
+      delivery.status != "leased" ->
+        {:error, :stale_delivery_claim}
+
+      delivery.claim_token != claim.claim_token ->
+        {:error, :stale_delivery_claim}
+
+      not current_webhook_claim_lease?(delivery, claim, now) ->
+        {:error, :stale_delivery_claim}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_webhook_terminal_claim(delivery, claim, reason, now) do
+    case validate_webhook_delivery_claim(delivery, claim, now) do
+      :ok -> validate_webhook_terminal_reason(delivery.message, reason, now)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_webhook_terminal_reason(%Message{} = message, :message_acked, _now) do
+    if acked?(message), do: :ok, else: {:error, :stale_delivery_claim}
+  end
+
+  defp validate_webhook_terminal_reason(%Message{} = message, :message_expired, now) do
+    if expired?(message, now), do: :ok, else: {:error, :stale_delivery_claim}
+  end
+
+  defp current_webhook_claim_lease?(
+         %Delivery{leased_until: %DateTime{} = leased_until},
+         %DeliveryClaim{leased_until: %DateTime{} = claimed_leased_until},
+         now
+       ) do
+    DateTime.compare(leased_until, claimed_leased_until) == :eq and
+      DateTime.compare(leased_until, now) == :gt
+  end
+
+  defp current_webhook_claim_lease?(%Delivery{}, %DeliveryClaim{}, _now), do: false
+
+  defp insert_claimed_webhook_attempt!(%DeliveryClaim{} = claim, %AttemptResult{} = result) do
+    %WebhookAttempt{id: ID.generate("wha")}
+    |> WebhookAttempt.changeset(%{
+      delivery_id: claim.delivery.id,
+      message_id: claim.message.id,
+      recipient_agent_id: claim.recipient_agent.id,
+      attempt_number: result.attempt_number,
+      request_url: claim.recipient_agent.webhook_url,
+      response_status: result.response_status,
+      error: result.error,
+      result: result.result,
+      next_attempt_at: result.next_attempt_at
+    })
+    |> Repo.insert!()
+  end
+
+  defp update_claimed_webhook_delivery!(%Delivery{} = delivery, %AttemptResult{} = result) do
+    delivery
+    |> Ecto.Changeset.change(
+      attempt_count: result.attempt_number,
+      status: result.delivery_status,
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: result.next_attempt_at,
+      delivered_at: result.delivered_at,
+      last_error: result.error
+    )
+    |> Repo.update!()
+  end
+
+  defp terminalize_claimed_webhook_delivery!(
+         %Delivery{} = delivery,
+         :message_acked,
+         _now
+       ) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "message_acked"
+    )
+    |> Repo.update!()
+
+    delivery.message
+  end
+
+  defp terminalize_claimed_webhook_delivery!(
+         %Delivery{message: %Message{} = message} = delivery,
+         :message_expired,
+         now
+       ) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "message_expired"
+    )
+    |> Repo.update!()
+
+    Message
+    |> where([persisted_message], persisted_message.id == ^message.id)
+    |> where([persisted_message], persisted_message.carrier_status != "delivered")
+    |> Repo.update_all(set: [carrier_status: "expired", terminal_at: now, updated_at: now])
+
+    Repo.get!(Message, message.id)
+  end
+
+  defp update_claimed_webhook_message!(%Message{} = message, %AttemptResult{
+         message_status: message_status
+       }) do
+    now = DateTime.utc_now(:microsecond)
+
+    Message
+    |> where([persisted_message], persisted_message.id == ^message.id)
+    |> where([persisted_message], persisted_message.carrier_status != "delivered")
+    |> Repo.update_all(set: [carrier_status: message_status, updated_at: now])
+
+    Repo.get!(Message, message.id)
+  end
 end
