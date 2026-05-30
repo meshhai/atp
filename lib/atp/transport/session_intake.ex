@@ -2,8 +2,7 @@ defmodule Atp.Transport.SessionIntake do
   @moduledoc false
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Repo
-  alias Atp.Transport.{DurableLedger, Message, Response, Session, WebhookDelivery}
+  alias Atp.Transport.{DurableLedger, Message, Response, WebhookDelivery}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -30,14 +29,13 @@ defmodule Atp.Transport.SessionIntake do
   defp finish_prepared_webhook_delivery(
          %Agent{} = viewer,
          _status,
-         _body,
+         %{"session" => %{"id" => session_id} = session_body},
          {session_id, delivery_id}
        )
        when is_binary(session_id) and is_binary(delivery_id) do
     with {:ok, %Message{} = message} <- WebhookDelivery.deliver_now(delivery_id) do
-      session = Repo.get!(Session, session_id)
-
-      {:ok, 201, Response.session_message(session, message, viewer)}
+      {:ok, 201,
+       %{"session" => session_body, "message_status" => Response.message_status(message, viewer)}}
     end
   end
 end
