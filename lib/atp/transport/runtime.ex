@@ -9,7 +9,7 @@ defmodule Atp.Transport.Runtime do
   require Logger
 
   alias Atp.Identity.Agent
-  alias Atp.Transport.Ledger
+  alias Atp.Transport.{DurableLedger, Ledger, SessionIntake}
   alias Atp.Transport.Runtime.SessionServer
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
@@ -20,8 +20,10 @@ defmodule Atp.Transport.Runtime do
 
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   def open_session(%Agent{} = initiator, params, idempotency_key, route) when is_map(params) do
-    initiator
-    |> Ledger.open_session(params, idempotency_key, route)
+    with {:ok, status, body, prepared} <-
+           DurableLedger.open_session(initiator, params, idempotency_key, route) do
+      SessionIntake.finish(initiator, status, body, prepared)
+    end
     |> warm_pending_opening_session()
   end
 

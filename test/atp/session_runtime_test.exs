@@ -9,6 +9,7 @@ defmodule Atp.SessionRuntimeTest do
 
   alias Atp.Transport.{
     Delivery,
+    DurableLedger,
     Ledger,
     Message,
     Runtime,
@@ -22,6 +23,61 @@ defmodule Atp.SessionRuntimeTest do
 
   @session_registry Atp.Transport.Runtime.SessionRegistry
   @session_supervisor Atp.Transport.Runtime.SessionSupervisor
+
+  defmodule RecordingSessionSendLedger do
+    @behaviour DurableLedger
+
+    @impl DurableLedger
+    def accept_direct_message(_sender, _params, _idempotency_key, _route) do
+      {:error, :unexpected_direct_message}
+    end
+
+    @impl DurableLedger
+    def open_session(_initiator, _params, _idempotency_key, _route) do
+      {:error, :unexpected_open_session}
+    end
+
+    @impl DurableLedger
+    def send_session_message(sender, session_id, params, idempotency_key, route) do
+      test_pid =
+        :atp
+        |> Application.fetch_env!(__MODULE__)
+        |> Keyword.fetch!(:test_pid)
+
+      send(test_pid, {
+        :durable_session_send,
+        sender,
+        session_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201,
+       %{
+         "session" => %{"id" => session_id, "last_sequence" => 2},
+         "message_status" => %{
+           "message" => %{"id" => "msg_recorded", "session_id" => session_id}
+         }
+       }, nil}
+    end
+
+    @impl DurableLedger
+    def claim_due_webhook_delivery(_opts), do: {:error, :unexpected_claim}
+
+    @impl DurableLedger
+    def claim_webhook_delivery(_delivery_id, _opts), do: {:error, :unexpected_claim}
+
+    @impl DurableLedger
+    def finish_claimed_webhook_delivery(_claim, _result, _opts) do
+      {:error, :unexpected_finish}
+    end
+
+    @impl DurableLedger
+    def terminalize_claimed_webhook_delivery(_claim, _reason, _opts) do
+      {:error, :unexpected_terminalize}
+    end
+  end
 
   test "ATP application starts the session runtime registry and supervisor" do
     assert is_pid(Process.whereis(@session_registry))
@@ -1379,6 +1435,53 @@ defmodule Atp.SessionRuntimeTest do
     assert :sys.get_state(pid) == before_state
   end
 
+  test "session server persists sends through the durable ledger", %{conn: conn} do
+    %{initiator: initiator, session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-durable-ledger")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+    Application.put_env(:atp, RecordingSessionSendLedger, test_pid: self())
+
+    sender = Repo.get!(Agent, initiator["id"])
+
+    params = %{
+      "payload" => a2a_user_text("runtime-server-durable-ledger", "via durable ledger")
+    }
+
+    route = "POST /api/sessions/#{session_id}/messages"
+
+    assert {:ok, 201, body} =
+             SessionServer.send_session_message(
+               pid,
+               sender,
+               params,
+               "runtime-server-durable-ledger-send",
+               route
+             )
+
+    assert body["message_status"]["message"]["id"] == "msg_recorded"
+
+    assert_received {
+      :durable_session_send,
+      ^sender,
+      ^session_id,
+      ^params,
+      "runtime-server-durable-ledger-send",
+      ^route
+    }
+  end
+
   test "durable session sends reject non-open sessions", %{conn: conn} do
     {initiator_data, recipient_data} = register_session_agents!(conn, "ledger-non-open-session")
 
@@ -1824,6 +1927,9 @@ defmodule Atp.SessionRuntimeTest do
     _runtime_state = :sys.get_state(Atp.Transport.Runtime.Supervisor)
     :ok
   end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:atp, key)
+  defp restore_application_env(key, config), do: Application.put_env(:atp, key, config)
 
   defp stop_session_server(session_id) do
     if Process.whereis(@session_registry) do

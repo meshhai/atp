@@ -192,6 +192,50 @@ defmodule Atp.DurableLedgerTest do
     }
   end
 
+  test "transport facade delegates session opening to the durable ledger through runtime" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    sender = %Agent{
+      id: "agt_transport_session_sender",
+      account_id: "acc_transport_session",
+      address: "atp://agent/agt_transport_session_sender",
+      status: "active"
+    }
+
+    params = %{
+      "to" => "atp://agent/agt_transport_session_recipient",
+      "payload" => %{
+        "messageId" => "msg_transport_session_open",
+        "role" => "ROLE_USER",
+        "parts" => [%{"text" => "open"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"session" => %{"id" => "ses_configured"}}} =
+             Transport.open_session(
+               sender,
+               params,
+               "transport-session-open-key",
+               "POST /api/sessions"
+             )
+
+    assert_received {
+      :open_session,
+      ^sender,
+      %{
+        "to" => "atp://agent/agt_transport_session_recipient",
+        "payload" => %{
+          "messageId" => "msg_transport_session_open",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => "open"}]
+        }
+      },
+      "transport-session-open-key",
+      "POST /api/sessions"
+    }
+  end
+
   test "durable ledger delegates session intake to configured adapter" do
     Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
 
