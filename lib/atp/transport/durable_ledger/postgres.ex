@@ -48,6 +48,22 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end
   end
 
+  @impl DurableLedger
+  @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.session_intake_result()
+  def open_session(%Agent{}, params, _idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    {:error, :session_intake_not_implemented}
+  end
+
+  @impl DurableLedger
+  @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.session_intake_result()
+  def send_session_message(%Agent{}, session_id, params, _idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    {:error, :session_intake_not_implemented}
+  end
+
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
     with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
          :ok <-

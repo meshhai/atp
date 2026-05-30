@@ -24,6 +24,33 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def open_session(initiator, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :open_session,
+        initiator,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201, %{"session" => %{"id" => "ses_configured"}}, nil}
+    end
+
+    @impl DurableLedger
+    def send_session_message(sender, session_id, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :send_session_message,
+        sender,
+        session_id,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201, %{"message_status" => %{"message" => %{"id" => "msg_configured"}}}, nil}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(opts) do
       notify_test_pid(opts, {:claim_due_webhook_delivery, opts})
       {:ok, nil}
@@ -165,6 +192,83 @@ defmodule Atp.DurableLedgerTest do
     }
   end
 
+  test "durable ledger delegates session intake to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    sender = %Agent{
+      id: "agt_session_sender",
+      account_id: "acc_session",
+      address: "atp://agent/agt_session_sender",
+      status: "active"
+    }
+
+    open_params = %{
+      "to" => "atp://agent/agt_session_recipient",
+      "payload" => %{
+        "messageId" => "msg_session_open",
+        "role" => "ROLE_USER",
+        "parts" => [%{"text" => "open"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"session" => %{"id" => "ses_configured"}}, nil} =
+             DurableLedger.open_session(
+               sender,
+               open_params,
+               "session-open-key",
+               "POST /api/sessions"
+             )
+
+    assert_received {
+      :open_session,
+      ^sender,
+      %{
+        "to" => "atp://agent/agt_session_recipient",
+        "payload" => %{
+          "messageId" => "msg_session_open",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => "open"}]
+        }
+      },
+      "session-open-key",
+      "POST /api/sessions"
+    }
+
+    message_params = %{
+      "payload" => %{
+        "messageId" => "msg_session_send",
+        "role" => "ROLE_USER",
+        "parts" => [%{"text" => "send"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"message_status" => %{"message" => %{"id" => "msg_configured"}}}, nil} =
+             DurableLedger.send_session_message(
+               sender,
+               "ses_configured",
+               message_params,
+               "session-send-key",
+               "POST /api/sessions/ses_configured/messages"
+             )
+
+    assert_received {
+      :send_session_message,
+      ^sender,
+      "ses_configured",
+      %{
+        "payload" => %{
+          "messageId" => "msg_session_send",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => "send"}]
+        }
+      },
+      "session-send-key",
+      "POST /api/sessions/ses_configured/messages"
+    }
+  end
+
   test "durable ledger delegates delivery claim operations to configured adapter" do
     Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
 
@@ -236,6 +340,24 @@ defmodule Atp.DurableLedgerTest do
     assert direct_intake_doc =~ "delivery work"
     assert direct_intake_doc =~ "must not perform active webhook dispatch"
     refute direct_intake_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    session_open_doc = callback_doc(docs, :open_session, 4)
+
+    assert session_open_doc =~ "session"
+    assert session_open_doc =~ "opening message"
+    assert session_open_doc =~ "idempotency"
+    assert session_open_doc =~ "delivery work"
+    assert session_open_doc =~ "must not perform active webhook dispatch"
+    refute session_open_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    session_send_doc = callback_doc(docs, :send_session_message, 5)
+
+    assert session_send_doc =~ "session message"
+    assert session_send_doc =~ "idempotency"
+    assert session_send_doc =~ "sequence"
+    assert session_send_doc =~ "delivery work"
+    assert session_send_doc =~ "must not perform active webhook dispatch"
+    refute session_send_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
   end
 
   defp callback_doc(docs, name, arity) do

@@ -7,18 +7,23 @@ defmodule Atp.Transport.DurableLedger do
   implementation. The current default implementation is
   `Atp.Transport.DurableLedger.Postgres`.
 
-  Delivery claim implementations must preserve atomicity across related carrier
-  state updates, lease ownership, stale-claim rejection, and session-order eligibility.
-  Callbacks use transport structs and avoid exposing storage-engine mechanics.
+  Implementations must preserve atomicity across related carrier state updates,
+  lease ownership, stale-claim rejection, session intake ordering, and
+  session-order eligibility for delivery work. Callbacks use transport structs
+  and avoid exposing storage-engine mechanics.
   """
 
   alias Atp.Identity.{Agent, Idempotency}
   alias Atp.Transport.{DeliveryClaim, Message}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
-  @type direct_message_after_commit :: Idempotency.prepared_after_commit() | nil
+  @type prepared_after_commit :: Idempotency.prepared_after_commit() | nil
+  @type direct_message_after_commit :: prepared_after_commit()
   @type direct_message_intake_result ::
           {:ok, pos_integer(), map(), direct_message_after_commit()} | {:error, term()}
+  @type session_intake_after_commit :: prepared_after_commit()
+  @type session_intake_result ::
+          {:ok, pos_integer(), map(), session_intake_after_commit()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -38,6 +43,38 @@ defmodule Atp.Transport.DurableLedger do
   """
   @callback accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
               direct_message_intake_result()
+
+  @doc """
+  Opens a session in the durable carrier ledger.
+
+  Implementations must validate the request, apply idempotency for the
+  initiator, route, key, and body, resolve the recipient, enforce sender
+  policy, create the session and opening message atomically, assign the opening
+  message sequence, prepare delivery work, and return stable retry results.
+
+  Blocked openings still persist rejected session and opening message state
+  without preparing delivery work. Implementations may return prepared
+  post-commit work for caller completion.
+  Implementations must not perform active webhook dispatch themselves.
+  """
+  @callback open_session(Agent.t(), map(), String.t() | nil, String.t()) ::
+              session_intake_result()
+
+  @doc """
+  Accepts one session message into the durable carrier ledger.
+
+  Implementations must validate the request, apply idempotency for the sender,
+  route, key, and body, enforce participant and open-session checks, allocate
+  the next session message sequence atomically, enforce sender policy, persist
+  the message, prepare delivery work, and return stable retry results.
+
+  Blocked session messages still persist rejected message state with the next
+  sequence without preparing delivery work. Implementations may return prepared
+  post-commit work for caller completion.
+  Implementations must not perform active webhook dispatch themselves.
+  """
+  @callback send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              session_intake_result()
 
   @doc """
   Claims the next due webhook delivery eligible for carrier work.
@@ -89,6 +126,20 @@ defmodule Atp.Transport.DurableLedger do
   def accept_direct_message(%Agent{} = sender, params, idempotency_key, route)
       when is_map(params) and is_binary(route) do
     adapter().accept_direct_message(sender, params, idempotency_key, route)
+  end
+
+  @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) ::
+          session_intake_result()
+  def open_session(%Agent{} = initiator, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    adapter().open_session(initiator, params, idempotency_key, route)
+  end
+
+  @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          session_intake_result()
+  def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    adapter().send_session_message(sender, session_id, params, idempotency_key, route)
   end
 
   @spec claim_due_webhook_delivery(keyword()) :: due_claim_result()
