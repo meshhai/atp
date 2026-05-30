@@ -74,6 +74,8 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_successful_direct_message_intake, "direct-success"},
       {"contract: session open replays stable idempotent responses",
        :assert_open_session_idempotent_replay, "session-open-replay"},
+      {"contract: concurrent session open retries create one committed session",
+       :assert_concurrent_open_session_idempotency, "session-open-concurrent"},
       {"contract: session open rejects idempotency body conflicts",
        :assert_open_session_idempotency_conflict, "session-open-conflict"},
       {"contract: invalid session open requests do not create carrier work",
@@ -612,6 +614,60 @@ defmodule Atp.Support.DurableLedgerContract do
              messages: 1,
              sessions: 1
            }
+
+    :ok
+  end
+
+  @spec assert_concurrent_open_session_idempotency(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_concurrent_open_session_idempotency(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    params = session_open_params(recipient, "#{key}-message", "retry-safe opening concurrency")
+    before_counts = harness.session_carrier_counts()
+
+    results =
+      1..2
+      |> Task.async_stream(
+        fn _index -> open_and_complete_session(adapter, initiator, params, "#{key}-open") end,
+        max_concurrency: 2,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    ok_results = Enum.filter(results, &match?({:ok, 201, _body}, &1))
+
+    assert ok_results != []
+
+    assert Enum.all?(results, fn result ->
+             match?({:ok, 201, _body}, result) or result == {:error, :idempotency_in_progress}
+           end)
+
+    [{:ok, 201, first_body} | _rest] = ok_results
+
+    assert Enum.all?(ok_results, fn {:ok, 201, body} -> body == first_body end)
+
+    assert {:ok, 201, replay_body} =
+             open_and_complete_session(adapter, initiator, params, "#{key}-open")
+
+    assert replay_body == first_body
+    assert first_body["session"]["status"] == "pending"
+    assert first_body["message_status"]["message"]["session_sequence"] == 1
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 1
+           }
+
+    assert [1] =
+             first_body["session"]["id"]
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
 
     :ok
   end
