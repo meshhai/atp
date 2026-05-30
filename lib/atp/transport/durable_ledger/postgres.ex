@@ -70,9 +70,17 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   @impl DurableLedger
   @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.session_intake_result()
-  def send_session_message(%Agent{}, session_id, params, _idempotency_key, route)
+  def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) and is_binary(route) do
-    {:error, :session_intake_not_implemented}
+    with {:ok, payload} <- fetch_session_message_payload(params) do
+      sender
+      |> Idempotency.run_prepared_after_commit(
+        route,
+        idempotency_key,
+        params,
+        fn -> persist_session_message_send(sender, session_id, payload) end
+      )
+    end
   end
 
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
@@ -110,9 +118,40 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end
   end
 
+  defp persist_session_message_send(%Agent{} = sender, session_id, payload) do
+    with {:ok, session} <- fetch_locked_participant_session(sender, session_id),
+         :ok <- ensure_session_open(session),
+         {:ok, recipient} <- fetch_session_recipient(sender, session),
+         {trust, blocked?} <- SenderPolicies.resolve(sender, recipient),
+         :ok <-
+           SenderPolicies.enforce_unknown_sender_rate_limit(
+             sender,
+             recipient,
+             trust,
+             blocked?
+           ),
+         {:ok, message, updated_session} <-
+           insert_next_session_message(sender, recipient, session, trust, blocked?, payload),
+         {:ok, webhook_delivery_id} <-
+           prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
+      body = Response.session_message(updated_session, message, sender)
+      prepared_session_message_response(body, updated_session, webhook_delivery_id)
+    end
+  end
+
   defp prepared_session_open_response(body, %Session{}, nil), do: {:ok, 201, body}
 
   defp prepared_session_open_response(body, %Session{id: session_id}, webhook_delivery_id) do
+    {:ok, 201, body, {session_id, webhook_delivery_id}}
+  end
+
+  defp prepared_session_message_response(body, %Session{}, nil), do: {:ok, 201, body}
+
+  defp prepared_session_message_response(
+         body,
+         %Session{id: session_id},
+         webhook_delivery_id
+       ) do
     {:ok, 201, body, {session_id, webhook_delivery_id}}
   end
 
@@ -198,6 +237,13 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp fetch_payload(%{"payload" => payload}), do: {:ok, payload}
   defp fetch_payload(_params), do: {:error, :payload_required}
 
+  defp fetch_session_message_payload(params) do
+    with {:ok, payload} <- fetch_payload(params),
+         :ok <- Payload.validate_a2a(payload) do
+      {:ok, payload}
+    end
+  end
+
   defp fetch_recipient(%Agent{} = sender, address) do
     case Repo.get_by(Agent, address: address, status: "active") do
       %Agent{} = recipient ->
@@ -214,6 +260,42 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp ensure_distinct_session_participant(%Agent{}, %Agent{}), do: :ok
+
+  defp fetch_locked_participant_session(%Agent{} = agent, session_id) do
+    query =
+      from(session in Session,
+        where: session.id == ^session_id,
+        where: session.initiator_agent_id == ^agent.id or session.recipient_agent_id == ^agent.id,
+        lock: "FOR UPDATE"
+      )
+
+    case Repo.one(query) do
+      %Session{} = session -> {:ok, session}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp ensure_session_open(%Session{status: "open"}), do: :ok
+  defp ensure_session_open(%Session{}), do: {:error, :session_not_open}
+
+  defp fetch_session_recipient(%Agent{id: id}, %Session{initiator_agent_id: id} = session) do
+    session.recipient_agent_id
+    |> fetch_active_agent_by_id()
+    |> normalize_session_recipient()
+  end
+
+  defp fetch_session_recipient(%Agent{id: id}, %Session{recipient_agent_id: id} = session) do
+    session.initiator_agent_id
+    |> fetch_active_agent_by_id()
+    |> normalize_session_recipient()
+  end
+
+  defp fetch_active_agent_by_id(agent_id) do
+    Repo.get_by(Agent, id: agent_id, status: "active")
+  end
+
+  defp normalize_session_recipient(%Agent{} = recipient), do: {:ok, recipient}
+  defp normalize_session_recipient(nil), do: {:error, :recipient_not_found}
 
   defp insert_direct_message(
          %Agent{} = sender,
@@ -285,6 +367,29 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     session
     |> Session.changeset(%{opening_message_id: message_id})
     |> Repo.update()
+  end
+
+  defp insert_next_session_message(
+         %Agent{} = sender,
+         %Agent{} = recipient,
+         %Session{} = session,
+         trust,
+         blocked?,
+         payload
+       ) do
+    next_sequence = session.last_sequence + 1
+
+    with {:ok, message} <-
+           insert_session_message(sender, recipient, trust, blocked?, payload, %{
+             session_id: session.id,
+             session_sequence: next_sequence
+           }),
+         {:ok, updated_session} <-
+           session
+           |> Session.changeset(%{last_sequence: next_sequence})
+           |> Repo.update() do
+      {:ok, message, updated_session}
+    end
   end
 
   defp insert_session_message(

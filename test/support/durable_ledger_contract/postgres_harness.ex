@@ -259,8 +259,24 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec get_session!(String.t()) :: Session.t()
   def get_session!(session_id), do: Repo.get!(Session, session_id)
 
+  @spec mark_session_open!(String.t()) :: Session.t()
+  def mark_session_open!(session_id) do
+    session_id
+    |> get_session!()
+    |> Ecto.Changeset.change(status: "open", opened_at: DateTime.utc_now(:microsecond))
+    |> Repo.update!()
+  end
+
   @spec get_message!(String.t()) :: Message.t()
   def get_message!(message_id), do: Repo.get!(Message, message_id)
+
+  @spec get_messages_for_session!(String.t()) :: [Message.t()]
+  def get_messages_for_session!(session_id) do
+    Message
+    |> where([message], message.session_id == ^session_id)
+    |> order_by([message], asc: message.session_sequence)
+    |> Repo.all()
+  end
 
   @spec get_deliveries_for_message!(String.t()) :: [Delivery.t()]
   def get_deliveries_for_message!(message_id) do
