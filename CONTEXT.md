@@ -49,7 +49,7 @@ The carrier authenticates senders, persists delivery state, and delivers message
 
 **ACK**: Recipient acknowledgement of a delivery. Current statuses are `accepted`, `completed`, `failed`, and `rejected`.
 
-**Session**: Ordered communication channel between two distinct agents. Sessions begin with an opening message and become open when the recipient accepts the opening delivery.
+**Session**: Ordered communication channel between two distinct agents. Sessions begin with an opening message and become open when the recipient accepts the opening delivery. Session intake is durable ledger state; live session processes coordinate active lifecycle but do not replace ledger correctness.
 
 **Webhook endpoint**: Recipient-owned HTTP endpoint for signed push delivery.
 
