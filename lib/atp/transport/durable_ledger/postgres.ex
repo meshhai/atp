@@ -19,6 +19,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     Payload,
     Response,
     SenderPolicies,
+    Session,
     WebhookAttempt,
     WebhookDelivery
   }
@@ -51,9 +52,19 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   @impl DurableLedger
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.session_intake_result()
-  def open_session(%Agent{}, params, _idempotency_key, route)
+  def open_session(%Agent{} = initiator, params, idempotency_key, route)
       when is_map(params) and is_binary(route) do
-    {:error, :session_intake_not_implemented}
+    with {:ok, recipient_address} <- fetch_to_address(params),
+         {:ok, payload} <- fetch_payload(params),
+         :ok <- Payload.validate_a2a(payload) do
+      initiator
+      |> Idempotency.run_prepared_after_commit(
+        route,
+        idempotency_key,
+        params,
+        fn -> persist_session_open(initiator, recipient_address, payload) end
+      )
+    end
   end
 
   @impl DurableLedger
@@ -78,6 +89,31 @@ defmodule Atp.Transport.DurableLedger.Postgres do
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
       {:ok, 201, Response.message_status(message, sender), webhook_delivery_id}
     end
+  end
+
+  defp persist_session_open(%Agent{} = initiator, recipient_address, payload) do
+    with {:ok, recipient, trust, blocked?} <- fetch_recipient(initiator, recipient_address),
+         :ok <- ensure_distinct_session_participant(initiator, recipient),
+         :ok <-
+           SenderPolicies.enforce_unknown_sender_rate_limit(
+             initiator,
+             recipient,
+             trust,
+             blocked?
+           ),
+         {:ok, session, message} <-
+           insert_opening_session_message(initiator, recipient, trust, blocked?, payload),
+         {:ok, webhook_delivery_id} <-
+           prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
+      body = Response.session_message(session, message, initiator)
+      prepared_session_open_response(body, session, webhook_delivery_id)
+    end
+  end
+
+  defp prepared_session_open_response(body, %Session{}, nil), do: {:ok, 201, body}
+
+  defp prepared_session_open_response(body, %Session{id: session_id}, webhook_delivery_id) do
+    {:ok, 201, body, {session_id, webhook_delivery_id}}
   end
 
   @impl DurableLedger
@@ -173,6 +209,12 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end
   end
 
+  defp ensure_distinct_session_participant(%Agent{id: id}, %Agent{id: id}) do
+    {:error, :invalid_session_recipient}
+  end
+
+  defp ensure_distinct_session_participant(%Agent{}, %Agent{}), do: :ok
+
   defp insert_direct_message(
          %Agent{} = sender,
          %Agent{} = recipient,
@@ -196,6 +238,81 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       carrier_status: carrier_status(blocked?),
       terminal_at: terminal_timestamp(blocked?, now),
       expires_at: DateTime.add(now, @default_message_ttl_seconds, :second)
+    })
+    |> Repo.insert()
+  end
+
+  defp insert_opening_session_message(
+         %Agent{} = initiator,
+         %Agent{} = recipient,
+         trust,
+         blocked?,
+         payload
+       ) do
+    now = DateTime.utc_now(:microsecond)
+
+    with {:ok, session} <- insert_session(initiator, recipient, blocked?, now),
+         {:ok, message} <-
+           insert_session_message(initiator, recipient, trust, blocked?, payload, %{
+             session_id: session.id,
+             session_sequence: 1
+           }),
+         {:ok, updated_session} <- cache_opening_message(session, message.id) do
+      {:ok, updated_session, message}
+    end
+  end
+
+  defp insert_session(%Agent{} = initiator, %Agent{} = recipient, blocked?, now) do
+    %Session{id: ID.generate("ses")}
+    |> Session.changeset(%{
+      initiator_account_id: initiator.account_id,
+      recipient_account_id: recipient.account_id,
+      initiator_agent_id: initiator.id,
+      recipient_agent_id: recipient.id,
+      initiator_address: initiator.address,
+      recipient_address: recipient.address,
+      status: initial_session_status(blocked?),
+      last_sequence: 1,
+      terminal_at: terminal_timestamp(blocked?, now)
+    })
+    |> Repo.insert()
+  end
+
+  defp initial_session_status(true), do: "rejected"
+  defp initial_session_status(false), do: "pending"
+
+  defp cache_opening_message(%Session{} = session, message_id) do
+    session
+    |> Session.changeset(%{opening_message_id: message_id})
+    |> Repo.update()
+  end
+
+  defp insert_session_message(
+         %Agent{} = sender,
+         %Agent{} = recipient,
+         trust,
+         blocked?,
+         payload,
+         session_attrs
+       ) do
+    now = DateTime.utc_now(:microsecond)
+
+    %Message{id: ID.generate("msg")}
+    |> Message.changeset(%{
+      sender_account_id: sender.account_id,
+      recipient_account_id: recipient.account_id,
+      sender_agent_id: sender.id,
+      recipient_agent_id: recipient.id,
+      sender_address: sender.address,
+      recipient_address: recipient.address,
+      trust: trust,
+      payload: payload,
+      content_type: Payload.content_type(),
+      carrier_status: carrier_status(blocked?),
+      terminal_at: terminal_timestamp(blocked?, now),
+      expires_at: DateTime.add(now, @default_message_ttl_seconds, :second),
+      session_id: Map.fetch!(session_attrs, :session_id),
+      session_sequence: Map.fetch!(session_attrs, :session_sequence)
     })
     |> Repo.insert()
   end

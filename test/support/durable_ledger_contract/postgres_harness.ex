@@ -14,7 +14,15 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   alias Atp.Identity.Agent
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, Message, SenderPolicies, WebhookAttempt, WebhookDelivery}
+
+  alias Atp.Transport.{
+    Delivery,
+    Message,
+    SenderPolicies,
+    Session,
+    WebhookAttempt,
+    WebhookDelivery
+  }
 
   @spec prepare_direct_message_pair!(Plug.Conn.t(), String.t()) :: {Agent.t(), Agent.t()}
   def prepare_direct_message_pair!(conn, key) do
@@ -25,6 +33,9 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
     {get_agent!(sender["id"]), get_agent!(recipient["id"])}
   end
+
+  @spec prepare_session_pair!(Plug.Conn.t(), String.t()) :: {Agent.t(), Agent.t()}
+  def prepare_session_pair!(conn, key), do: prepare_direct_message_pair!(conn, key)
 
   @spec prepare_active_webhook_direct_message_pair!(Plug.Conn.t(), String.t()) ::
           {Agent.t(), Agent.t()}
@@ -42,6 +53,11 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
     {get_agent!(sender["id"]), get_agent!(recipient["id"])}
   end
+
+  @spec prepare_active_webhook_session_pair!(Plug.Conn.t(), String.t()) ::
+          {Agent.t(), Agent.t()}
+  def prepare_active_webhook_session_pair!(conn, key),
+    do: prepare_active_webhook_direct_message_pair!(conn, key)
 
   @spec prepare_direct_message_principal_scope!(Plug.Conn.t(), String.t()) ::
           {Agent.t(), Agent.t(), Agent.t()}
@@ -63,6 +79,16 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
       messages: Repo.aggregate(Message, :count, :id),
       deliveries: Repo.aggregate(Delivery, :count, :id)
     }
+  end
+
+  @spec session_carrier_counts() :: %{
+          messages: non_neg_integer(),
+          deliveries: non_neg_integer(),
+          sessions: non_neg_integer()
+        }
+  def session_carrier_counts do
+    carrier_counts()
+    |> Map.put(:sessions, Repo.aggregate(Session, :count, :id))
   end
 
   @spec prepare_due_webhook_delivery!(Plug.Conn.t(), String.t()) ::
@@ -229,6 +255,9 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   @spec get_delivery!(String.t()) :: Delivery.t()
   def get_delivery!(delivery_id), do: Repo.get!(Delivery, delivery_id)
+
+  @spec get_session!(String.t()) :: Session.t()
+  def get_session!(session_id), do: Repo.get!(Session, session_id)
 
   @spec get_message!(String.t()) :: Message.t()
   def get_message!(message_id), do: Repo.get!(Message, message_id)
