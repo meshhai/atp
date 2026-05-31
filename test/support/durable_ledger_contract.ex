@@ -992,6 +992,20 @@ defmodule Atp.Support.DurableLedgerContract do
                "#{key}-outsider-send"
              )
 
+    {inactive_initiator, inactive_recipient, inactive_session} =
+      prepare_open_session!(adapter, harness, conn, "#{key}-inactive-counterparty")
+
+    harness.disable_agent!(inactive_recipient)
+
+    assert {:error, :recipient_not_found} =
+             send_and_complete_session_message(
+               adapter,
+               inactive_initiator,
+               inactive_session.id,
+               session_message_params("#{key}-inactive-send", "counterparty gone"),
+               "#{key}-inactive-send"
+             )
+
     assert {:ok, 201, _body} =
              send_and_complete_session_message(
                adapter,
@@ -1003,8 +1017,8 @@ defmodule Atp.Support.DurableLedgerContract do
 
     assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
              deliveries: 0,
-             messages: 2,
-             sessions: 1
+             messages: 3,
+             sessions: 2
            }
 
     assert [1] =
@@ -1014,6 +1028,11 @@ defmodule Atp.Support.DurableLedgerContract do
 
     assert [1, 2] =
              open_session.id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    assert [1] =
+             inactive_session.id
              |> harness.get_messages_for_session!()
              |> Enum.map(& &1.session_sequence)
 
@@ -1130,6 +1149,18 @@ defmodule Atp.Support.DurableLedgerContract do
            }
 
     assert {:ok, 201, ^body} = complete_prepared_session_send(prepared)
+
+    assert {:ok, 201, completed_body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               session_message_params("#{key}-completed", "complete prepared session send"),
+               "#{key}-completed-send"
+             )
+
+    assert completed_body["session"]["last_sequence"] == 3
+    assert completed_body["message_status"]["message"]["session_sequence"] == 3
 
     :ok
   end
@@ -1399,9 +1430,6 @@ defmodule Atp.Support.DurableLedgerContract do
         complete_prepared_session_send(prepared)
 
       {:ok, status, body, nil} ->
-        {:ok, status, body}
-
-      {:ok, status, body} ->
         {:ok, status, body}
 
       {:error, reason} ->

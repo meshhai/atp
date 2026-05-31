@@ -22,10 +22,6 @@ defmodule Atp.Transport.SessionIntake do
     end)
   end
 
-  defp finish_prepared_webhook_delivery(%Agent{}, status, body, {_session_id, nil}) do
-    {:ok, status, body}
-  end
-
   defp finish_prepared_webhook_delivery(
          %Agent{} = viewer,
          _status,

@@ -38,6 +38,25 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
+    def preflight_session_message(sender, session_id, params, idempotency_key, route) do
+      test_pid =
+        :atp
+        |> Application.fetch_env!(__MODULE__)
+        |> Keyword.fetch!(:test_pid)
+
+      send(test_pid, {
+        :durable_session_preflight,
+        sender,
+        session_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      :ok
+    end
+
+    @impl DurableLedger
     def send_session_message(sender, session_id, params, idempotency_key, route) do
       test_pid =
         :atp
@@ -476,8 +495,8 @@ defmodule Atp.SessionRuntimeTest do
         initiator = register_agent!(account_token, "register-#{key}-initiator", %{})
         recipient = register_agent!(account_token, "register-#{key}-recipient", %{})
 
-        assert {:ok, 201, opened} =
-                 Ledger.open_session(
+        assert {:ok, 201, opened, _prepared} =
+                 DurableLedger.open_session(
                    Repo.get!(Agent, initiator["id"]),
                    %{
                      "to" => recipient["address"],
@@ -1482,6 +1501,61 @@ defmodule Atp.SessionRuntimeTest do
     }
   end
 
+  test "runtime preflights session sends through the durable ledger before startup", %{conn: conn} do
+    %{initiator: initiator, session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-preflight-durable-ledger")
+
+    session_id = session["id"]
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      stop_session_server(session_id)
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+    Application.put_env(:atp, RecordingSessionSendLedger, test_pid: self())
+
+    sender = Repo.get!(Agent, initiator["id"])
+
+    params = %{
+      "payload" => a2a_user_text("runtime-preflight-durable-ledger", "via durable ledger")
+    }
+
+    route = "POST /api/sessions/#{session_id}/messages"
+
+    assert {:ok, 201, body} =
+             Runtime.send_session_message(
+               sender,
+               session_id,
+               params,
+               "runtime-preflight-durable-ledger-send",
+               route
+             )
+
+    assert body["message_status"]["message"]["id"] == "msg_recorded"
+
+    assert_received {
+      :durable_session_preflight,
+      ^sender,
+      ^session_id,
+      ^params,
+      "runtime-preflight-durable-ledger-send",
+      ^route
+    }
+
+    assert_received {
+      :durable_session_send,
+      ^sender,
+      ^session_id,
+      ^params,
+      "runtime-preflight-durable-ledger-send",
+      ^route
+    }
+  end
+
   test "durable session sends reject non-open sessions", %{conn: conn} do
     {initiator_data, recipient_data} = register_session_agents!(conn, "ledger-non-open-session")
 
@@ -1497,10 +1571,16 @@ defmodule Atp.SessionRuntimeTest do
     recipient = Repo.get!(Agent, session["recipient_agent_id"])
 
     assert {:error, :session_not_open} =
-             Ledger.validate_session_message_sender(recipient, session["id"])
+             DurableLedger.preflight_session_message(
+               recipient,
+               session["id"],
+               %{"payload" => a2a_user_text("ledger-non-open-preflight", "not open")},
+               "ledger-non-open-preflight-send",
+               "POST /api/sessions/#{session["id"]}/messages"
+             )
 
     assert {:error, :session_not_open} =
-             Ledger.send_session_message(
+             DurableLedger.send_session_message(
                initiator,
                session["id"],
                %{"payload" => a2a_user_text("ledger-non-open-session", "not open")},
@@ -1519,7 +1599,7 @@ defmodule Atp.SessionRuntimeTest do
       register_agent!(account["account_api_key"]["token"], "register-ledger-unrelated", %{})
 
     assert {:error, :not_found} =
-             Ledger.send_session_message(
+             DurableLedger.send_session_message(
                Repo.get!(Agent, unrelated["id"]),
                session["id"],
                %{"payload" => a2a_user_text("ledger-unrelated-session", "not a participant")},
@@ -1530,7 +1610,7 @@ defmodule Atp.SessionRuntimeTest do
     disable_agent!(recipient["id"])
 
     assert {:error, :recipient_not_found} =
-             Ledger.send_session_message(
+             DurableLedger.send_session_message(
                Repo.get!(Agent, initiator["id"]),
                session["id"],
                %{"payload" => a2a_user_text("ledger-inactive-counterparty", "recipient gone")},
@@ -1678,8 +1758,8 @@ defmodule Atp.SessionRuntimeTest do
   defp open_pending_session_context_without_runtime!(conn, key) do
     {initiator, recipient} = register_session_agents!(conn, key)
 
-    assert {:ok, 201, opened} =
-             Ledger.open_session(
+    assert {:ok, 201, opened, _prepared} =
+             DurableLedger.open_session(
                Repo.get!(Agent, initiator["id"]),
                %{
                  "to" => recipient["address"],

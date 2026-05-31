@@ -47,9 +47,14 @@ defmodule Atp.Transport.Runtime do
           api_result()
   def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) do
-    with :ok <- Ledger.validate_session_message_params(params),
-         :ok <- Ledger.preflight_idempotency(sender, route, idempotency_key, params),
-         :ok <- Ledger.validate_session_message_sender(sender, session_id),
+    with :ok <-
+           DurableLedger.preflight_session_message(
+             sender,
+             session_id,
+             params,
+             idempotency_key,
+             route
+           ),
          {:ok, pid} <- ensure_session_started(session_id) do
       SessionServer.send_session_message(pid, sender, params, idempotency_key, route)
     end

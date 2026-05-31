@@ -68,6 +68,17 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   @impl DurableLedger
+  @spec preflight_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.session_message_preflight_result()
+  def preflight_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    with {:ok, _payload} <- fetch_session_message_payload(params),
+         :ok <- Idempotency.preflight(sender, route, idempotency_key, params) do
+      validate_session_message_sender(sender, session_id)
+    end
+  end
+
+  @impl DurableLedger
   @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.session_intake_result()
   def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
@@ -114,7 +125,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          {:ok, webhook_delivery_id} <-
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
       body = Response.session_message(session, message, initiator)
-      prepared_session_open_response(body, session, webhook_delivery_id)
+      prepared_session_intake_response(body, session, webhook_delivery_id)
     end
   end
 
@@ -135,23 +146,13 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          {:ok, webhook_delivery_id} <-
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
       body = Response.session_message(updated_session, message, sender)
-      prepared_session_message_response(body, updated_session, webhook_delivery_id)
+      prepared_session_intake_response(body, updated_session, webhook_delivery_id)
     end
   end
 
-  defp prepared_session_open_response(body, %Session{}, nil), do: {:ok, 201, body}
+  defp prepared_session_intake_response(body, %Session{}, nil), do: {:ok, 201, body}
 
-  defp prepared_session_open_response(body, %Session{id: session_id}, webhook_delivery_id) do
-    {:ok, 201, body, {session_id, webhook_delivery_id}}
-  end
-
-  defp prepared_session_message_response(body, %Session{}, nil), do: {:ok, 201, body}
-
-  defp prepared_session_message_response(
-         body,
-         %Session{id: session_id},
-         webhook_delivery_id
-       ) do
+  defp prepared_session_intake_response(body, %Session{id: session_id}, webhook_delivery_id) do
     {:ok, 201, body, {session_id, webhook_delivery_id}}
   end
 
@@ -272,6 +273,25 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     case Repo.one(query) do
       %Session{} = session -> {:ok, session}
       nil -> {:error, :not_found}
+    end
+  end
+
+  defp validate_session_message_sender(%Agent{} = sender, session_id) do
+    case Repo.get(Session, session_id) do
+      %Session{initiator_agent_id: agent_id, status: "open"} when agent_id == sender.id ->
+        :ok
+
+      %Session{recipient_agent_id: agent_id, status: "open"} when agent_id == sender.id ->
+        :ok
+
+      %Session{initiator_agent_id: agent_id} when agent_id == sender.id ->
+        {:error, :session_not_open}
+
+      %Session{recipient_agent_id: agent_id} when agent_id == sender.id ->
+        {:error, :session_not_open}
+
+      _other ->
+        {:error, :not_found}
     end
   end
 

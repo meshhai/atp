@@ -24,6 +24,7 @@ defmodule Atp.Transport.DurableLedger do
   @type session_intake_after_commit :: prepared_after_commit()
   @type session_intake_result ::
           {:ok, pos_integer(), map(), session_intake_after_commit()} | {:error, term()}
+  @type session_message_preflight_result :: :ok | {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -59,6 +60,24 @@ defmodule Atp.Transport.DurableLedger do
   """
   @callback open_session(Agent.t(), map(), String.t() | nil, String.t()) ::
               session_intake_result()
+
+  @doc """
+  Performs a cheap preflight for a session message before live runtime startup.
+
+  Implementations should validate request shape, idempotency replay eligibility,
+  participant membership, and open-session state without mutating carrier state.
+  Final correctness, sequence allocation, sender policy enforcement, message
+  persistence, and delivery preparation remain the responsibility of
+  `send_session_message/5`.
+  """
+  @callback preflight_session_message(
+              Agent.t(),
+              String.t(),
+              map(),
+              String.t() | nil,
+              String.t()
+            ) ::
+              session_message_preflight_result()
 
   @doc """
   Accepts one session message into the durable carrier ledger.
@@ -133,6 +152,13 @@ defmodule Atp.Transport.DurableLedger do
   def open_session(%Agent{} = initiator, params, idempotency_key, route)
       when is_map(params) and is_binary(route) do
     adapter().open_session(initiator, params, idempotency_key, route)
+  end
+
+  @spec preflight_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          session_message_preflight_result()
+  def preflight_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    adapter().preflight_session_message(sender, session_id, params, idempotency_key, route)
   end
 
   @spec send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::

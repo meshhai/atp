@@ -37,6 +37,20 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def preflight_session_message(sender, session_id, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :preflight_session_message,
+        sender,
+        session_id,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      :ok
+    end
+
+    @impl DurableLedger
     def send_session_message(sender, session_id, params, idempotency_key, route) do
       send(Map.fetch!(params, :test_pid), {
         :send_session_message,
@@ -311,6 +325,39 @@ defmodule Atp.DurableLedgerTest do
       "session-send-key",
       "POST /api/sessions/ses_configured/messages"
     }
+
+    preflight_params = %{
+      "payload" => %{
+        "messageId" => "msg_session_preflight",
+        "role" => "ROLE_USER",
+        "parts" => [%{"text" => "preflight"}]
+      },
+      test_pid: self()
+    }
+
+    assert :ok =
+             DurableLedger.preflight_session_message(
+               sender,
+               "ses_configured",
+               preflight_params,
+               "session-preflight-key",
+               "POST /api/sessions/ses_configured/messages"
+             )
+
+    assert_received {
+      :preflight_session_message,
+      ^sender,
+      "ses_configured",
+      %{
+        "payload" => %{
+          "messageId" => "msg_session_preflight",
+          "role" => "ROLE_USER",
+          "parts" => [%{"text" => "preflight"}]
+        }
+      },
+      "session-preflight-key",
+      "POST /api/sessions/ses_configured/messages"
+    }
   end
 
   test "durable ledger delegates delivery claim operations to configured adapter" do
@@ -402,6 +449,13 @@ defmodule Atp.DurableLedgerTest do
     assert session_send_doc =~ "delivery work"
     assert session_send_doc =~ "must not perform active webhook dispatch"
     refute session_send_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    session_preflight_doc = callback_doc(docs, :preflight_session_message, 5)
+
+    assert session_preflight_doc =~ "preflight"
+    assert session_preflight_doc =~ "without mutating carrier state"
+    assert session_preflight_doc =~ "Final correctness"
+    refute session_preflight_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
   end
 
   defp callback_doc(docs, name, arity) do
