@@ -128,8 +128,26 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
-    def ack_delivery(_recipient, _delivery_id, _params, _idempotency_key, _route) do
-      {:error, :unexpected_ack}
+    def ack_delivery(recipient, delivery_id, params, idempotency_key, route) do
+      test_pid =
+        :atp
+        |> Application.fetch_env!(__MODULE__)
+        |> Keyword.fetch!(:test_pid)
+
+      send(test_pid, {
+        :durable_delivery_ack,
+        recipient,
+        delivery_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201,
+       %{
+         "ack" => %{"status" => params["status"]},
+         "message_status" => %{"ack_status" => params["status"]}
+       }}
     end
 
     @impl DurableLedger
@@ -1808,6 +1826,51 @@ defmodule Atp.SessionRuntimeTest do
       ^reject_params,
       "runtime-lifecycle-reject",
       "POST /api/sessions/ses_runtime_lifecycle_reject/reject"
+    }
+  end
+
+  test "runtime routes delivery ACK through the durable ledger" do
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+    Application.put_env(:atp, RecordingSessionSendLedger, test_pid: self())
+
+    recipient = %Agent{
+      id: "agt_runtime_ack_recipient",
+      account_id: "acc_runtime_ack",
+      address: "atp://agent/agt_runtime_ack_recipient",
+      status: "active"
+    }
+
+    params = %{"status" => "completed"}
+    route = "POST /api/deliveries/dlv_runtime_ack/acks"
+
+    assert {:ok, 201,
+            %{
+              "ack" => %{"status" => "completed"},
+              "message_status" => %{"ack_status" => "completed"}
+            }} =
+             Runtime.ack_delivery(
+               recipient,
+               "dlv_runtime_ack",
+               params,
+               "runtime-delivery-ack",
+               route
+             )
+
+    assert_received {
+      :durable_delivery_ack,
+      ^recipient,
+      "dlv_runtime_ack",
+      ^params,
+      "runtime-delivery-ack",
+      ^route
     }
   end
 

@@ -124,6 +124,14 @@ defmodule Atp.ArchitectureTest do
     refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.reject_session"))
   end
 
+  test "runtime routes delivery ACK mutation through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+
+    assert runtime_source =~ "DurableLedger.ack_delivery"
+    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.ack_delivery"))
+  end
+
   test "legacy ledger does not expose session lifecycle entry points" do
     ledger_functions = TransportLedger.__info__(:functions)
 
