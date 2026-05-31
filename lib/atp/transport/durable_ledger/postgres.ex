@@ -16,7 +16,6 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     Delivery,
     DeliveryClaim,
     DurableLedger,
-    Ledger,
     Message,
     Payload,
     Response,
@@ -33,6 +32,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   @default_message_ttl_seconds 7 * 24 * 60 * 60
   @default_polling_lease_seconds 60
   @default_webhook_claim_lease_seconds 60
+  @ack_statuses ~w(accepted completed failed rejected)
   @terminal_ack_statuses ~w(completed failed rejected)
 
   @impl DurableLedger
@@ -131,7 +131,14 @@ defmodule Atp.Transport.DurableLedger.Postgres do
           DurableLedger.ack_result()
   def ack_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
       when is_binary(delivery_id) and is_map(params) and is_binary(route) do
-    Ledger.ack_delivery(recipient, delivery_id, params, idempotency_key, route)
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, ack_status} <- fetch_ack_status(params),
+           {:ok, payload} <- fetch_optional_payload(params),
+           :ok <- Payload.validate_optional_a2a(payload) do
+        persist_delivery_ack(recipient, delivery_id, ack_status, payload)
+      end
+    end)
   end
 
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
@@ -199,6 +206,35 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp persist_session_reject(%Agent{} = recipient, session_id, payload) do
     with {:ok, delivery_id} <- ensure_session_lifecycle_delivery(recipient, session_id) do
       append_session_lifecycle_ack(recipient, delivery_id, "rejected", payload)
+    end
+  end
+
+  defp persist_delivery_ack(%Agent{} = agent, delivery_id, ack_status, payload) do
+    now = DateTime.utc_now(:microsecond)
+
+    case fetch_locked_delivery(agent, delivery_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Delivery{} = delivery ->
+        persist_delivery_ack(agent, delivery, ack_status, payload, now)
+    end
+  end
+
+  defp persist_delivery_ack(%Agent{} = agent, %Delivery{} = delivery, ack_status, payload, now) do
+    with :ok <- validate_delivery_ack_lease(delivery, now),
+         :ok <- validate_delivery_ack_transition(delivery.message.current_ack_status, ack_status),
+         {:ok, opening_session} <- lock_opening_session(delivery.message),
+         :ok <- expire_due_opening_session(opening_session, delivery.message, now),
+         :ok <- validate_opening_session_delivery_ack(opening_session, ack_status),
+         {:ok, delivery} <- mark_acked_delivery_delivered(delivery, now),
+         {:ok, ack} <- insert_ack(delivery, ack_status, payload),
+         {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
+         {:ok, _session} <- cache_opening_session_delivery_ack(opening_session, ack_status, now) do
+      {:ok, 201, Response.ack(agent, ack, message)}
+    else
+      {:commit_error, reason} -> {:commit_error, reason}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -291,6 +327,10 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp fetch_payload(_params), do: {:error, :payload_required}
 
   defp fetch_optional_payload(params), do: {:ok, Map.get(params, "payload")}
+
+  defp fetch_ack_status(%{"status" => status}) when status in @ack_statuses, do: {:ok, status}
+  defp fetch_ack_status(%{"status" => _status}), do: {:error, :invalid_ack_status}
+  defp fetch_ack_status(_params), do: {:error, :ack_status_required}
 
   defp fetch_session_message_payload(params) do
     with {:ok, payload} <- fetch_payload(params),
@@ -653,6 +693,31 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end
   end
 
+  defp validate_delivery_ack_lease(
+         %Delivery{message: %Message{current_ack_status: "accepted"}},
+         _now
+       ) do
+    :ok
+  end
+
+  defp validate_delivery_ack_lease(%Delivery{mode: "webhook", status: "delivered"}, _now),
+    do: :ok
+
+  defp validate_delivery_ack_lease(%Delivery{mode: "webhook"}, _now) do
+    {:error, :delivery_not_delivered}
+  end
+
+  defp validate_delivery_ack_lease(
+         %Delivery{mode: "polling", leased_until: %DateTime{} = leased_until},
+         now
+       ) do
+    if DateTime.compare(leased_until, now) == :gt do
+      :ok
+    else
+      {:error, :lease_expired}
+    end
+  end
+
   defp validate_session_lifecycle_transition(nil), do: :ok
 
   defp validate_session_lifecycle_transition(current_status)
@@ -661,6 +726,21 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp validate_session_lifecycle_transition("accepted"), do: {:error, :invalid_ack_transition}
+
+  defp validate_delivery_ack_transition(nil, _next_status), do: :ok
+
+  defp validate_delivery_ack_transition(current_status, _next_status)
+       when current_status in @terminal_ack_statuses do
+    {:error, :terminal_ack_status}
+  end
+
+  defp validate_delivery_ack_transition("accepted", next_status)
+       when next_status in ~w(completed failed) do
+    :ok
+  end
+
+  defp validate_delivery_ack_transition("accepted", _next_status),
+    do: {:error, :invalid_ack_transition}
 
   defp lock_opening_session(%Message{session_id: nil}), do: {:ok, nil}
 
@@ -691,7 +771,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp expire_due_opening_session(%Session{}, %Message{}, _now), do: :ok
-  defp expire_due_opening_session(nil, %Message{}, _now), do: {:error, :invalid_ack_transition}
+  defp expire_due_opening_session(nil, %Message{}, _now), do: :ok
 
   defp expire_opening_message(%Message{carrier_status: status} = message, now)
        when status in ~w(queued delivered delivery_failed) do
@@ -716,6 +796,18 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp validate_opening_session_lifecycle(%Session{status: "pending"}), do: :ok
   defp validate_opening_session_lifecycle(%Session{}), do: {:error, :invalid_ack_transition}
   defp validate_opening_session_lifecycle(nil), do: {:error, :invalid_ack_transition}
+
+  defp validate_opening_session_delivery_ack(nil, _ack_status), do: :ok
+
+  defp validate_opening_session_delivery_ack(%Session{status: "pending"}, "completed") do
+    {:error, :invalid_ack_transition}
+  end
+
+  defp validate_opening_session_delivery_ack(%Session{status: "pending"}, _ack_status), do: :ok
+
+  defp validate_opening_session_delivery_ack(%Session{}, _ack_status) do
+    {:error, :invalid_ack_transition}
+  end
 
   defp mark_acked_delivery_delivered(%Delivery{mode: "polling", status: "leased"} = delivery, now) do
     delivery
@@ -765,6 +857,19 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp cache_opening_session_lifecycle(%Session{status: "pending"} = session, "rejected", now) do
     terminalize_pending_opening_session(session, "rejected", now)
+  end
+
+  defp cache_opening_session_delivery_ack(nil, _ack_status, _now), do: {:ok, nil}
+
+  defp cache_opening_session_delivery_ack(%Session{status: "pending"} = session, "accepted", now) do
+    session
+    |> Session.changeset(%{status: "open", opened_at: now})
+    |> Repo.update()
+  end
+
+  defp cache_opening_session_delivery_ack(%Session{status: "pending"} = session, status, now)
+       when status in ~w(rejected failed) do
+    terminalize_pending_opening_session(session, status, now)
   end
 
   defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0

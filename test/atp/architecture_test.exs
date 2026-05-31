@@ -107,6 +107,12 @@ defmodule Atp.ArchitectureTest do
     refute postgres_source =~ "Ledger.reject_session"
   end
 
+  test "Postgres durable ledger adapter owns delivery ACK mutation" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+
+    refute postgres_source =~ "Ledger.ack_delivery"
+  end
+
   test "runtime routes session lifecycle mutations through durable ledger" do
     runtime_source = File.read!("lib/atp/transport/runtime.ex")
     runtime_lines = String.split(runtime_source, "\n")

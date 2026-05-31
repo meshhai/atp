@@ -98,6 +98,18 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_session_reject_authorization_and_payload_checks, "session-reject-checks"},
       {"contract: expired session openings cannot be accepted or rejected",
        :assert_expired_session_lifecycle, "session-lifecycle-expired"},
+      {"contract: delivery ACK records polling ACKs and enforces terminal transitions",
+       :assert_delivery_ack_polling_success_and_transitions, "delivery-ack-polling"},
+      {"contract: delivered webhook deliveries can be ACKed",
+       :assert_delivery_ack_delivered_webhook, "delivery-ack-webhook"},
+      {"contract: delivery ACK validates ownership, leases, and webhook delivery state",
+       :assert_delivery_ack_delivery_validation, "delivery-ack-validation"},
+      {"contract: delivery ACK validates status, payload, and idempotency",
+       :assert_delivery_ack_request_validation_and_idempotency, "delivery-ack-request"},
+      {"contract: opening delivery ACK updates durable session state",
+       :assert_delivery_ack_opening_session_side_effects, "delivery-ack-opening"},
+      {"contract: expired opening delivery ACK fails the pending session",
+       :assert_delivery_ack_expired_opening_session, "delivery-ack-expired-opening"},
       {"contract: session message send replays stable idempotent responses",
        :assert_session_message_idempotent_replay, "session-send-replay"},
       {"contract: session message send rejects idempotency body conflicts",
@@ -1213,6 +1225,325 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_delivery_ack_polling_success_and_transitions(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_delivery_ack_polling_success_and_transitions(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {delivery, message, _sender, recipient} = harness.prepare_polling_delivery!(conn, key)
+    payload = Atp.ConnCase.a2a_agent_text("#{key}-accepted", "accepted")
+
+    assert {:ok, 201, accepted} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "accepted", "payload" => payload},
+               "#{key}-accepted"
+             )
+
+    assert accepted["ack"]["delivery_id"] == delivery.id
+    assert accepted["ack"]["message_id"] == message.id
+    assert accepted["ack"]["status"] == "accepted"
+    assert accepted["ack"]["payload"] == payload
+    assert accepted["message_status"]["carrier_status"] == "delivered"
+    assert accepted["message_status"]["ack_status"] == "accepted"
+    refute accepted["message_status"]["terminal_at"]
+
+    persisted_delivery = harness.get_delivery!(delivery.id)
+    persisted_message = harness.get_message!(message.id)
+
+    assert persisted_delivery.status == "delivered"
+    assert %DateTime{} = persisted_delivery.delivered_at
+    assert persisted_message.carrier_status == "delivered"
+    assert persisted_message.current_ack_status == "accepted"
+    refute persisted_message.terminal_at
+
+    assert [accepted_ack] = harness.get_acks_for_message!(message.id)
+    assert accepted_ack.status == "accepted"
+    assert accepted_ack.payload == payload
+
+    assert {:error, :invalid_ack_transition} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "rejected"},
+               "#{key}-rejected-after-accepted"
+             )
+
+    assert {:ok, 201, completed} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "completed"},
+               "#{key}-completed"
+             )
+
+    assert completed["ack"]["status"] == "completed"
+    assert completed["message_status"]["ack_status"] == "completed"
+    assert completed["message_status"]["terminal_at"]
+
+    assert {:error, :terminal_ack_status} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "failed"},
+               "#{key}-failed-after-completed"
+             )
+
+    assert ["accepted", "completed"] =
+             message.id
+             |> harness.get_acks_for_message!()
+             |> Enum.map(& &1.status)
+
+    :ok
+  end
+
+  @spec assert_delivery_ack_delivered_webhook(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_delivery_ack_delivered_webhook(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {delivery, message, recipient, _recipient_response} =
+      harness.prepare_due_webhook_delivery_context!(conn, key)
+
+    assert {:ok, %DeliveryClaim{} = claim} =
+             claim_delivery(adapter, delivery.id, lease_seconds: 90)
+
+    assert {:ok, %Message{carrier_status: "delivered"}} =
+             finish_claim(
+               adapter,
+               claim,
+               delivered_attempt_result(claim, DateTime.utc_now(:microsecond))
+             )
+
+    assert {:ok, 201, body} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "accepted"},
+               "#{key}-accepted"
+             )
+
+    assert body["ack"]["delivery_id"] == delivery.id
+    assert body["ack"]["message_id"] == message.id
+    assert body["ack"]["status"] == "accepted"
+    assert body["message_status"]["ack_status"] == "accepted"
+
+    assert [ack] = harness.get_acks_for_message!(message.id)
+    assert ack.status == "accepted"
+  end
+
+  @spec assert_delivery_ack_delivery_validation(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_delivery_ack_delivery_validation(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {delivery, message, sender, recipient} =
+      harness.prepare_polling_delivery!(conn, "#{key}-wrong-recipient")
+
+    assert {:error, :not_found} =
+             ack_delivery(
+               adapter,
+               sender,
+               delivery.id,
+               %{"status" => "accepted"},
+               "#{key}-wrong-recipient-ack"
+             )
+
+    assert [] = harness.get_acks_for_message!(message.id)
+    refute harness.get_message!(message.id).current_ack_status
+
+    {expired_delivery, expired_message, _sender, expired_recipient} =
+      harness.prepare_polling_delivery!(conn, "#{key}-expired-lease")
+
+    harness.expire_delivery_lease!(expired_delivery)
+
+    assert {:error, :lease_expired} =
+             ack_delivery(
+               adapter,
+               expired_recipient,
+               expired_delivery.id,
+               %{"status" => "accepted"},
+               "#{key}-expired-lease-ack"
+             )
+
+    assert [] = harness.get_acks_for_message!(expired_message.id)
+
+    {webhook_delivery, webhook_message, webhook_recipient, _recipient_response} =
+      harness.prepare_due_webhook_delivery_context!(conn, "#{key}-undelivered-webhook")
+
+    assert {:error, :delivery_not_delivered} =
+             ack_delivery(
+               adapter,
+               webhook_recipient,
+               webhook_delivery.id,
+               %{"status" => "accepted"},
+               "#{key}-undelivered-webhook-ack"
+             )
+
+    assert [] = harness.get_acks_for_message!(webhook_message.id)
+
+    assert recipient.id != sender.id
+
+    :ok
+  end
+
+  @spec assert_delivery_ack_request_validation_and_idempotency(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_delivery_ack_request_validation_and_idempotency(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {delivery, message, _sender, recipient} = harness.prepare_polling_delivery!(conn, key)
+
+    assert {:error, :ack_status_required} =
+             ack_delivery(adapter, recipient, delivery.id, %{}, "#{key}-missing-status")
+
+    assert {:error, :invalid_ack_status} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "done"},
+               "#{key}-invalid-status"
+             )
+
+    assert {:error, :invalid_a2a_message} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "accepted", "payload" => %{"text" => "not A2A"}},
+               "#{key}-invalid-payload"
+             )
+
+    assert [] = harness.get_acks_for_message!(message.id)
+
+    params = %{
+      "status" => "failed",
+      "payload" => Atp.ConnCase.a2a_agent_text("#{key}-failed", "failed")
+    }
+
+    assert {:ok, 201, first_body} =
+             ack_delivery(adapter, recipient, delivery.id, params, "#{key}-idempotent")
+
+    assert {:ok, 201, replay_body} =
+             ack_delivery(adapter, recipient, delivery.id, params, "#{key}-idempotent")
+
+    assert replay_body == first_body
+
+    assert {:error, :idempotency_conflict} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{params | "payload" => Atp.ConnCase.a2a_agent_text("#{key}-changed", "changed")},
+               "#{key}-idempotent"
+             )
+
+    assert [ack] = harness.get_acks_for_message!(message.id)
+    assert ack.status == "failed"
+    assert harness.get_message!(message.id).current_ack_status == "failed"
+
+    :ok
+  end
+
+  @spec assert_delivery_ack_opening_session_side_effects(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_delivery_ack_opening_session_side_effects(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    for status <- ~w(accepted rejected failed) do
+      {session, opening, delivery, _initiator, recipient} =
+        harness.prepare_opening_polling_delivery!(conn, "#{key}-#{status}")
+
+      assert {:ok, 201, body} =
+               ack_delivery(
+                 adapter,
+                 recipient,
+                 delivery.id,
+                 %{"status" => status},
+                 "#{key}-#{status}-ack"
+               )
+
+      assert body["ack"]["message_id"] == opening.id
+      assert body["ack"]["delivery_id"] == delivery.id
+      assert body["ack"]["status"] == status
+      assert body["message_status"]["ack_status"] == status
+
+      persisted_session = harness.get_session!(session.id)
+      persisted_opening = harness.get_message!(opening.id)
+
+      assert persisted_opening.current_ack_status == status
+      assert persisted_opening.carrier_status == "delivered"
+
+      case status do
+        "accepted" ->
+          assert persisted_session.status == "open"
+          assert %DateTime{} = persisted_session.opened_at
+          refute persisted_session.terminal_at
+          refute persisted_opening.terminal_at
+
+        terminal_status ->
+          assert persisted_session.status == terminal_status
+          assert %DateTime{} = persisted_session.terminal_at
+          refute persisted_session.opened_at
+          assert %DateTime{} = persisted_opening.terminal_at
+      end
+    end
+
+    :ok
+  end
+
+  @spec assert_delivery_ack_expired_opening_session(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_delivery_ack_expired_opening_session(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {session, opening, delivery, _initiator, recipient} =
+      harness.prepare_opening_polling_delivery!(conn, key)
+
+    opening
+    |> harness.expire_message!()
+
+    assert {:error, :message_expired} =
+             ack_delivery(
+               adapter,
+               recipient,
+               delivery.id,
+               %{"status" => "accepted"},
+               "#{key}-accepted"
+             )
+
+    persisted_session = harness.get_session!(session.id)
+    persisted_opening = harness.get_message!(opening.id)
+
+    assert persisted_session.status == "failed"
+    assert %DateTime{} = persisted_session.terminal_at
+    refute persisted_session.opened_at
+
+    assert persisted_opening.carrier_status == "expired"
+    assert %DateTime{} = persisted_opening.terminal_at
+    refute persisted_opening.current_ack_status
+    assert [] = harness.get_acks_for_message!(opening.id)
+
+    :ok
+  end
+
   @spec assert_session_message_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
           :ok
   def assert_session_message_idempotent_replay(adapter, harness, conn, key)
@@ -1785,6 +2116,11 @@ defmodule Atp.Support.DurableLedgerContract do
   defp reject_session(adapter, recipient, session_id, params, key) do
     route = "POST /api/sessions/#{session_id}/reject"
     adapter.reject_session(recipient, session_id, params, key, route)
+  end
+
+  defp ack_delivery(adapter, recipient, delivery_id, params, key) do
+    route = "POST /api/deliveries/#{delivery_id}/acks"
+    adapter.ack_delivery(recipient, delivery_id, params, key, route)
   end
 
   defp assert_expired_session_action(adapter, harness, conn, key, action)
