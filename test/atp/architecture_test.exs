@@ -1,6 +1,8 @@
 defmodule Atp.ArchitectureTest do
   use ExUnit.Case, async: true
 
+  alias Atp.Transport.Ledger, as: TransportLedger
+
   test "ATP dependencies stay carrier scoped" do
     dep_apps =
       Atp.MixProject.project()
@@ -91,6 +93,36 @@ defmodule Atp.ArchitectureTest do
     assert postgres_source =~ "FOR UPDATE"
     assert postgres_source =~ "FOR UPDATE SKIP LOCKED"
     refute File.exists?("lib/atp/transport/delivery_claims.ex")
+  end
+
+  test "Postgres durable ledger adapter owns session accept mutation" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+
+    refute postgres_source =~ "Ledger.accept_session"
+  end
+
+  test "Postgres durable ledger adapter owns session reject mutation" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+
+    refute postgres_source =~ "Ledger.reject_session"
+  end
+
+  test "runtime routes session lifecycle mutations through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+
+    assert runtime_source =~ "DurableLedger.accept_session"
+    assert runtime_source =~ "DurableLedger.reject_session"
+
+    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.accept_session"))
+    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.reject_session"))
+  end
+
+  test "legacy ledger does not expose session lifecycle entry points" do
+    ledger_functions = TransportLedger.__info__(:functions)
+
+    refute {:accept_session, 5} in ledger_functions
+    refute {:reject_session, 5} in ledger_functions
   end
 
   test "session intake completion does not reload Postgres session rows" do
