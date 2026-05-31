@@ -82,6 +82,16 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
+    def accept_session(_recipient, _session_id, _params, _idempotency_key, _route) do
+      {:error, :unexpected_accept_session}
+    end
+
+    @impl DurableLedger
+    def reject_session(_recipient, _session_id, _params, _idempotency_key, _route) do
+      {:error, :unexpected_reject_session}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(_opts), do: {:error, :unexpected_claim}
 
     @impl DurableLedger

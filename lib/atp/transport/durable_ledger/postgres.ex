@@ -15,6 +15,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     Delivery,
     DeliveryClaim,
     DurableLedger,
+    Ledger,
     Message,
     Payload,
     Response,
@@ -92,6 +93,22 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         fn -> persist_session_message_send(sender, session_id, payload) end
       )
     end
+  end
+
+  @impl DurableLedger
+  @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.session_lifecycle_result()
+  def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    Ledger.accept_session(recipient, session_id, params, idempotency_key, route)
+  end
+
+  @impl DurableLedger
+  @spec reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.session_lifecycle_result()
+  def reject_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    Ledger.reject_session(recipient, session_id, params, idempotency_key, route)
   end
 
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do

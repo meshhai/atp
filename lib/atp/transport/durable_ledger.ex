@@ -25,6 +25,7 @@ defmodule Atp.Transport.DurableLedger do
   @type session_intake_result ::
           {:ok, pos_integer(), map(), session_intake_after_commit()} | {:error, term()}
   @type session_message_preflight_result :: :ok | {:ok, pos_integer(), map()} | {:error, term()}
+  @type session_lifecycle_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -94,6 +95,34 @@ defmodule Atp.Transport.DurableLedger do
   """
   @callback send_session_message(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
               session_intake_result()
+
+  @doc """
+  Accepts a pending session opening in the durable carrier ledger.
+
+  Implementations must allow only the opening session recipient to accept,
+  apply idempotency for that recipient, route, key, and body, validate any
+  optional A2A ACK payload, record an accepted ACK for the opening delivery,
+  and transition the session from pending to open atomically.
+
+  Implementations must return stable retry results and must not perform active webhook dispatch
+  themselves. Runtime process startup belongs to the caller.
+  """
+  @callback accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              session_lifecycle_result()
+
+  @doc """
+  Rejects a pending session opening in the durable carrier ledger.
+
+  Implementations must allow only the opening session recipient to reject,
+  apply idempotency for that recipient, route, key, and body, validate any
+  optional A2A ACK payload, record a rejected ACK for the opening delivery,
+  and transition the pending session to a terminal rejected state atomically.
+
+  Implementations must return stable retry results and must not perform active webhook dispatch
+  themselves. Runtime process shutdown belongs to the caller.
+  """
+  @callback reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              session_lifecycle_result()
 
   @doc """
   Claims the next due webhook delivery eligible for carrier work.
@@ -166,6 +195,20 @@ defmodule Atp.Transport.DurableLedger do
   def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) and is_binary(route) do
     adapter().send_session_message(sender, session_id, params, idempotency_key, route)
+  end
+
+  @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          session_lifecycle_result()
+  def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    adapter().accept_session(recipient, session_id, params, idempotency_key, route)
+  end
+
+  @spec reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          session_lifecycle_result()
+  def reject_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
+      when is_binary(session_id) and is_map(params) and is_binary(route) do
+    adapter().reject_session(recipient, session_id, params, idempotency_key, route)
   end
 
   @spec claim_due_webhook_delivery(keyword()) :: due_claim_result()

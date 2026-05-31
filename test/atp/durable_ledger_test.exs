@@ -65,6 +65,34 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def accept_session(recipient, session_id, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :accept_session,
+        recipient,
+        session_id,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201, %{"ack" => %{"status" => "accepted"}, "session" => %{"id" => session_id}}}
+    end
+
+    @impl DurableLedger
+    def reject_session(recipient, session_id, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :reject_session,
+        recipient,
+        session_id,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201, %{"ack" => %{"status" => "rejected"}, "session" => %{"id" => session_id}}}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(opts) do
       notify_test_pid(opts, {:claim_due_webhook_delivery, opts})
       {:ok, nil}
@@ -360,6 +388,83 @@ defmodule Atp.DurableLedgerTest do
     }
   end
 
+  test "durable ledger delegates session lifecycle to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    recipient = %Agent{
+      id: "agt_session_lifecycle_recipient",
+      account_id: "acc_session_lifecycle",
+      address: "atp://agent/agt_session_lifecycle_recipient",
+      status: "active"
+    }
+
+    accept_params = %{
+      "payload" => %{
+        "messageId" => "msg_session_accept",
+        "role" => "ROLE_AGENT",
+        "parts" => [%{"text" => "accepted"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"ack" => %{"status" => "accepted"}, "session" => %{"id" => "ses_accept"}}} =
+             DurableLedger.accept_session(
+               recipient,
+               "ses_accept",
+               accept_params,
+               "session-accept-key",
+               "POST /api/sessions/ses_accept/accept"
+             )
+
+    assert_received {
+      :accept_session,
+      ^recipient,
+      "ses_accept",
+      %{
+        "payload" => %{
+          "messageId" => "msg_session_accept",
+          "role" => "ROLE_AGENT",
+          "parts" => [%{"text" => "accepted"}]
+        }
+      },
+      "session-accept-key",
+      "POST /api/sessions/ses_accept/accept"
+    }
+
+    reject_params = %{
+      "payload" => %{
+        "messageId" => "msg_session_reject",
+        "role" => "ROLE_AGENT",
+        "parts" => [%{"text" => "rejected"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"ack" => %{"status" => "rejected"}, "session" => %{"id" => "ses_reject"}}} =
+             DurableLedger.reject_session(
+               recipient,
+               "ses_reject",
+               reject_params,
+               "session-reject-key",
+               "POST /api/sessions/ses_reject/reject"
+             )
+
+    assert_received {
+      :reject_session,
+      ^recipient,
+      "ses_reject",
+      %{
+        "payload" => %{
+          "messageId" => "msg_session_reject",
+          "role" => "ROLE_AGENT",
+          "parts" => [%{"text" => "rejected"}]
+        }
+      },
+      "session-reject-key",
+      "POST /api/sessions/ses_reject/reject"
+    }
+  end
+
   test "durable ledger delegates delivery claim operations to configured adapter" do
     Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
 
@@ -456,6 +561,24 @@ defmodule Atp.DurableLedgerTest do
     assert session_preflight_doc =~ "without mutating carrier state"
     assert session_preflight_doc =~ "Final correctness"
     refute session_preflight_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    session_accept_doc = callback_doc(docs, :accept_session, 5)
+
+    assert session_accept_doc =~ "recipient"
+    assert session_accept_doc =~ "idempotency"
+    assert session_accept_doc =~ "ACK"
+    assert session_accept_doc =~ "open"
+    assert session_accept_doc =~ "must not perform active webhook dispatch"
+    refute session_accept_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    session_reject_doc = callback_doc(docs, :reject_session, 5)
+
+    assert session_reject_doc =~ "recipient"
+    assert session_reject_doc =~ "idempotency"
+    assert session_reject_doc =~ "ACK"
+    assert session_reject_doc =~ "terminal"
+    assert session_reject_doc =~ "must not perform active webhook dispatch"
+    refute session_reject_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
   end
 
   defp callback_doc(docs, name, arity) do
