@@ -495,6 +495,56 @@ defmodule Atp.SessionRuntimeTest do
     refute persisted_opening.current_ack_status
   end
 
+  test "accepted session by ID expires a due opening message and stops the pending process", %{
+    conn: conn
+  } do
+    {initiator, recipient} = register_session_agents!(conn, "runtime-session-id-accept-expired")
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-runtime-session-id-accept-expired",
+        recipient["address"],
+        a2a_user_text("runtime-session-id-accept-expired", "expire before accept")
+      )
+
+    session_id = opened["session"]["id"]
+    opening_message_id = opened["session"]["opening_message_id"]
+    on_exit(fn -> stop_session_server(session_id) end)
+
+    assert [{pid, _metadata}] = Registry.lookup(@session_registry, session_id)
+
+    expired_at = DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
+
+    Message
+    |> Repo.get!(opening_message_id)
+    |> Ecto.Changeset.change(expires_at: expired_at)
+    |> Repo.update!()
+
+    ref = Process.monitor(pid)
+
+    response =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("accept-runtime-session-id-expired")
+      |> post("/api/sessions/#{session_id}/accept", %{})
+      |> json_response(409)
+
+    assert error_code(response) == "message_expired"
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+    assert [] = Registry.lookup(@session_registry, session_id)
+
+    persisted_session = Repo.get!(Session, session_id)
+    assert persisted_session.status == "failed"
+    assert %DateTime{} = persisted_session.terminal_at
+    refute persisted_session.opened_at
+
+    persisted_opening = Repo.get!(Message, opening_message_id)
+    assert persisted_opening.carrier_status == "expired"
+    assert %DateTime{} = persisted_opening.terminal_at
+    refute persisted_opening.current_ack_status
+  end
+
   test "opening ACK and expiry can race without deadlocking", %{conn: conn} do
     unboxed_repo(fn ->
       key = "runtime-opening-expiry-race-#{System.unique_integer([:positive])}"

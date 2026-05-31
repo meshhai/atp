@@ -96,6 +96,8 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_session_reject_idempotency, "session-reject-idempotency"},
       {"contract: session reject enforces recipient authorization and ACK payload policy",
        :assert_session_reject_authorization_and_payload_checks, "session-reject-checks"},
+      {"contract: expired session openings cannot be accepted or rejected",
+       :assert_expired_session_lifecycle, "session-lifecycle-expired"},
       {"contract: session message send replays stable idempotent responses",
        :assert_session_message_idempotent_replay, "session-send-replay"},
       {"contract: session message send rejects idempotency body conflicts",
@@ -1202,6 +1204,15 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_expired_session_lifecycle(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_expired_session_lifecycle(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    assert_expired_session_action(adapter, harness, conn, "#{key}-accept", :accept)
+    assert_expired_session_action(adapter, harness, conn, "#{key}-reject", :reject)
+
+    :ok
+  end
+
   @spec assert_session_message_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
           :ok
   def assert_session_message_idempotent_replay(adapter, harness, conn, key)
@@ -1774,6 +1785,57 @@ defmodule Atp.Support.DurableLedgerContract do
   defp reject_session(adapter, recipient, session_id, params, key) do
     route = "POST /api/sessions/#{session_id}/reject"
     adapter.reject_session(recipient, session_id, params, key, route)
+  end
+
+  defp assert_expired_session_action(adapter, harness, conn, key, action)
+       when action in [:accept, :reject] do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, "#{key}-participants")
+
+    assert {:ok, 201, opened} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-opening", "expire before lifecycle ACK"),
+               "#{key}-open"
+             )
+
+    session_id = opened["session"]["id"]
+    opening_message_id = opened["message_status"]["message"]["id"]
+    before_counts = harness.session_carrier_counts()
+
+    opening_message_id
+    |> harness.get_message!()
+    |> harness.expire_message!()
+
+    assert {:error, :message_expired} =
+             expired_session_action(adapter, recipient, session_id, key, action)
+
+    persisted_session = harness.get_session!(session_id)
+    persisted_opening = harness.get_message!(opening_message_id)
+
+    assert persisted_session.status == "failed"
+    assert %DateTime{} = persisted_session.terminal_at
+    refute persisted_session.opened_at
+
+    assert persisted_opening.carrier_status == "expired"
+    assert %DateTime{} = persisted_opening.terminal_at
+    refute persisted_opening.current_ack_status
+
+    assert harness.get_acks_for_message!(opening_message_id) == []
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 1,
+             messages: 0,
+             sessions: 0
+           }
+  end
+
+  defp expired_session_action(adapter, recipient, session_id, key, :accept) do
+    accept_session(adapter, recipient, session_id, %{}, "#{key}-accept")
+  end
+
+  defp expired_session_action(adapter, recipient, session_id, key, :reject) do
+    reject_session(adapter, recipient, session_id, %{}, "#{key}-reject")
   end
 
   defp send_and_complete_session_message(adapter, sender, session_id, params, key) do

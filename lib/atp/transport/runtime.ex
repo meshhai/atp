@@ -199,6 +199,11 @@ defmodule Atp.Transport.Runtime do
     result
   end
 
+  defp handle_session_id_accept({:error, :message_expired} = result, session_id) do
+    stop_session_process(session_id)
+    result
+  end
+
   defp handle_session_id_accept(result, _session_id), do: result
 
   defp handle_session_id_reject({:ok, _status, _body} = result, session_id) do
