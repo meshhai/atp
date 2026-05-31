@@ -542,20 +542,20 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       [delivery],
       delivery.message_id == ^opening_message_id and delivery.recipient_agent_id == ^agent.id
     )
+    |> where(^ackable_delivery_filter(now))
     |> order_by([delivery], desc: delivery.inserted_at)
-    |> Repo.all()
-    |> Enum.find(&ackable_delivery?(&1, now))
+    |> limit(1)
+    |> Repo.one()
   end
 
-  defp ackable_delivery?(
-         %Delivery{mode: "polling", status: "leased", leased_until: %DateTime{} = leased_until},
-         now
-       ) do
-    DateTime.compare(leased_until, now) == :gt
+  defp ackable_delivery_filter(now) do
+    dynamic(
+      [delivery],
+      (delivery.mode == "polling" and delivery.status == "leased" and
+         not is_nil(delivery.leased_until) and delivery.leased_until > ^now) or
+        (delivery.mode == "webhook" and delivery.status == "delivered")
+    )
   end
-
-  defp ackable_delivery?(%Delivery{mode: "webhook", status: "delivered"}, _now), do: true
-  defp ackable_delivery?(%Delivery{}, _now), do: false
 
   defp insert_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
     lease_until = DateTime.add(now, @default_polling_lease_seconds, :second)
