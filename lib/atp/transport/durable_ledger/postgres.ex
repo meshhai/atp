@@ -12,6 +12,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   alias Atp.Repo
 
   alias Atp.Transport.{
+    Ack,
     Delivery,
     DeliveryClaim,
     DurableLedger,
@@ -30,7 +31,9 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   @behaviour DurableLedger
 
   @default_message_ttl_seconds 7 * 24 * 60 * 60
+  @default_polling_lease_seconds 60
   @default_webhook_claim_lease_seconds 60
+  @terminal_ack_statuses ~w(completed failed rejected)
 
   @impl DurableLedger
   @spec accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
@@ -100,7 +103,13 @@ defmodule Atp.Transport.DurableLedger.Postgres do
           DurableLedger.session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) and is_binary(route) do
-    Ledger.accept_session(recipient, session_id, params, idempotency_key, route)
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, payload} <- fetch_optional_payload(params),
+           :ok <- Payload.validate_optional_a2a(payload) do
+        persist_session_accept(recipient, session_id, payload)
+      end
+    end)
   end
 
   @impl DurableLedger
@@ -164,6 +173,12 @@ defmodule Atp.Transport.DurableLedger.Postgres do
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
       body = Response.session_message(updated_session, message, sender)
       prepared_session_intake_response(body, updated_session, webhook_delivery_id)
+    end
+  end
+
+  defp persist_session_accept(%Agent{} = recipient, session_id, payload) do
+    with {:ok, delivery_id} <- ensure_session_accept_delivery(recipient, session_id) do
+      append_session_accept_ack(recipient, delivery_id, payload)
     end
   end
 
@@ -254,6 +269,8 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp fetch_payload(%{"payload" => payload}), do: {:ok, payload}
   defp fetch_payload(_params), do: {:error, :payload_required}
+
+  defp fetch_optional_payload(params), do: {:ok, Map.get(params, "payload")}
 
   defp fetch_session_message_payload(params) do
     with {:ok, payload} <- fetch_payload(params),
@@ -481,6 +498,241 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp prepare_deliverable_webhook_delivery(%Message{} = message, %Agent{} = recipient, false) do
     prepare_trusted_webhook_delivery(message, recipient)
+  end
+
+  defp ensure_session_accept_delivery(%Agent{} = agent, session_id) do
+    with {:ok, opening_message_id} <- opening_message_id_for_session_accept(agent, session_id) do
+      now = DateTime.utc_now(:microsecond)
+
+      case fetch_ackable_delivery(agent, opening_message_id, now) do
+        %Delivery{id: delivery_id} -> {:ok, delivery_id}
+        nil -> insert_session_action_delivery(agent, opening_message_id, now)
+      end
+    end
+  end
+
+  defp opening_message_id_for_session_accept(%Agent{} = agent, session_id) do
+    case Repo.get(Session, session_id) do
+      %Session{recipient_agent_id: agent_id, status: "pending", opening_message_id: message_id}
+      when agent_id == agent.id and is_binary(message_id) ->
+        {:ok, message_id}
+
+      %Session{recipient_agent_id: agent_id} when agent_id == agent.id ->
+        {:error, :invalid_ack_transition}
+
+      _other ->
+        {:error, :not_found}
+    end
+  end
+
+  defp fetch_ackable_delivery(%Agent{} = agent, opening_message_id, now) do
+    Delivery
+    |> where(
+      [delivery],
+      delivery.message_id == ^opening_message_id and delivery.recipient_agent_id == ^agent.id
+    )
+    |> order_by([delivery], desc: delivery.inserted_at)
+    |> Repo.all()
+    |> Enum.find(&ackable_delivery?(&1, now))
+  end
+
+  defp ackable_delivery?(
+         %Delivery{mode: "polling", status: "leased", leased_until: %DateTime{} = leased_until},
+         now
+       ) do
+    DateTime.compare(leased_until, now) == :gt
+  end
+
+  defp ackable_delivery?(%Delivery{mode: "webhook", status: "delivered"}, _now), do: true
+  defp ackable_delivery?(%Delivery{}, _now), do: false
+
+  defp insert_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
+    lease_until = DateTime.add(now, @default_polling_lease_seconds, :second)
+
+    %Delivery{id: ID.generate("dlv")}
+    |> Delivery.changeset(%{
+      message_id: opening_message_id,
+      recipient_agent_id: agent.id,
+      mode: "polling",
+      status: "leased",
+      leased_until: lease_until
+    })
+    |> Repo.insert()
+    |> case do
+      {:ok, %Delivery{id: delivery_id}} -> {:ok, delivery_id}
+      {:error, _changeset} -> {:error, :invalid_ack_transition}
+    end
+  end
+
+  defp append_session_accept_ack(%Agent{} = agent, delivery_id, payload) do
+    now = DateTime.utc_now(:microsecond)
+
+    case fetch_locked_delivery(agent, delivery_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Delivery{} = delivery ->
+        persist_session_accept_ack(agent, delivery, payload, now)
+    end
+  end
+
+  defp persist_session_accept_ack(%Agent{} = agent, %Delivery{} = delivery, payload, now) do
+    with :ok <- validate_accept_ack_lease(delivery, now),
+         :ok <- validate_session_accept_transition(delivery.message.current_ack_status),
+         {:ok, opening_session} <- lock_opening_session(delivery.message),
+         :ok <- expire_due_opening_session(opening_session, delivery.message, now),
+         :ok <- validate_opening_session_accept(opening_session),
+         {:ok, delivery} <- mark_acked_delivery_delivered(delivery, now),
+         {:ok, ack} <- insert_ack(delivery, "accepted", payload),
+         {:ok, message} <- cache_ack_status(delivery.message, "accepted", now),
+         {:ok, session} <- cache_opening_session_accept(opening_session, now) do
+      body =
+        agent
+        |> Response.ack(ack, message)
+        |> Map.put("session", Response.session(session))
+
+      {:ok, 201, body}
+    else
+      {:commit_error, reason} -> {:commit_error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_locked_delivery(%Agent{} = agent, delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id)
+    |> where([delivery], delivery.recipient_agent_id == ^agent.id)
+    |> join(:inner, [delivery], message in assoc(delivery, :message))
+    |> preload([_delivery, message], message: message)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp validate_accept_ack_lease(%Delivery{mode: "webhook", status: "delivered"}, _now), do: :ok
+
+  defp validate_accept_ack_lease(%Delivery{mode: "webhook"}, _now) do
+    {:error, :delivery_not_delivered}
+  end
+
+  defp validate_accept_ack_lease(
+         %Delivery{mode: "polling", leased_until: %DateTime{} = leased_until},
+         now
+       ) do
+    if DateTime.compare(leased_until, now) == :gt do
+      :ok
+    else
+      {:error, :lease_expired}
+    end
+  end
+
+  defp validate_session_accept_transition(nil), do: :ok
+
+  defp validate_session_accept_transition(current_status)
+       when current_status in @terminal_ack_statuses do
+    {:error, :terminal_ack_status}
+  end
+
+  defp validate_session_accept_transition("accepted"), do: {:error, :invalid_ack_transition}
+
+  defp lock_opening_session(%Message{session_id: nil}), do: {:ok, nil}
+
+  defp lock_opening_session(%Message{} = message) do
+    query =
+      from(session in Session,
+        where: session.id == ^message.session_id,
+        where: session.opening_message_id == ^message.id,
+        lock: "FOR UPDATE"
+      )
+
+    {:ok, Repo.one(query)}
+  end
+
+  defp expire_due_opening_session(
+         %Session{status: "pending"} = session,
+         %Message{expires_at: %DateTime{} = expires_at} = message,
+         now
+       ) do
+    if DateTime.compare(expires_at, now) == :gt do
+      :ok
+    else
+      {:ok, _message} = expire_opening_message(message, now)
+      {:ok, _session} = fail_pending_opening_session(session, now)
+
+      {:commit_error, :message_expired}
+    end
+  end
+
+  defp expire_due_opening_session(%Session{}, %Message{}, _now), do: :ok
+  defp expire_due_opening_session(nil, %Message{}, _now), do: {:error, :invalid_ack_transition}
+
+  defp expire_opening_message(%Message{carrier_status: status} = message, now)
+       when status in ~w(queued delivered delivery_failed) do
+    message
+    |> Ecto.Changeset.change(carrier_status: "expired", terminal_at: now)
+    |> Repo.update()
+  end
+
+  defp expire_opening_message(%Message{} = message, _now), do: {:ok, message}
+
+  defp fail_pending_opening_session(%Session{status: "pending"} = session, now) do
+    terminalize_pending_opening_session(session, "failed", now)
+  end
+
+  defp terminalize_pending_opening_session(%Session{status: "pending"} = session, status, now)
+       when status in ~w(failed rejected) do
+    session
+    |> Session.changeset(%{status: status, terminal_at: now})
+    |> Repo.update()
+  end
+
+  defp validate_opening_session_accept(%Session{status: "pending"}), do: :ok
+  defp validate_opening_session_accept(%Session{}), do: {:error, :invalid_ack_transition}
+  defp validate_opening_session_accept(nil), do: {:error, :invalid_ack_transition}
+
+  defp mark_acked_delivery_delivered(%Delivery{mode: "polling", status: "leased"} = delivery, now) do
+    delivery
+    |> Ecto.Changeset.change(status: "delivered", delivered_at: now)
+    |> Repo.update()
+  end
+
+  defp mark_acked_delivery_delivered(%Delivery{} = delivery, _now), do: {:ok, delivery}
+
+  defp insert_ack(%Delivery{} = delivery, ack_status, payload) do
+    %Ack{id: ID.generate("ack")}
+    |> Ack.changeset(%{
+      message_id: delivery.message_id,
+      delivery_id: delivery.id,
+      recipient_agent_id: delivery.recipient_agent_id,
+      status: ack_status,
+      payload: payload
+    })
+    |> Repo.insert()
+  end
+
+  defp cache_ack_status(%Message{} = message, ack_status, now) do
+    message
+    |> Ecto.Changeset.change(
+      carrier_status: delivered_carrier_status(message),
+      current_ack_status: ack_status,
+      terminal_at: terminal_ack_timestamp(ack_status, now)
+    )
+    |> Repo.update()
+  end
+
+  defp delivered_carrier_status(%Message{carrier_status: status})
+       when status in ~w(queued delivery_failed) do
+    "delivered"
+  end
+
+  defp delivered_carrier_status(%Message{carrier_status: status}), do: status
+
+  defp terminal_ack_timestamp(status, now) when status in @terminal_ack_statuses, do: now
+  defp terminal_ack_timestamp(_status, _now), do: nil
+
+  defp cache_opening_session_accept(%Session{status: "pending"} = session, now) do
+    session
+    |> Session.changeset(%{status: "open", opened_at: now})
+    |> Repo.update()
   end
 
   defp valid_lease_seconds?(seconds), do: is_integer(seconds) and seconds > 0

@@ -84,6 +84,12 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_blocked_session_open_no_delivery_work, "session-open-blocked"},
       {"contract: successful session open creates session state and delivery work",
        :assert_successful_session_open, "session-open-success"},
+      {"contract: session accept records ACK and opens the pending session",
+       :assert_successful_session_accept, "session-accept-success"},
+      {"contract: session accept replays and conflicts idempotently",
+       :assert_session_accept_idempotency, "session-accept-idempotency"},
+      {"contract: session accept enforces recipient authorization and ACK payload policy",
+       :assert_session_accept_authorization_and_payload_checks, "session-accept-checks"},
       {"contract: session message send replays stable idempotent responses",
        :assert_session_message_idempotent_replay, "session-send-replay"},
       {"contract: session message send rejects idempotency body conflicts",
@@ -860,6 +866,171 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_successful_session_accept(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_successful_session_accept(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+
+    assert {:ok, 201, opened} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-opening", "accept this session"),
+               "#{key}-open"
+             )
+
+    session_id = opened["session"]["id"]
+    opening_message_id = opened["message_status"]["message"]["id"]
+    before_counts = harness.session_carrier_counts()
+    ack_payload = Atp.ConnCase.a2a_agent_text("#{key}-accepted", "accepted")
+
+    assert {:ok, 201, accepted} =
+             accept_session(
+               adapter,
+               recipient,
+               session_id,
+               %{"payload" => ack_payload},
+               "#{key}-accept"
+             )
+
+    assert accepted["session"]["id"] == session_id
+    assert accepted["session"]["status"] == "open"
+    assert accepted["ack"]["status"] == "accepted"
+    assert accepted["ack"]["payload"] == ack_payload
+    assert accepted["ack"]["message_id"] == opening_message_id
+    assert accepted["ack"]["delivery_id"] =~ "dlv_"
+    assert accepted["message_status"]["carrier_status"] == "delivered"
+    assert accepted["message_status"]["ack_status"] == "accepted"
+
+    assert [%{"id" => delivery_id, "mode" => "polling", "status" => "delivered"}] =
+             accepted["message_status"]["deliveries"]
+
+    assert delivery_id == accepted["ack"]["delivery_id"]
+
+    persisted_session = harness.get_session!(session_id)
+    persisted_opening = harness.get_message!(opening_message_id)
+
+    assert persisted_session.status == "open"
+    assert %DateTime{} = persisted_session.opened_at
+    refute persisted_session.terminal_at
+    assert persisted_opening.carrier_status == "delivered"
+    assert persisted_opening.current_ack_status == "accepted"
+    refute persisted_opening.terminal_at
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 1,
+             messages: 0,
+             sessions: 0
+           }
+
+    assert [ack] = harness.get_acks_for_message!(opening_message_id)
+    assert ack.status == "accepted"
+    assert ack.payload == ack_payload
+
+    :ok
+  end
+
+  @spec assert_session_accept_idempotency(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_session_accept_idempotency(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+
+    assert {:ok, 201, opened} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-opening", "retry-safe accept"),
+               "#{key}-open"
+             )
+
+    session_id = opened["session"]["id"]
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, first_body} =
+             accept_session(adapter, recipient, session_id, %{}, "#{key}-accept")
+
+    assert {:ok, 201, replay_body} =
+             accept_session(adapter, recipient, session_id, %{}, "#{key}-accept")
+
+    assert replay_body == first_body
+
+    assert {:error, :idempotency_conflict} =
+             accept_session(
+               adapter,
+               recipient,
+               session_id,
+               %{"payload" => Atp.ConnCase.a2a_agent_text("#{key}-changed", "changed")},
+               "#{key}-accept"
+             )
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 1,
+             messages: 0,
+             sessions: 0
+           }
+
+    assert [ack] = harness.get_acks_for_message!(opened["message_status"]["message"]["id"])
+    assert ack.status == "accepted"
+
+    :ok
+  end
+
+  @spec assert_session_accept_authorization_and_payload_checks(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_session_accept_authorization_and_payload_checks(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, "#{key}-participants")
+    {_outsider_sender, outsider} = harness.prepare_session_pair!(conn, "#{key}-outsider")
+
+    assert {:ok, 201, opened} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-opening", "recipient only"),
+               "#{key}-open"
+             )
+
+    session_id = opened["session"]["id"]
+    opening_message_id = opened["message_status"]["message"]["id"]
+    before_counts = harness.session_carrier_counts()
+
+    assert {:error, :not_found} =
+             accept_session(adapter, initiator, session_id, %{}, "#{key}-initiator-accept")
+
+    assert {:error, :not_found} =
+             accept_session(adapter, outsider, session_id, %{}, "#{key}-outsider-accept")
+
+    assert {:error, :invalid_a2a_message} =
+             accept_session(
+               adapter,
+               recipient,
+               session_id,
+               %{"payload" => %{"text" => "not A2A"}},
+               "#{key}-invalid-payload"
+             )
+
+    assert harness.get_session!(session_id).status == "pending"
+    assert harness.get_message!(opening_message_id).current_ack_status == nil
+    assert harness.get_acks_for_message!(opening_message_id) == []
+
+    assert {:ok, 201, accepted} =
+             accept_session(adapter, recipient, session_id, %{}, "#{key}-recipient-accept")
+
+    assert accepted["session"]["status"] == "open"
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 1,
+             messages: 0,
+             sessions: 0
+           }
+
+    :ok
+  end
+
   @spec assert_session_message_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
           :ok
   def assert_session_message_idempotent_replay(adapter, harness, conn, key)
@@ -1422,6 +1593,11 @@ defmodule Atp.Support.DurableLedgerContract do
   defp send_session_message(adapter, sender, session_id, params, key) do
     route = "POST /api/sessions/#{session_id}/messages"
     adapter.send_session_message(sender, session_id, params, key, route)
+  end
+
+  defp accept_session(adapter, recipient, session_id, params, key) do
+    route = "POST /api/sessions/#{session_id}/accept"
+    adapter.accept_session(recipient, session_id, params, key, route)
   end
 
   defp send_and_complete_session_message(adapter, sender, session_id, params, key) do

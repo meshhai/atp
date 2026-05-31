@@ -16,6 +16,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   alias Atp.Repo
 
   alias Atp.Transport.{
+    Ack,
     Delivery,
     Message,
     SenderPolicies,
@@ -283,6 +284,14 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     Delivery
     |> where([delivery], delivery.message_id == ^message_id)
     |> order_by([delivery], asc: delivery.inserted_at)
+    |> Repo.all()
+  end
+
+  @spec get_acks_for_message!(String.t()) :: [Ack.t()]
+  def get_acks_for_message!(message_id) do
+    Ack
+    |> where([ack], ack.message_id == ^message_id)
+    |> order_by([ack], asc: ack.inserted_at)
     |> Repo.all()
   end
 
