@@ -72,6 +72,30 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_blocked_direct_message_no_delivery_work, "direct-blocked"},
       {"contract: successful direct message intake creates message state and delivery work",
        :assert_successful_direct_message_intake, "direct-success"},
+      {"contract: session open replays stable idempotent responses",
+       :assert_open_session_idempotent_replay, "session-open-replay"},
+      {"contract: concurrent session open retries create one committed session",
+       :assert_concurrent_open_session_idempotency, "session-open-concurrent"},
+      {"contract: session open rejects idempotency body conflicts",
+       :assert_open_session_idempotency_conflict, "session-open-conflict"},
+      {"contract: invalid session open requests do not create carrier work",
+       :assert_invalid_session_open_no_carrier_work, "session-open-invalid"},
+      {"contract: blocked session open creates no delivery work",
+       :assert_blocked_session_open_no_delivery_work, "session-open-blocked"},
+      {"contract: successful session open creates session state and delivery work",
+       :assert_successful_session_open, "session-open-success"},
+      {"contract: session message send replays stable idempotent responses",
+       :assert_session_message_idempotent_replay, "session-send-replay"},
+      {"contract: session message send rejects idempotency body conflicts",
+       :assert_session_message_idempotency_conflict, "session-send-conflict"},
+      {"contract: session message send requires an open participant session",
+       :assert_session_message_participant_and_open_session_checks, "session-send-checks"},
+      {"contract: blocked session message send creates no delivery work",
+       :assert_blocked_session_message_no_delivery_work, "session-send-blocked"},
+      {"contract: successful session message send creates message state and delivery work",
+       :assert_successful_session_message_send, "session-send-success"},
+      {"contract: concurrent session message retries create one committed message",
+       :assert_concurrent_session_message_idempotency, "session-send-concurrent"},
       {"contract: session webhook delivery order is preserved", :assert_session_ordering,
        "session-order"}
     ]
@@ -80,10 +104,11 @@ defmodule Atp.Support.DurableLedgerContract do
   import ExUnit.Assertions
 
   alias Atp.Identity.Idempotency
-  alias Atp.Transport.{Delivery, DeliveryClaim, Message, WebhookAttempt}
+  alias Atp.Transport.{Delivery, DeliveryClaim, Message, Session, WebhookAttempt}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @direct_message_route "POST /api/messages"
+  @session_open_route "POST /api/sessions"
 
   @type harness :: module()
 
@@ -565,6 +590,639 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_open_session_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_open_session_idempotent_replay(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    params = session_open_params(recipient, "#{key}-message", "retry-safe opening")
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, first_body} =
+             open_and_complete_session(adapter, initiator, params, "#{key}-open")
+
+    assert {:ok, 201, replay_body} =
+             open_and_complete_session(adapter, initiator, params, "#{key}-open")
+
+    assert replay_body == first_body
+    assert first_body["session"]["status"] == "pending"
+    assert first_body["message_status"]["message"]["from"] == initiator.address
+    assert first_body["message_status"]["message"]["to"] == recipient.address
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 1
+           }
+
+    :ok
+  end
+
+  @spec assert_concurrent_open_session_idempotency(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_concurrent_open_session_idempotency(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    params = session_open_params(recipient, "#{key}-message", "retry-safe opening concurrency")
+    before_counts = harness.session_carrier_counts()
+
+    results =
+      1..2
+      |> Task.async_stream(
+        fn _index -> open_and_complete_session(adapter, initiator, params, "#{key}-open") end,
+        max_concurrency: 2,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    ok_results = Enum.filter(results, &match?({:ok, 201, _body}, &1))
+
+    assert ok_results != []
+
+    assert Enum.all?(results, fn result ->
+             match?({:ok, 201, _body}, result) or result == {:error, :idempotency_in_progress}
+           end)
+
+    [{:ok, 201, first_body} | _rest] = ok_results
+
+    assert Enum.all?(ok_results, fn {:ok, 201, body} -> body == first_body end)
+
+    assert {:ok, 201, replay_body} =
+             open_and_complete_session(adapter, initiator, params, "#{key}-open")
+
+    assert replay_body == first_body
+    assert first_body["session"]["status"] == "pending"
+    assert first_body["message_status"]["message"]["session_sequence"] == 1
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 1
+           }
+
+    assert [1] =
+             first_body["session"]["id"]
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
+  @spec assert_open_session_idempotency_conflict(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_open_session_idempotency_conflict(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, _body} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-original", "original opening"),
+               "#{key}-open"
+             )
+
+    assert {:error, :idempotency_conflict} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-changed", "changed opening"),
+               "#{key}-open"
+             )
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 1
+           }
+
+    :ok
+  end
+
+  @spec assert_invalid_session_open_no_carrier_work(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_invalid_session_open_no_carrier_work(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    before_counts = harness.session_carrier_counts()
+
+    assert {:error, :invalid_a2a_message} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               %{"to" => recipient.address, "payload" => %{"text" => "not an A2A message"}},
+               "#{key}-invalid-payload"
+             )
+
+    assert {:error, :recipient_not_found} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               %{
+                 "to" => "atp://agent/agt_#{key}_missing",
+                 "payload" => Atp.ConnCase.a2a_user_text("#{key}-missing", "missing")
+               },
+               "#{key}-missing-recipient"
+             )
+
+    assert {:error, :invalid_session_recipient} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(initiator, "#{key}-self", "self opening"),
+               "#{key}-self-recipient"
+             )
+
+    assert harness.session_carrier_counts() == before_counts
+
+    :ok
+  end
+
+  @spec assert_blocked_session_open_no_delivery_work(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_blocked_session_open_no_delivery_work(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    harness.block_sender_agent!(initiator, recipient)
+
+    params = session_open_params(recipient, "#{key}-message", "blocked opening")
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, body} =
+             open_and_complete_session(adapter, initiator, params, "#{key}-open")
+
+    assert body["session"]["status"] == "rejected"
+    assert body["session"]["last_sequence"] == 1
+    assert body["message_status"]["carrier_status"] == "rejected"
+    assert body["message_status"]["message"]["trust"] == "untrusted"
+    assert body["message_status"]["deliveries"] == []
+
+    session = harness.get_session!(body["session"]["id"])
+    message = harness.get_message!(body["message_status"]["message"]["id"])
+
+    assert session.status == "rejected"
+    assert session.opening_message_id == message.id
+    assert session.last_sequence == 1
+    assert %DateTime{} = session.terminal_at
+    assert message.session_id == session.id
+    assert message.session_sequence == 1
+    assert message.carrier_status == "rejected"
+    assert %DateTime{} = message.terminal_at
+    assert harness.get_deliveries_for_message!(message.id) == []
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 1
+           }
+
+    :ok
+  end
+
+  @spec assert_successful_session_open(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_successful_session_open(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_active_webhook_session_pair!(conn, key)
+    params = session_open_params(recipient, "#{key}-message", "deliver opening by webhook")
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, body, prepared} =
+             open_session(adapter, initiator, params, "#{key}-open")
+
+    assert body["session"]["status"] == "pending"
+    assert body["session"]["last_sequence"] == 1
+    assert body["session"]["opening_message_id"] == body["message_status"]["message"]["id"]
+    assert body["message_status"]["carrier_status"] == "queued"
+    assert body["message_status"]["message"]["from"] == initiator.address
+    assert body["message_status"]["message"]["to"] == recipient.address
+    assert body["message_status"]["message"]["payload"] == params["payload"]
+    assert body["message_status"]["message"]["session_id"] == body["session"]["id"]
+    assert body["message_status"]["message"]["session_sequence"] == 1
+
+    assert [delivery_status] = body["message_status"]["deliveries"]
+    assert delivery_status["mode"] == "webhook"
+    assert delivery_status["status"] == "retry_scheduled"
+    assert delivery_status["attempt_count"] == 0
+
+    assert %{commit_value: {session_id, webhook_delivery_id}} = prepared
+    assert session_id == body["session"]["id"]
+    assert is_binary(webhook_delivery_id)
+
+    session = harness.get_session!(session_id)
+    message = harness.get_message!(body["message_status"]["message"]["id"])
+
+    assert %Session{} = session
+    assert session.initiator_agent_id == initiator.id
+    assert session.recipient_agent_id == recipient.id
+    assert session.opening_message_id == message.id
+    assert session.status == "pending"
+    assert session.last_sequence == 1
+    assert is_nil(session.opened_at)
+    assert is_nil(session.terminal_at)
+
+    assert message.sender_agent_id == initiator.id
+    assert message.recipient_agent_id == recipient.id
+    assert message.session_id == session.id
+    assert message.session_sequence == 1
+    assert message.content_type == "application/a2a+json"
+    assert message.carrier_status == "queued"
+    assert message.trust == "trusted"
+    assert message.payload == params["payload"]
+
+    assert [%Delivery{} = delivery] = harness.get_deliveries_for_message!(message.id)
+    assert delivery.id == webhook_delivery_id
+    assert delivery.recipient_agent_id == recipient.id
+    assert delivery.mode == "webhook"
+    assert delivery.status == "retry_scheduled"
+    assert delivery.attempt_count == 0
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 1,
+             messages: 1,
+             sessions: 1
+           }
+
+    assert {:ok, 201, ^body} = complete_prepared_session_open(prepared)
+
+    :ok
+  end
+
+  @spec assert_session_message_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_session_message_idempotent_replay(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, _recipient, session} = prepare_open_session!(adapter, harness, conn, key)
+    params = session_message_params("#{key}-message", "retry-safe session message")
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, first_body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               params,
+               "#{key}-send"
+             )
+
+    assert {:ok, 201, replay_body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               params,
+               "#{key}-send"
+             )
+
+    assert replay_body == first_body
+    assert first_body["message_status"]["message"]["session_id"] == session.id
+    assert first_body["message_status"]["message"]["session_sequence"] == 2
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 0
+           }
+
+    assert [1, 2] =
+             session.id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
+  @spec assert_session_message_idempotency_conflict(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_session_message_idempotency_conflict(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, _recipient, session} = prepare_open_session!(adapter, harness, conn, key)
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, _body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               session_message_params("#{key}-original", "original session message"),
+               "#{key}-send"
+             )
+
+    assert {:error, :idempotency_conflict} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               session_message_params("#{key}-changed", "changed session message"),
+               "#{key}-send"
+             )
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 0
+           }
+
+    assert [1, 2] =
+             session.id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
+  @spec assert_session_message_participant_and_open_session_checks(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_session_message_participant_and_open_session_checks(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, _recipient} = harness.prepare_session_pair!(conn, "#{key}-pending")
+    {_outsider, outsider_recipient} = harness.prepare_session_pair!(conn, "#{key}-outsider")
+
+    pending_params =
+      session_open_params(
+        outsider_recipient,
+        "#{key}-pending-opening",
+        "pending session opening"
+      )
+
+    assert {:ok, 201, pending_body} =
+             open_and_complete_session(adapter, initiator, pending_params, "#{key}-open")
+
+    pending_session_id = pending_body["session"]["id"]
+    before_counts = harness.session_carrier_counts()
+
+    assert {:error, :session_not_open} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               pending_session_id,
+               session_message_params("#{key}-pending-send", "too early"),
+               "#{key}-pending-send"
+             )
+
+    {participant, _recipient, open_session} =
+      prepare_open_session!(adapter, harness, conn, "#{key}-open")
+
+    assert {:error, :not_found} =
+             send_and_complete_session_message(
+               adapter,
+               outsider_recipient,
+               open_session.id,
+               session_message_params("#{key}-outsider-send", "not a participant"),
+               "#{key}-outsider-send"
+             )
+
+    {inactive_initiator, inactive_recipient, inactive_session} =
+      prepare_open_session!(adapter, harness, conn, "#{key}-inactive-counterparty")
+
+    harness.disable_agent!(inactive_recipient)
+
+    assert {:error, :recipient_not_found} =
+             send_and_complete_session_message(
+               adapter,
+               inactive_initiator,
+               inactive_session.id,
+               session_message_params("#{key}-inactive-send", "counterparty gone"),
+               "#{key}-inactive-send"
+             )
+
+    assert {:ok, 201, _body} =
+             send_and_complete_session_message(
+               adapter,
+               participant,
+               open_session.id,
+               session_message_params("#{key}-participant-send", "participant"),
+               "#{key}-participant-send"
+             )
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 3,
+             sessions: 2
+           }
+
+    assert [1] =
+             pending_session_id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    assert [1, 2] =
+             open_session.id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    assert [1] =
+             inactive_session.id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
+  @spec assert_blocked_session_message_no_delivery_work(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_blocked_session_message_no_delivery_work(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient, session} = prepare_open_session!(adapter, harness, conn, key)
+    harness.block_sender_agent!(initiator, recipient)
+
+    params = session_message_params("#{key}-message", "blocked session message")
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               params,
+               "#{key}-send"
+             )
+
+    assert body["session"]["id"] == session.id
+    assert body["session"]["last_sequence"] == 2
+    assert body["message_status"]["carrier_status"] == "rejected"
+    assert body["message_status"]["message"]["trust"] == "untrusted"
+    assert body["message_status"]["message"]["session_sequence"] == 2
+    assert body["message_status"]["deliveries"] == []
+
+    persisted_session = harness.get_session!(session.id)
+    message = harness.get_message!(body["message_status"]["message"]["id"])
+
+    assert persisted_session.status == "open"
+    assert persisted_session.last_sequence == 2
+    assert message.session_id == session.id
+    assert message.session_sequence == 2
+    assert message.carrier_status == "rejected"
+    assert message.trust == "untrusted"
+    assert %DateTime{} = message.terminal_at
+    assert harness.get_deliveries_for_message!(message.id) == []
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 0
+           }
+
+    :ok
+  end
+
+  @spec assert_successful_session_message_send(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_successful_session_message_send(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient, session} =
+      prepare_open_session!(adapter, harness, conn, key, active_webhook?: true)
+
+    params = session_message_params("#{key}-message", "deliver session message by webhook")
+    before_counts = harness.session_carrier_counts()
+
+    assert {:ok, 201, body, prepared} =
+             send_session_message(adapter, initiator, session.id, params, "#{key}-send")
+
+    assert body["session"]["id"] == session.id
+    assert body["session"]["status"] == "open"
+    assert body["session"]["last_sequence"] == 2
+    assert body["message_status"]["carrier_status"] == "queued"
+    assert body["message_status"]["message"]["from"] == initiator.address
+    assert body["message_status"]["message"]["to"] == recipient.address
+    assert body["message_status"]["message"]["payload"] == params["payload"]
+    assert body["message_status"]["message"]["session_id"] == session.id
+    assert body["message_status"]["message"]["session_sequence"] == 2
+
+    assert [delivery_status] = body["message_status"]["deliveries"]
+    assert delivery_status["mode"] == "webhook"
+    assert delivery_status["status"] == "retry_scheduled"
+    assert delivery_status["attempt_count"] == 0
+
+    assert %{commit_value: {session_id, webhook_delivery_id}} = prepared
+    assert session_id == session.id
+    assert is_binary(webhook_delivery_id)
+
+    persisted_session = harness.get_session!(session.id)
+    message = harness.get_message!(body["message_status"]["message"]["id"])
+
+    assert persisted_session.last_sequence == 2
+    assert message.sender_agent_id == initiator.id
+    assert message.recipient_agent_id == recipient.id
+    assert message.session_id == session.id
+    assert message.session_sequence == 2
+    assert message.content_type == "application/a2a+json"
+    assert message.carrier_status == "queued"
+    assert message.trust == "trusted"
+    assert message.payload == params["payload"]
+
+    assert [%Delivery{} = delivery] = harness.get_deliveries_for_message!(message.id)
+    assert delivery.id == webhook_delivery_id
+    assert delivery.recipient_agent_id == recipient.id
+    assert delivery.mode == "webhook"
+    assert delivery.status == "retry_scheduled"
+    assert delivery.attempt_count == 0
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 1,
+             messages: 1,
+             sessions: 0
+           }
+
+    assert {:ok, 201, ^body} = complete_prepared_session_send(prepared)
+
+    assert {:ok, 201, completed_body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               session_message_params("#{key}-completed", "complete prepared session send"),
+               "#{key}-completed-send"
+             )
+
+    assert completed_body["session"]["last_sequence"] == 3
+    assert completed_body["message_status"]["message"]["session_sequence"] == 3
+
+    :ok
+  end
+
+  @spec assert_concurrent_session_message_idempotency(
+          module(),
+          harness(),
+          Plug.Conn.t(),
+          String.t()
+        ) :: :ok
+  def assert_concurrent_session_message_idempotency(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, _recipient, session} = prepare_open_session!(adapter, harness, conn, key)
+    params = session_message_params("#{key}-message", "retry-safe under concurrency")
+    before_counts = harness.session_carrier_counts()
+
+    results =
+      1..2
+      |> Task.async_stream(
+        fn _index ->
+          send_and_complete_session_message(adapter, initiator, session.id, params, "#{key}-send")
+        end,
+        max_concurrency: 2,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    ok_results = Enum.filter(results, &match?({:ok, 201, _body}, &1))
+
+    assert ok_results != []
+
+    assert Enum.all?(results, fn result ->
+             match?({:ok, 201, _body}, result) or result == {:error, :idempotency_in_progress}
+           end)
+
+    [{:ok, 201, first_body} | _rest] = ok_results
+
+    assert {:ok, 201, replay_body} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session.id,
+               params,
+               "#{key}-send"
+             )
+
+    assert replay_body == first_body
+
+    assert session_carrier_delta(before_counts, harness.session_carrier_counts()) == %{
+             deliveries: 0,
+             messages: 1,
+             sessions: 0
+           }
+
+    assert [1, 2] =
+             session.id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
   @spec assert_session_ordering(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
   def assert_session_ordering(adapter, harness, conn, key)
       when is_atom(adapter) and is_atom(harness) and is_binary(key) do
@@ -716,6 +1374,19 @@ defmodule Atp.Support.DurableLedgerContract do
     }
   end
 
+  defp session_open_params(recipient, message_id, text) do
+    %{
+      "to" => recipient.address,
+      "payload" => Atp.ConnCase.a2a_user_text(message_id, text)
+    }
+  end
+
+  defp session_message_params(message_id, text) do
+    %{
+      "payload" => Atp.ConnCase.a2a_user_text(message_id, text)
+    }
+  end
+
   defp accept_direct_message(adapter, sender, params, key),
     do: adapter.accept_direct_message(sender, params, key, @direct_message_route)
 
@@ -732,16 +1403,90 @@ defmodule Atp.Support.DurableLedgerContract do
     end
   end
 
+  defp open_session(adapter, initiator, params, key),
+    do: adapter.open_session(initiator, params, key, @session_open_route)
+
+  defp open_and_complete_session(adapter, initiator, params, key) do
+    case open_session(adapter, initiator, params, key) do
+      {:ok, _status, _body, prepared} when is_map(prepared) ->
+        complete_prepared_session_open(prepared)
+
+      {:ok, status, body, nil} ->
+        {:ok, status, body}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp send_session_message(adapter, sender, session_id, params, key) do
+    route = "POST /api/sessions/#{session_id}/messages"
+    adapter.send_session_message(sender, session_id, params, key, route)
+  end
+
+  defp send_and_complete_session_message(adapter, sender, session_id, params, key) do
+    case send_session_message(adapter, sender, session_id, params, key) do
+      {:ok, _status, _body, prepared} when is_map(prepared) ->
+        complete_prepared_session_send(prepared)
+
+      {:ok, status, body, nil} ->
+        {:ok, status, body}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp complete_prepared_direct_message(%{} = prepared) do
     Idempotency.complete_prepared_after_commit(prepared, fn status, body, _commit_value ->
       {:ok, status, body}
     end)
   end
 
+  defp complete_prepared_session_open(%{} = prepared) do
+    Idempotency.complete_prepared_after_commit(prepared, fn status, body, _commit_value ->
+      {:ok, status, body}
+    end)
+  end
+
+  defp complete_prepared_session_send(%{} = prepared) do
+    Idempotency.complete_prepared_after_commit(prepared, fn status, body, _commit_value ->
+      {:ok, status, body}
+    end)
+  end
+
+  defp prepare_open_session!(adapter, harness, conn, key, opts \\ []) do
+    {initiator, recipient} =
+      if Keyword.get(opts, :active_webhook?, false) do
+        harness.prepare_active_webhook_session_pair!(conn, key)
+      else
+        harness.prepare_session_pair!(conn, key)
+      end
+
+    params = session_open_params(recipient, "#{key}-opening", "open session")
+
+    assert {:ok, 201, body} =
+             open_and_complete_session(adapter, initiator, params, "#{key}-open")
+
+    session =
+      body["session"]["id"]
+      |> harness.mark_session_open!()
+
+    {initiator, recipient, session}
+  end
+
   defp carrier_delta(before_counts, after_counts) do
     %{
       deliveries: after_counts.deliveries - before_counts.deliveries,
       messages: after_counts.messages - before_counts.messages
+    }
+  end
+
+  defp session_carrier_delta(before_counts, after_counts) do
+    %{
+      deliveries: after_counts.deliveries - before_counts.deliveries,
+      messages: after_counts.messages - before_counts.messages,
+      sessions: after_counts.sessions - before_counts.sessions
     }
   end
 

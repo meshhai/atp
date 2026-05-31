@@ -93,6 +93,13 @@ defmodule Atp.ArchitectureTest do
     refute File.exists?("lib/atp/transport/delivery_claims.ex")
   end
 
+  test "session intake completion does not reload Postgres session rows" do
+    session_intake_source = File.read!("lib/atp/transport/session_intake.ex")
+
+    refute session_intake_source =~ "Atp.Repo"
+    refute session_intake_source =~ "Repo.get!"
+  end
+
   defp allowed_dependency_apps do
     [
       :bandit,

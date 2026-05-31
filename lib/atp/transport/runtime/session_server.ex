@@ -3,7 +3,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
 
   use GenServer
 
-  alias Atp.Transport.{Ledger, Session}
+  alias Atp.Transport.{DurableLedger, Ledger, Session, SessionIntake}
   alias Atp.Transport.Runtime.SessionState
 
   @registry Atp.Transport.Runtime.SessionRegistry
@@ -69,7 +69,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
         %SessionState{session_id: session_id} = state
       ) do
     result =
-      Ledger.prepare_session_message_send(sender, session_id, params, idempotency_key, route)
+      DurableLedger.send_session_message(sender, session_id, params, idempotency_key, route)
 
     state = refresh_state_after_send(result, session_id, state)
     {reply, state} = maybe_enqueue_webhook_dispatch(result, from, state)
@@ -147,7 +147,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
   end
 
   defp finish_session_message_send(_server, sender, status, body, prepared, nil) do
-    Ledger.finish_prepared_session_message_send(sender, status, body, prepared)
+    SessionIntake.finish(sender, status, body, prepared)
   end
 
   defp finish_session_message_send(server, sender, status, body, prepared, dispatch_ticket) do
@@ -158,7 +158,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
              :infinity
            ) do
       try do
-        Ledger.finish_prepared_session_message_send(sender, status, body, prepared)
+        SessionIntake.finish(sender, status, body, prepared)
       after
         GenServer.cast(
           server,

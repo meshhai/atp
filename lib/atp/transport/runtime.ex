@@ -9,7 +9,7 @@ defmodule Atp.Transport.Runtime do
   require Logger
 
   alias Atp.Identity.Agent
-  alias Atp.Transport.Ledger
+  alias Atp.Transport.{DurableLedger, Ledger, SessionIntake}
   alias Atp.Transport.Runtime.SessionServer
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
@@ -20,8 +20,10 @@ defmodule Atp.Transport.Runtime do
 
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   def open_session(%Agent{} = initiator, params, idempotency_key, route) when is_map(params) do
-    initiator
-    |> Ledger.open_session(params, idempotency_key, route)
+    with {:ok, status, body, prepared} <-
+           DurableLedger.open_session(initiator, params, idempotency_key, route) do
+      SessionIntake.finish(initiator, status, body, prepared)
+    end
     |> warm_pending_opening_session()
   end
 
@@ -45,9 +47,14 @@ defmodule Atp.Transport.Runtime do
           api_result()
   def send_session_message(%Agent{} = sender, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) do
-    with :ok <- Ledger.validate_session_message_params(params),
-         :ok <- Ledger.preflight_idempotency(sender, route, idempotency_key, params),
-         :ok <- Ledger.validate_session_message_sender(sender, session_id),
+    with :ok <-
+           DurableLedger.preflight_session_message(
+             sender,
+             session_id,
+             params,
+             idempotency_key,
+             route
+           ),
          {:ok, pid} <- ensure_session_started(session_id) do
       SessionServer.send_session_message(pid, sender, params, idempotency_key, route)
     end
