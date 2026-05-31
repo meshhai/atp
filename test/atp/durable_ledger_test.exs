@@ -93,6 +93,20 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def ack_delivery(recipient, delivery_id, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :ack_delivery,
+        recipient,
+        delivery_id,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201, %{"ack" => %{"status" => Map.fetch!(params, "status")}}}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(opts) do
       notify_test_pid(opts, {:claim_due_webhook_delivery, opts})
       {:ok, nil}
@@ -465,6 +479,52 @@ defmodule Atp.DurableLedgerTest do
     }
   end
 
+  test "durable ledger delegates delivery ACK to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    recipient = %Agent{
+      id: "agt_ack_recipient",
+      account_id: "acc_ack",
+      address: "atp://agent/agt_ack_recipient",
+      status: "active"
+    }
+
+    params = %{
+      "status" => "completed",
+      "payload" => %{
+        "messageId" => "msg_ack",
+        "role" => "ROLE_AGENT",
+        "parts" => [%{"text" => "done"}]
+      },
+      test_pid: self()
+    }
+
+    assert {:ok, 201, %{"ack" => %{"status" => "completed"}}} =
+             DurableLedger.ack_delivery(
+               recipient,
+               "dlv_ack",
+               params,
+               "ack-key",
+               "POST /api/deliveries/dlv_ack/ack"
+             )
+
+    assert_received {
+      :ack_delivery,
+      ^recipient,
+      "dlv_ack",
+      %{
+        "status" => "completed",
+        "payload" => %{
+          "messageId" => "msg_ack",
+          "role" => "ROLE_AGENT",
+          "parts" => [%{"text" => "done"}]
+        }
+      },
+      "ack-key",
+      "POST /api/deliveries/dlv_ack/ack"
+    }
+  end
+
   test "durable ledger delegates delivery claim operations to configured adapter" do
     Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
 
@@ -579,6 +639,17 @@ defmodule Atp.DurableLedgerTest do
     assert session_reject_doc =~ "terminal"
     assert session_reject_doc =~ "must not perform active webhook dispatch"
     refute session_reject_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    ack_delivery_doc = callback_doc(docs, :ack_delivery, 5)
+
+    assert ack_delivery_doc =~ "recipient-owned delivery ACK"
+    assert ack_delivery_doc =~ "idempotency"
+    assert ack_delivery_doc =~ "lease"
+    assert ack_delivery_doc =~ "delivery validation"
+    assert ack_delivery_doc =~ "ACK transition rules"
+    assert ack_delivery_doc =~ "durable opening-session state transitions"
+    assert ack_delivery_doc =~ "must not perform active webhook dispatch"
+    refute ack_delivery_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
   end
 
   defp callback_doc(docs, name, arity) do

@@ -128,6 +128,11 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
+    def ack_delivery(_recipient, _delivery_id, _params, _idempotency_key, _route) do
+      {:error, :unexpected_ack}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(_opts), do: {:error, :unexpected_claim}
 
     @impl DurableLedger
