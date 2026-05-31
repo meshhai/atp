@@ -105,6 +105,17 @@ defmodule Atp.ArchitectureTest do
     refute postgres_source =~ "Ledger.reject_session"
   end
 
+  test "runtime routes session lifecycle mutations through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+
+    assert runtime_source =~ "DurableLedger.accept_session"
+    assert runtime_source =~ "DurableLedger.reject_session"
+
+    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.accept_session"))
+    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.reject_session"))
+  end
+
   test "session intake completion does not reload Postgres session rows" do
     session_intake_source = File.read!("lib/atp/transport/session_intake.ex")
 

@@ -31,7 +31,7 @@ defmodule Atp.Transport.Runtime do
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) do
     recipient
-    |> Ledger.accept_session(session_id, params, idempotency_key, route)
+    |> DurableLedger.accept_session(session_id, params, idempotency_key, route)
     |> handle_session_id_accept(session_id)
   end
 
@@ -39,7 +39,7 @@ defmodule Atp.Transport.Runtime do
   def reject_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) do
     recipient
-    |> Ledger.reject_session(session_id, params, idempotency_key, route)
+    |> DurableLedger.reject_session(session_id, params, idempotency_key, route)
     |> handle_session_id_reject(session_id)
   end
 

@@ -82,13 +82,49 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
-    def accept_session(_recipient, _session_id, _params, _idempotency_key, _route) do
-      {:error, :unexpected_accept_session}
+    def accept_session(recipient, session_id, params, idempotency_key, route) do
+      test_pid =
+        :atp
+        |> Application.fetch_env!(__MODULE__)
+        |> Keyword.fetch!(:test_pid)
+
+      send(test_pid, {
+        :durable_session_accept,
+        recipient,
+        session_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201,
+       %{
+         "ack" => %{"status" => "accepted"},
+         "session" => %{"id" => session_id, "status" => "open"}
+       }}
     end
 
     @impl DurableLedger
-    def reject_session(_recipient, _session_id, _params, _idempotency_key, _route) do
-      {:error, :unexpected_reject_session}
+    def reject_session(recipient, session_id, params, idempotency_key, route) do
+      test_pid =
+        :atp
+        |> Application.fetch_env!(__MODULE__)
+        |> Keyword.fetch!(:test_pid)
+
+      send(test_pid, {
+        :durable_session_reject,
+        recipient,
+        session_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201,
+       %{
+         "ack" => %{"status" => "rejected"},
+         "session" => %{"id" => session_id, "status" => "rejected"}
+       }}
     end
 
     @impl DurableLedger
@@ -440,6 +476,54 @@ defmodule Atp.SessionRuntimeTest do
     assert opening_message_id == opened["session"]["opening_message_id"]
   end
 
+  test "accepted session by ID warms a hydrated session process", %{conn: conn} do
+    {initiator, recipient} = register_session_agents!(conn, "runtime-session-id-accept")
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-runtime-session-id-accept",
+        recipient["address"],
+        a2a_user_text("opening-runtime-session-id-accept", "warm by session ID")
+      )
+
+    session_id = opened["session"]["id"]
+    on_exit(fn -> stop_session_server(session_id) end)
+
+    assert [{pending_pid, _metadata}] = Registry.lookup(@session_registry, session_id)
+
+    assert %SessionState{
+             session_id: ^session_id,
+             status: "pending",
+             lifecycle_timer_ref: pending_timer_ref
+           } = :sys.get_state(pending_pid)
+
+    assert is_reference(pending_timer_ref)
+
+    accepted =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("accept-runtime-session-id")
+      |> post("/api/sessions/#{session_id}/accept", %{})
+      |> json_response(201)
+
+    assert accepted["ack"]["status"] == "accepted"
+    assert accepted["session"]["status"] == "open"
+    assert [{^pending_pid, _metadata}] = Registry.lookup(@session_registry, session_id)
+    assert session_supervised?(pending_pid)
+
+    assert %SessionState{
+             session_id: ^session_id,
+             status: "open",
+             last_sequence: 1,
+             opening_message_id: opening_message_id,
+             lifecycle_deadline_at: nil,
+             lifecycle_timer_ref: nil
+           } = :sys.get_state(pending_pid)
+
+    assert opening_message_id == opened["session"]["opening_message_id"]
+  end
+
   test "accepted opening ACK expires a due opening message before opening the session", %{
     conn: conn
   } do
@@ -543,6 +627,38 @@ defmodule Atp.SessionRuntimeTest do
     assert persisted_opening.carrier_status == "expired"
     assert %DateTime{} = persisted_opening.terminal_at
     refute persisted_opening.current_ack_status
+  end
+
+  test "rejected session by ID stops the pending process", %{conn: conn} do
+    {initiator, recipient} = register_session_agents!(conn, "runtime-session-id-reject")
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-runtime-session-id-reject",
+        recipient["address"],
+        a2a_user_text("opening-runtime-session-id-reject", "reject by session ID")
+      )
+
+    session_id = opened["session"]["id"]
+    on_exit(fn -> stop_session_server(session_id) end)
+
+    assert [{pending_pid, _metadata}] = Registry.lookup(@session_registry, session_id)
+    ref = Process.monitor(pending_pid)
+
+    rejected =
+      build_conn()
+      |> authorize(recipient["agent_api_key"]["token"])
+      |> idempotency_key("reject-runtime-session-id")
+      |> post("/api/sessions/#{session_id}/reject", %{
+        "payload" => a2a_agent_text("runtime-session-id-reject", "reject by ID")
+      })
+      |> json_response(201)
+
+    assert rejected["ack"]["status"] == "rejected"
+    assert rejected["session"]["status"] == "rejected"
+    assert_receive {:DOWN, ^ref, :process, ^pending_pid, :normal}, 5_000
+    assert [] = Registry.lookup(@session_registry, session_id)
   end
 
   test "opening ACK and expiry can race without deadlocking", %{conn: conn} do
@@ -1613,6 +1729,80 @@ defmodule Atp.SessionRuntimeTest do
       ^params,
       "runtime-preflight-durable-ledger-send",
       ^route
+    }
+  end
+
+  test "runtime routes session accept and reject through the durable ledger" do
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+    Application.put_env(:atp, RecordingSessionSendLedger, test_pid: self())
+
+    recipient = %Agent{
+      id: "agt_runtime_lifecycle_recipient",
+      account_id: "acc_runtime_lifecycle",
+      address: "atp://agent/agt_runtime_lifecycle_recipient",
+      status: "active"
+    }
+
+    accept_params = %{
+      "payload" => a2a_user_text("runtime-lifecycle-accept", "accept through durable ledger")
+    }
+
+    assert capture_log(fn ->
+             assert {:ok, 201,
+                     %{
+                       "ack" => %{"status" => "accepted"},
+                       "session" => %{"id" => "ses_runtime_lifecycle_accept", "status" => "open"}
+                     }} =
+                      Runtime.accept_session(
+                        recipient,
+                        "ses_runtime_lifecycle_accept",
+                        accept_params,
+                        "runtime-lifecycle-accept",
+                        "POST /api/sessions/ses_runtime_lifecycle_accept/accept"
+                      )
+           end) =~ "Failed to warm accepted ATP session runtime"
+
+    assert_received {
+      :durable_session_accept,
+      ^recipient,
+      "ses_runtime_lifecycle_accept",
+      ^accept_params,
+      "runtime-lifecycle-accept",
+      "POST /api/sessions/ses_runtime_lifecycle_accept/accept"
+    }
+
+    reject_params = %{
+      "payload" => a2a_user_text("runtime-lifecycle-reject", "reject through durable ledger")
+    }
+
+    assert {:ok, 201,
+            %{
+              "ack" => %{"status" => "rejected"},
+              "session" => %{"id" => "ses_runtime_lifecycle_reject", "status" => "rejected"}
+            }} =
+             Runtime.reject_session(
+               recipient,
+               "ses_runtime_lifecycle_reject",
+               reject_params,
+               "runtime-lifecycle-reject",
+               "POST /api/sessions/ses_runtime_lifecycle_reject/reject"
+             )
+
+    assert_received {
+      :durable_session_reject,
+      ^recipient,
+      "ses_runtime_lifecycle_reject",
+      ^reject_params,
+      "runtime-lifecycle-reject",
+      "POST /api/sessions/ses_runtime_lifecycle_reject/reject"
     }
   end
 
