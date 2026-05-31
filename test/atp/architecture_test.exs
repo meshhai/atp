@@ -99,6 +99,12 @@ defmodule Atp.ArchitectureTest do
     refute postgres_source =~ "Ledger.accept_session"
   end
 
+  test "Postgres durable ledger adapter owns session reject mutation" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+
+    refute postgres_source =~ "Ledger.reject_session"
+  end
+
   test "session intake completion does not reload Postgres session rows" do
     session_intake_source = File.read!("lib/atp/transport/session_intake.ex")
 
