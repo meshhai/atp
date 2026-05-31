@@ -755,7 +755,7 @@ defmodule Atp.SessionRuntimeTest do
                 send(parent, {:ack_backend_pid, backend_pid})
 
                 result =
-                  Ledger.ack_delivery(
+                  DurableLedger.ack_delivery(
                     recipient_agent,
                     delivery["id"],
                     %{"status" => "accepted"},
@@ -938,7 +938,7 @@ defmodule Atp.SessionRuntimeTest do
     route = "POST /api/deliveries/#{delivery["id"]}/acks"
 
     assert {:ok, 201, accepted} =
-             Ledger.ack_delivery(
+             DurableLedger.ack_delivery(
                Repo.get!(Agent, recipient["id"]),
                delivery["id"],
                %{"status" => "accepted"},
@@ -2007,7 +2007,7 @@ defmodule Atp.SessionRuntimeTest do
     route = "POST /api/deliveries/#{delivery["id"]}/acks"
 
     assert {:ok, 201, _accepted} =
-             Ledger.ack_delivery(
+             DurableLedger.ack_delivery(
                Repo.get!(Agent, recipient["id"]),
                delivery["id"],
                %{"status" => "accepted"},

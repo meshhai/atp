@@ -35,6 +35,8 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   @ack_statuses ~w(accepted completed failed rejected)
   @terminal_ack_statuses ~w(completed failed rejected)
 
+  @typep ack_flow :: :delivery | :session_lifecycle
+
   @impl DurableLedger
   @spec accept_direct_message(Agent.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.direct_message_intake_result()
@@ -210,32 +212,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp persist_delivery_ack(%Agent{} = agent, delivery_id, ack_status, payload) do
-    now = DateTime.utc_now(:microsecond)
-
-    case fetch_locked_delivery(agent, delivery_id) do
-      nil ->
-        {:error, :not_found}
-
-      %Delivery{} = delivery ->
-        persist_delivery_ack(agent, delivery, ack_status, payload, now)
-    end
-  end
-
-  defp persist_delivery_ack(%Agent{} = agent, %Delivery{} = delivery, ack_status, payload, now) do
-    with :ok <- validate_delivery_ack_lease(delivery, now),
-         :ok <- validate_delivery_ack_transition(delivery.message.current_ack_status, ack_status),
-         {:ok, opening_session} <- lock_opening_session(delivery.message),
-         :ok <- expire_due_opening_session(opening_session, delivery.message, now),
-         :ok <- validate_opening_session_delivery_ack(opening_session, ack_status),
-         {:ok, delivery} <- mark_acked_delivery_delivered(delivery, now),
-         {:ok, ack} <- insert_ack(delivery, ack_status, payload),
-         {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
-         {:ok, _session} <- cache_opening_session_delivery_ack(opening_session, ack_status, now) do
-      {:ok, 201, Response.ack(agent, ack, message)}
-    else
-      {:commit_error, reason} -> {:commit_error, reason}
-      {:error, reason} -> {:error, reason}
-    end
+    append_ack(agent, delivery_id, ack_status, payload, :delivery)
   end
 
   defp prepared_session_intake_response(body, %Session{}, nil), do: {:ok, 201, body}
@@ -626,6 +603,13 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp append_session_lifecycle_ack(%Agent{} = agent, delivery_id, ack_status, payload)
        when ack_status in ~w(accepted rejected) do
+    append_ack(agent, delivery_id, ack_status, payload, :session_lifecycle)
+  end
+
+  @spec append_ack(Agent.t(), String.t(), String.t(), map() | nil, ack_flow()) ::
+          DurableLedger.ack_result()
+  defp append_ack(%Agent{} = agent, delivery_id, ack_status, payload, ack_flow)
+       when is_binary(delivery_id) and ack_flow in [:delivery, :session_lifecycle] do
     now = DateTime.utc_now(:microsecond)
 
     case fetch_locked_delivery(agent, delivery_id) do
@@ -633,36 +617,54 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         {:error, :not_found}
 
       %Delivery{} = delivery ->
-        persist_session_lifecycle_ack(agent, delivery, ack_status, payload, now)
+        persist_ack(agent, delivery, ack_status, payload, now, ack_flow)
     end
   end
 
-  defp persist_session_lifecycle_ack(
+  @spec persist_ack(Agent.t(), Delivery.t(), String.t(), map() | nil, DateTime.t(), ack_flow()) ::
+          DurableLedger.ack_result()
+  defp persist_ack(
          %Agent{} = agent,
          %Delivery{} = delivery,
          ack_status,
          payload,
-         now
+         now,
+         ack_flow
        ) do
-    with :ok <- validate_lifecycle_ack_lease(delivery, now),
-         :ok <- validate_session_lifecycle_transition(delivery.message.current_ack_status),
+    with :ok <- validate_ack_lease(ack_flow, delivery, now),
+         :ok <-
+           validate_ack_transition(ack_flow, delivery.message.current_ack_status, ack_status),
          {:ok, opening_session} <- lock_opening_session(delivery.message),
          :ok <- expire_due_opening_session(opening_session, delivery.message, now),
-         :ok <- validate_opening_session_lifecycle(opening_session),
+         :ok <- validate_opening_session_ack(ack_flow, opening_session, ack_status),
          {:ok, delivery} <- mark_acked_delivery_delivered(delivery, now),
          {:ok, ack} <- insert_ack(delivery, ack_status, payload),
          {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
-         {:ok, session} <- cache_opening_session_lifecycle(opening_session, ack_status, now) do
-      body =
-        agent
-        |> Response.ack(ack, message)
-        |> Map.put("session", Response.session(session))
-
-      {:ok, 201, body}
+         {:ok, session} <- cache_opening_session_ack(ack_flow, opening_session, ack_status, now) do
+      ack_response(ack_flow, agent, ack, message, session)
     else
       {:commit_error, reason} -> {:commit_error, reason}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp ack_response(:delivery, %Agent{} = agent, %Ack{} = ack, %Message{} = message, _session) do
+    {:ok, 201, Response.ack(agent, ack, message)}
+  end
+
+  defp ack_response(
+         :session_lifecycle,
+         %Agent{} = agent,
+         %Ack{} = ack,
+         %Message{} = message,
+         %Session{} = session
+       ) do
+    body =
+      agent
+      |> Response.ack(ack, message)
+      |> Map.put("session", Response.session(session))
+
+    {:ok, 201, body}
   end
 
   defp fetch_locked_delivery(%Agent{} = agent, delivery_id) do
@@ -675,39 +677,23 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> Repo.one()
   end
 
-  defp validate_lifecycle_ack_lease(%Delivery{mode: "webhook", status: "delivered"}, _now),
-    do: :ok
-
-  defp validate_lifecycle_ack_lease(%Delivery{mode: "webhook"}, _now) do
-    {:error, :delivery_not_delivered}
-  end
-
-  defp validate_lifecycle_ack_lease(
-         %Delivery{mode: "polling", leased_until: %DateTime{} = leased_until},
-         now
-       ) do
-    if DateTime.compare(leased_until, now) == :gt do
-      :ok
-    else
-      {:error, :lease_expired}
-    end
-  end
-
-  defp validate_delivery_ack_lease(
+  defp validate_ack_lease(
+         :delivery,
          %Delivery{message: %Message{current_ack_status: "accepted"}},
          _now
        ) do
     :ok
   end
 
-  defp validate_delivery_ack_lease(%Delivery{mode: "webhook", status: "delivered"}, _now),
+  defp validate_ack_lease(_ack_flow, %Delivery{mode: "webhook", status: "delivered"}, _now),
     do: :ok
 
-  defp validate_delivery_ack_lease(%Delivery{mode: "webhook"}, _now) do
+  defp validate_ack_lease(_ack_flow, %Delivery{mode: "webhook"}, _now) do
     {:error, :delivery_not_delivered}
   end
 
-  defp validate_delivery_ack_lease(
+  defp validate_ack_lease(
+         _ack_flow,
          %Delivery{mode: "polling", leased_until: %DateTime{} = leased_until},
          now
        ) do
@@ -718,28 +704,23 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end
   end
 
-  defp validate_session_lifecycle_transition(nil), do: :ok
+  defp validate_ack_transition(_ack_flow, nil, _next_status), do: :ok
 
-  defp validate_session_lifecycle_transition(current_status)
+  defp validate_ack_transition(_ack_flow, current_status, _next_status)
        when current_status in @terminal_ack_statuses do
     {:error, :terminal_ack_status}
   end
 
-  defp validate_session_lifecycle_transition("accepted"), do: {:error, :invalid_ack_transition}
-
-  defp validate_delivery_ack_transition(nil, _next_status), do: :ok
-
-  defp validate_delivery_ack_transition(current_status, _next_status)
-       when current_status in @terminal_ack_statuses do
-    {:error, :terminal_ack_status}
+  defp validate_ack_transition(:session_lifecycle, "accepted", _next_status) do
+    {:error, :invalid_ack_transition}
   end
 
-  defp validate_delivery_ack_transition("accepted", next_status)
+  defp validate_ack_transition(:delivery, "accepted", next_status)
        when next_status in ~w(completed failed) do
     :ok
   end
 
-  defp validate_delivery_ack_transition("accepted", _next_status),
+  defp validate_ack_transition(:delivery, "accepted", _next_status),
     do: {:error, :invalid_ack_transition}
 
   defp lock_opening_session(%Message{session_id: nil}), do: {:ok, nil}
@@ -793,19 +774,24 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> Repo.update()
   end
 
-  defp validate_opening_session_lifecycle(%Session{status: "pending"}), do: :ok
-  defp validate_opening_session_lifecycle(%Session{}), do: {:error, :invalid_ack_transition}
-  defp validate_opening_session_lifecycle(nil), do: {:error, :invalid_ack_transition}
+  defp validate_opening_session_ack(:session_lifecycle, %Session{status: "pending"}, _ack_status),
+    do: :ok
 
-  defp validate_opening_session_delivery_ack(nil, _ack_status), do: :ok
+  defp validate_opening_session_ack(:session_lifecycle, %Session{}, _ack_status),
+    do: {:error, :invalid_ack_transition}
 
-  defp validate_opening_session_delivery_ack(%Session{status: "pending"}, "completed") do
+  defp validate_opening_session_ack(:session_lifecycle, nil, _ack_status),
+    do: {:error, :invalid_ack_transition}
+
+  defp validate_opening_session_ack(:delivery, nil, _ack_status), do: :ok
+
+  defp validate_opening_session_ack(:delivery, %Session{status: "pending"}, "completed") do
     {:error, :invalid_ack_transition}
   end
 
-  defp validate_opening_session_delivery_ack(%Session{status: "pending"}, _ack_status), do: :ok
+  defp validate_opening_session_ack(:delivery, %Session{status: "pending"}, _ack_status), do: :ok
 
-  defp validate_opening_session_delivery_ack(%Session{}, _ack_status) do
+  defp validate_opening_session_ack(:delivery, %Session{}, _ack_status) do
     {:error, :invalid_ack_transition}
   end
 
@@ -849,25 +835,20 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp terminal_ack_timestamp(status, now) when status in @terminal_ack_statuses, do: now
   defp terminal_ack_timestamp(_status, _now), do: nil
 
-  defp cache_opening_session_lifecycle(%Session{status: "pending"} = session, "accepted", now) do
+  defp cache_opening_session_ack(:delivery, nil, _ack_status, _now), do: {:ok, nil}
+
+  defp cache_opening_session_ack(
+         _ack_flow,
+         %Session{status: "pending"} = session,
+         "accepted",
+         now
+       ) do
     session
     |> Session.changeset(%{status: "open", opened_at: now})
     |> Repo.update()
   end
 
-  defp cache_opening_session_lifecycle(%Session{status: "pending"} = session, "rejected", now) do
-    terminalize_pending_opening_session(session, "rejected", now)
-  end
-
-  defp cache_opening_session_delivery_ack(nil, _ack_status, _now), do: {:ok, nil}
-
-  defp cache_opening_session_delivery_ack(%Session{status: "pending"} = session, "accepted", now) do
-    session
-    |> Session.changeset(%{status: "open", opened_at: now})
-    |> Repo.update()
-  end
-
-  defp cache_opening_session_delivery_ack(%Session{status: "pending"} = session, status, now)
+  defp cache_opening_session_ack(_ack_flow, %Session{status: "pending"} = session, status, now)
        when status in ~w(rejected failed) do
     terminalize_pending_opening_session(session, status, now)
   end

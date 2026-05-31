@@ -109,8 +109,9 @@ defmodule Atp.ArchitectureTest do
 
   test "Postgres durable ledger adapter owns delivery ACK mutation" do
     postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+    legacy_ack_call = Enum.join(["Ledger", "ack_delivery"], ".")
 
-    refute postgres_source =~ "Ledger.ack_delivery"
+    refute postgres_source =~ legacy_ack_call
   end
 
   test "runtime routes session lifecycle mutations through durable ledger" do
@@ -127,9 +128,10 @@ defmodule Atp.ArchitectureTest do
   test "runtime routes delivery ACK mutation through durable ledger" do
     runtime_source = File.read!("lib/atp/transport/runtime.ex")
     runtime_lines = String.split(runtime_source, "\n")
+    legacy_ack_pipe = "|> " <> Enum.join(["Ledger", "ack_delivery"], ".")
 
     assert runtime_source =~ "DurableLedger.ack_delivery"
-    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.ack_delivery"))
+    refute Enum.any?(runtime_lines, &String.contains?(&1, legacy_ack_pipe))
   end
 
   test "legacy ledger does not expose session lifecycle entry points" do
@@ -137,6 +139,22 @@ defmodule Atp.ArchitectureTest do
 
     refute {:accept_session, 5} in ledger_functions
     refute {:reject_session, 5} in ledger_functions
+  end
+
+  test "legacy ledger does not expose delivery ACK entry point" do
+    refute {:ack_delivery, 5} in TransportLedger.__info__(:functions)
+  end
+
+  test "Postgres durable ledger keeps ACK mutation in one state-machine flow" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+
+    assert postgres_source =~ "defp append_ack("
+    assert postgres_source =~ "defp persist_ack("
+    refute postgres_source =~ "defp persist_session_lifecycle_ack"
+    refute postgres_source =~ "defp validate_lifecycle_ack_lease"
+    refute postgres_source =~ "defp validate_delivery_ack_lease"
+    refute postgres_source =~ "defp cache_opening_session_lifecycle"
+    refute postgres_source =~ "defp cache_opening_session_delivery_ack"
   end
 
   test "session intake completion does not reload Postgres session rows" do
