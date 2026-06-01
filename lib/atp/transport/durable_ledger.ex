@@ -27,6 +27,7 @@ defmodule Atp.Transport.DurableLedger do
   @type session_message_preflight_result :: :ok | {:ok, pos_integer(), map()} | {:error, term()}
   @type session_lifecycle_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type ack_result :: {:ok, pos_integer(), map()} | {:error, term()}
+  @type polling_lease_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -143,6 +144,29 @@ defmodule Atp.Transport.DurableLedger do
               ack_result()
 
   @doc """
+  Claims the next recipient-owned inbox polling delivery.
+
+  Implementations must validate requested lease duration, apply idempotency for
+  the recipient, route, key, and body, return stable replay results, and expose
+  at most one eligible delivery. Implementations must keep active leases hidden
+  until expiry, allow expired leases to become eligible again, keep ACKed
+  messages invisible, and preserve session order eligibility.
+  """
+  @callback claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
+              polling_lease_result()
+
+  @doc """
+  Extends a recipient-owned polling lease for one delivery.
+
+  Implementations must validate requested lease duration, apply idempotency for
+  the recipient, route, key, and body, return stable replay results, and enforce
+  recipient ownership, polling mode, leased state, and non-expired lease
+  requirements before extending the lease.
+  """
+  @callback extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              polling_lease_result()
+
+  @doc """
   Claims the next due webhook delivery eligible for carrier work.
 
   Implementations must return one current lease at most, respect active leases,
@@ -234,6 +258,20 @@ defmodule Atp.Transport.DurableLedger do
   def ack_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
       when is_binary(delivery_id) and is_map(params) and is_binary(route) do
     adapter().ack_delivery(recipient, delivery_id, params, idempotency_key, route)
+  end
+
+  @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
+          polling_lease_result()
+  def claim_inbox(%Agent{} = recipient, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    adapter().claim_inbox(recipient, params, idempotency_key, route)
+  end
+
+  @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          polling_lease_result()
+  def extend_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
+      when is_binary(delivery_id) and is_map(params) and is_binary(route) do
+    adapter().extend_delivery(recipient, delivery_id, params, idempotency_key, route)
   end
 
   @spec claim_due_webhook_delivery(keyword()) :: due_claim_result()

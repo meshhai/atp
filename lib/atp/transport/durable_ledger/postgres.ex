@@ -16,6 +16,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     Delivery,
     DeliveryClaim,
     DurableLedger,
+    Ledger,
     Message,
     Payload,
     Response,
@@ -141,6 +142,22 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         append_ack(recipient, delivery_id, ack_status, payload, :delivery)
       end
     end)
+  end
+
+  @impl DurableLedger
+  @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.polling_lease_result()
+  def claim_inbox(%Agent{} = recipient, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    Ledger.claim_inbox(recipient, params, idempotency_key, route)
+  end
+
+  @impl DurableLedger
+  @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.polling_lease_result()
+  def extend_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
+      when is_binary(delivery_id) and is_map(params) and is_binary(route) do
+    Ledger.extend_delivery(recipient, delivery_id, params, idempotency_key, route)
   end
 
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
