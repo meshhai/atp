@@ -163,6 +163,13 @@ defmodule Atp.ArchitectureTest do
     refute {:ack_delivery, 5} in TransportLedger.__info__(:functions)
   end
 
+  test "legacy ledger does not expose polling lease entry points" do
+    ledger_functions = TransportLedger.__info__(:functions)
+
+    refute {:claim_inbox, 4} in ledger_functions
+    refute {:extend_delivery, 5} in ledger_functions
+  end
+
   test "Postgres durable ledger keeps ACK mutation in one state-machine flow" do
     postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
 
