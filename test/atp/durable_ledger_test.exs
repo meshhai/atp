@@ -594,7 +594,7 @@ defmodule Atp.DurableLedgerTest do
     assert direct_intake_doc =~ "idempotency"
     assert direct_intake_doc =~ "sender policy"
     assert direct_intake_doc =~ "delivery work"
-    assert direct_intake_doc =~ "must not perform active webhook dispatch"
+    assert_no_active_webhook_dispatch(direct_intake_doc)
     refute direct_intake_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     session_open_doc = callback_doc(docs, :open_session, 4)
@@ -603,7 +603,7 @@ defmodule Atp.DurableLedgerTest do
     assert session_open_doc =~ "opening message"
     assert session_open_doc =~ "idempotency"
     assert session_open_doc =~ "delivery work"
-    assert session_open_doc =~ "must not perform active webhook dispatch"
+    assert_no_active_webhook_dispatch(session_open_doc)
     refute session_open_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     session_send_doc = callback_doc(docs, :send_session_message, 5)
@@ -612,7 +612,7 @@ defmodule Atp.DurableLedgerTest do
     assert session_send_doc =~ "idempotency"
     assert session_send_doc =~ "sequence"
     assert session_send_doc =~ "delivery work"
-    assert session_send_doc =~ "must not perform active webhook dispatch"
+    assert_no_active_webhook_dispatch(session_send_doc)
     refute session_send_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     session_preflight_doc = callback_doc(docs, :preflight_session_message, 5)
@@ -628,7 +628,7 @@ defmodule Atp.DurableLedgerTest do
     assert session_accept_doc =~ "idempotency"
     assert session_accept_doc =~ "ACK"
     assert session_accept_doc =~ "open"
-    assert session_accept_doc =~ "must not perform active webhook dispatch"
+    assert_no_active_webhook_dispatch(session_accept_doc)
     refute session_accept_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     session_reject_doc = callback_doc(docs, :reject_session, 5)
@@ -637,7 +637,7 @@ defmodule Atp.DurableLedgerTest do
     assert session_reject_doc =~ "idempotency"
     assert session_reject_doc =~ "ACK"
     assert session_reject_doc =~ "terminal"
-    assert session_reject_doc =~ "must not perform active webhook dispatch"
+    assert_no_active_webhook_dispatch(session_reject_doc)
     refute session_reject_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     ack_delivery_doc = callback_doc(docs, :ack_delivery, 5)
@@ -648,7 +648,7 @@ defmodule Atp.DurableLedgerTest do
     assert ack_delivery_doc =~ "delivery validation"
     assert ack_delivery_doc =~ "ACK transition rules"
     assert ack_delivery_doc =~ "durable opening-session state transitions"
-    assert ack_delivery_doc =~ "must not perform active webhook dispatch"
+    assert_no_active_webhook_dispatch(ack_delivery_doc)
     refute ack_delivery_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
   end
 
@@ -657,5 +657,10 @@ defmodule Atp.DurableLedgerTest do
       {{:callback, ^name, ^arity}, _line, _signatures, %{"en" => doc}, _metadata} -> doc
       _doc -> nil
     end)
+  end
+
+  defp assert_no_active_webhook_dispatch(doc) do
+    assert doc =~ "must not perform active"
+    assert doc =~ "webhook dispatch"
   end
 end

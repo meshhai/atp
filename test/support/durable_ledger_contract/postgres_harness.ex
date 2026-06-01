@@ -27,10 +27,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   @spec prepare_direct_message_pair!(Plug.Conn.t(), String.t()) :: {Agent.t(), Agent.t()}
   def prepare_direct_message_pair!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     {get_agent!(sender["id"]), get_agent!(recipient["id"])}
   end
@@ -41,10 +38,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec prepare_active_webhook_direct_message_pair!(Plug.Conn.t(), String.t()) ::
           {Agent.t(), Agent.t()}
   def prepare_active_webhook_direct_message_pair!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     Atp.ConnCase.configure_webhook!(
       recipient,
@@ -104,10 +98,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec prepare_due_webhook_delivery_context!(Plug.Conn.t(), String.t()) ::
           {Delivery.t(), Message.t(), Agent.t(), map()}
   def prepare_due_webhook_delivery_context!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     Atp.ConnCase.configure_webhook!(
       recipient,
@@ -136,10 +127,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec prepare_polling_delivery!(Plug.Conn.t(), String.t()) ::
           {Delivery.t(), Message.t(), Agent.t(), Agent.t()}
   def prepare_polling_delivery!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     sent =
       Atp.ConnCase.send_message!(
@@ -165,10 +153,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec prepare_opening_polling_delivery!(Plug.Conn.t(), String.t()) ::
           {Session.t(), Message.t(), Delivery.t(), Agent.t(), Agent.t()}
   def prepare_opening_polling_delivery!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    initiator = Atp.ConnCase.register_agent!(account_token, "register-#{key}-initiator", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {initiator, recipient} = register_agent_pair!(conn, key, "initiator", "recipient")
 
     opened =
       Atp.ConnCase.open_session!(
@@ -367,6 +352,19 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   def webhook_attempt_count, do: Repo.aggregate(WebhookAttempt, :count, :id)
 
   defp get_agent!(agent_id), do: Repo.get!(Agent, agent_id)
+
+  defp register_agent_pair!(conn, key, sender_label \\ "sender", recipient_label \\ "recipient") do
+    account = Atp.ConnCase.create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+
+    sender =
+      Atp.ConnCase.register_agent!(account_token, "register-#{key}-#{sender_label}", %{})
+
+    recipient =
+      Atp.ConnCase.register_agent!(account_token, "register-#{key}-#{recipient_label}", %{})
+
+    {sender, recipient}
+  end
 
   defp promote_to_basic!(account) do
     Atp.Identity.Account

@@ -138,7 +138,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       with {:ok, ack_status} <- fetch_ack_status(params),
            {:ok, payload} <- fetch_optional_payload(params),
            :ok <- Payload.validate_optional_a2a(payload) do
-        persist_delivery_ack(recipient, delivery_id, ack_status, payload)
+        append_ack(recipient, delivery_id, ack_status, payload, :delivery)
       end
     end)
   end
@@ -209,10 +209,6 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     with {:ok, delivery_id} <- ensure_session_lifecycle_delivery(recipient, session_id) do
       append_session_lifecycle_ack(recipient, delivery_id, "rejected", payload)
     end
-  end
-
-  defp persist_delivery_ack(%Agent{} = agent, delivery_id, ack_status, payload) do
-    append_ack(agent, delivery_id, ack_status, payload, :delivery)
   end
 
   defp prepared_session_intake_response(body, %Session{}, nil), do: {:ok, 201, body}
