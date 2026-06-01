@@ -114,6 +114,15 @@ defmodule Atp.ArchitectureTest do
     refute postgres_source =~ legacy_ack_call
   end
 
+  test "Postgres durable ledger adapter owns polling lease mutations" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+    legacy_claim_call = Enum.join(["Ledger", "claim_inbox"], ".")
+    legacy_extend_call = Enum.join(["Ledger", "extend_delivery"], ".")
+
+    refute postgres_source =~ legacy_claim_call
+    refute postgres_source =~ legacy_extend_call
+  end
+
   test "runtime routes session lifecycle mutations through durable ledger" do
     runtime_source = File.read!("lib/atp/transport/runtime.ex")
     runtime_lines = String.split(runtime_source, "\n")
