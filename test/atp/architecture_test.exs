@@ -143,6 +143,15 @@ defmodule Atp.ArchitectureTest do
     refute Enum.any?(runtime_lines, &String.contains?(&1, legacy_ack_pipe))
   end
 
+  test "transport facade routes polling lease mutations through durable ledger" do
+    transport_source = File.read!("lib/atp/transport.ex")
+
+    assert transport_source =~ polling_delegate_pattern(:claim_inbox, :DurableLedger)
+    assert transport_source =~ polling_delegate_pattern(:extend_delivery, :DurableLedger)
+    refute transport_source =~ polling_delegate_pattern(:claim_inbox, :Ledger)
+    refute transport_source =~ polling_delegate_pattern(:extend_delivery, :Ledger)
+  end
+
   test "legacy ledger does not expose session lifecycle entry points" do
     ledger_functions = TransportLedger.__info__(:functions)
 
@@ -193,5 +202,13 @@ defmodule Atp.ArchitectureTest do
 
   defp product_domain_pattern do
     ~r/\b(SourceMonitor|RLM|MarketEvents|Billing|Corpus|Missions)\b/
+  end
+
+  defp polling_delegate_pattern(:claim_inbox, module) do
+    ~r/defdelegate\s+claim_inbox\(agent,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
+  end
+
+  defp polling_delegate_pattern(:extend_delivery, module) do
+    ~r/defdelegate\s+extend_delivery\(agent,\s*delivery_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
   end
 end

@@ -319,6 +319,55 @@ defmodule Atp.DurableLedgerTest do
     }
   end
 
+  test "transport facade delegates polling leases to the durable ledger" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    recipient = %Agent{
+      id: "agt_transport_polling_recipient",
+      account_id: "acc_transport_polling",
+      address: "atp://agent/agt_transport_polling_recipient",
+      status: "active"
+    }
+
+    claim_params = %{"lease_seconds" => 30, test_pid: self()}
+
+    assert {:ok, 200, %{"delivery" => nil}} =
+             Transport.claim_inbox(
+               recipient,
+               claim_params,
+               "transport-polling-claim-key",
+               "POST /api/inbox/claims"
+             )
+
+    assert_received {
+      :claim_inbox,
+      ^recipient,
+      %{"lease_seconds" => 30},
+      "transport-polling-claim-key",
+      "POST /api/inbox/claims"
+    }
+
+    extend_params = %{"lease_seconds" => 45, test_pid: self()}
+
+    assert {:ok, 200, %{"delivery" => %{"id" => "dlv_transport_polling"}}} =
+             Transport.extend_delivery(
+               recipient,
+               "dlv_transport_polling",
+               extend_params,
+               "transport-polling-extend-key",
+               "POST /api/deliveries/dlv_transport_polling/lease"
+             )
+
+    assert_received {
+      :extend_delivery,
+      ^recipient,
+      "dlv_transport_polling",
+      %{"lease_seconds" => 45},
+      "transport-polling-extend-key",
+      "POST /api/deliveries/dlv_transport_polling/lease"
+    }
+  end
+
   test "durable ledger delegates session intake to configured adapter" do
     Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
 
