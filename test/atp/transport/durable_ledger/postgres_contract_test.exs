@@ -3,6 +3,13 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     adapter: Atp.Transport.DurableLedger.Postgres,
     harness: Atp.Support.DurableLedgerContract.PostgresHarness
 
+  import Ecto.Query
+
+  alias Atp.Identity.{Account, Agent}
+  alias Atp.Repo
+  alias Atp.Transport.Message
+  alias Ecto.Adapters.SQL.Sandbox
+
   @claim_route "POST /api/inbox/claims"
 
   test "postgres adapter claims polling inbox messages and reclaims expired leases", %{
@@ -227,6 +234,81 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
   end
 
+  test "postgres adapter does not skip locked earlier polling session messages", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-session-locked-order"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling locked order"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+        initiator_response = Atp.ConnCase.register_agent!(account_token, "register-#{key}-i", %{})
+        recipient_response = Atp.ConnCase.register_agent!(account_token, "register-#{key}-r", %{})
+        initiator = Repo.get!(Agent, initiator_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+
+        opened = open_session!(initiator, recipient, key)
+        session_id = opened["session"]["id"]
+
+        assert {:ok, 201, opening_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-opening",
+                   @claim_route
+                 )
+
+        assert {:ok, 201, _ack} =
+                 @ledger_adapter.ack_delivery(
+                   recipient,
+                   opening_claim["id"],
+                   %{"status" => "accepted"},
+                   "ack-#{key}-opening",
+                   "POST /api/deliveries/#{opening_claim["id"]}/acks"
+                 )
+
+        first = send_session_message!(initiator, session_id, "#{key}-first")
+        second = send_session_message!(initiator, session_id, "#{key}-second")
+        first_message_id = first["message_status"]["message"]["id"]
+
+        lock_task = lock_message_until_release(first_message_id, self())
+        assert_receive {:message_locked, ^first_message_id}, 5_000
+
+        assert {:ok, 200, %{"delivery" => nil}} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-while-first-locked",
+                   @claim_route
+                 )
+
+        send(lock_task.pid, :release_message_lock)
+        assert :ok = Task.await(lock_task, 5_000)
+
+        assert {:ok, 201, first_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-first",
+                   @claim_route
+                 )
+
+        assert first_claim["message"]["id"] == first_message_id
+
+        assert {:ok, 201, second_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-second",
+                   @claim_route
+                 )
+
+        assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   defp accept_direct_message!(sender, recipient, key) do
     assert {:ok, 201, body, _prepared} =
              @ledger_adapter.accept_direct_message(
@@ -268,6 +350,43 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
              )
 
     body
+  end
+
+  defp lock_message_until_release(message_id, parent) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn -> hold_message_lock!(message_id, parent) end)
+      :ok
+    end)
+  end
+
+  defp hold_message_lock!(message_id, parent) do
+    {:ok, :release_message_lock} =
+      Repo.transaction(fn ->
+        lock_message!(message_id)
+        send(parent, {:message_locked, message_id})
+        assert_receive :release_message_lock, 5_000
+      end)
+  end
+
+  defp lock_message!(message_id) do
+    Message
+    |> where([message], message.id == ^message_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one!()
+  end
+
+  defp unboxed_repo(fun), do: Sandbox.unboxed_run(Repo, fun)
+
+  defp checked_out_unboxed_repo(fun) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.checkout(fun)
+    end)
+  end
+
+  defp delete_account!(account_id) do
+    Account
+    |> Repo.get!(account_id)
+    |> Repo.delete!()
   end
 
   defp later_timestamp?(later, earlier) do

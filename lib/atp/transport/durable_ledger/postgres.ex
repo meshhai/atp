@@ -266,14 +266,32 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       )
 
     from(message in Message,
+      as: :message,
       where: message.recipient_agent_id == ^recipient.id,
       where: message.carrier_status in ["queued", "delivered"],
       where: is_nil(message.current_ack_status),
       where: message.expires_at > ^now,
       where: message.id not in subquery(active_delivery_message_ids),
+      where: ^polling_session_order_filter(),
       order_by: [asc: message.inserted_at],
       limit: 1,
       lock: "FOR UPDATE SKIP LOCKED"
+    )
+  end
+
+  defp polling_session_order_filter do
+    dynamic(
+      [message: message],
+      is_nil(message.session_id) or is_nil(message.session_sequence) or
+        not exists(
+          from(prior_message in Message,
+            where: prior_message.session_id == parent_as(:message).session_id,
+            where: prior_message.session_sequence < parent_as(:message).session_sequence,
+            where: prior_message.carrier_status == "queued",
+            where: is_nil(prior_message.current_ack_status),
+            select: 1
+          )
+        )
     )
   end
 
