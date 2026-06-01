@@ -78,7 +78,7 @@ defmodule Atp.Transport.Runtime do
     opening_session_id = opening_session_id_for_ack(agent, delivery_id, params)
 
     agent
-    |> Ledger.ack_delivery(delivery_id, params, idempotency_key, route)
+    |> DurableLedger.ack_delivery(delivery_id, params, idempotency_key, route)
     |> handle_opening_session_ack(params, opening_session_id)
   end
 

@@ -26,6 +26,7 @@ defmodule Atp.Transport.DurableLedger do
           {:ok, pos_integer(), map(), session_intake_after_commit()} | {:error, term()}
   @type session_message_preflight_result :: :ok | {:ok, pos_integer(), map()} | {:error, term()}
   @type session_lifecycle_result :: {:ok, pos_integer(), map()} | {:error, term()}
+  @type ack_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -104,8 +105,8 @@ defmodule Atp.Transport.DurableLedger do
   optional A2A ACK payload, record an accepted ACK for the opening delivery,
   and transition the session from pending to open atomically.
 
-  Implementations must return stable retry results and must not perform active webhook dispatch
-  themselves. Runtime process startup belongs to the caller.
+  Implementations must return stable retry results and must not perform active
+  webhook dispatch themselves. Runtime process startup belongs to the caller.
   """
   @callback accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
               session_lifecycle_result()
@@ -118,11 +119,28 @@ defmodule Atp.Transport.DurableLedger do
   optional A2A ACK payload, record a rejected ACK for the opening delivery,
   and transition the pending session to a terminal rejected state atomically.
 
-  Implementations must return stable retry results and must not perform active webhook dispatch
-  themselves. Runtime process shutdown belongs to the caller.
+  Implementations must return stable retry results and must not perform active
+  webhook dispatch themselves. Runtime process shutdown belongs to the caller.
   """
   @callback reject_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
               session_lifecycle_result()
+
+  @doc """
+  Records a recipient-owned delivery ACK in the durable carrier ledger.
+
+  Implementations must allow only the delivery recipient to ACK, apply
+  idempotency for the recipient, route, key, and body, validate delivery
+  ownership, lease state, delivery validation requirements, and any optional
+  A2A ACK payload, enforce ACK transition rules for accepted, completed,
+  failed, and rejected outcomes, persist the ACK, update cached message status,
+  and apply durable opening-session state transitions atomically.
+
+  Implementations must return stable retry results and must not perform active
+  webhook dispatch themselves. Runtime process startup or shutdown belongs to
+  the caller.
+  """
+  @callback ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              ack_result()
 
   @doc """
   Claims the next due webhook delivery eligible for carrier work.
@@ -209,6 +227,13 @@ defmodule Atp.Transport.DurableLedger do
   def reject_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
       when is_binary(session_id) and is_map(params) and is_binary(route) do
     adapter().reject_session(recipient, session_id, params, idempotency_key, route)
+  end
+
+  @spec ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          ack_result()
+  def ack_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
+      when is_binary(delivery_id) and is_map(params) and is_binary(route) do
+    adapter().ack_delivery(recipient, delivery_id, params, idempotency_key, route)
   end
 
   @spec claim_due_webhook_delivery(keyword()) :: due_claim_result()

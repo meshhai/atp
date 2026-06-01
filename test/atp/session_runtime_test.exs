@@ -128,6 +128,29 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
+    def ack_delivery(recipient, delivery_id, params, idempotency_key, route) do
+      test_pid =
+        :atp
+        |> Application.fetch_env!(__MODULE__)
+        |> Keyword.fetch!(:test_pid)
+
+      send(test_pid, {
+        :durable_delivery_ack,
+        recipient,
+        delivery_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      {:ok, 201,
+       %{
+         "ack" => %{"status" => params["status"]},
+         "message_status" => %{"ack_status" => params["status"]}
+       }}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(_opts), do: {:error, :unexpected_claim}
 
     @impl DurableLedger
@@ -732,7 +755,7 @@ defmodule Atp.SessionRuntimeTest do
                 send(parent, {:ack_backend_pid, backend_pid})
 
                 result =
-                  Ledger.ack_delivery(
+                  DurableLedger.ack_delivery(
                     recipient_agent,
                     delivery["id"],
                     %{"status" => "accepted"},
@@ -915,7 +938,7 @@ defmodule Atp.SessionRuntimeTest do
     route = "POST /api/deliveries/#{delivery["id"]}/acks"
 
     assert {:ok, 201, accepted} =
-             Ledger.ack_delivery(
+             DurableLedger.ack_delivery(
                Repo.get!(Agent, recipient["id"]),
                delivery["id"],
                %{"status" => "accepted"},
@@ -1806,6 +1829,51 @@ defmodule Atp.SessionRuntimeTest do
     }
   end
 
+  test "runtime routes delivery ACK through the durable ledger" do
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+    Application.put_env(:atp, RecordingSessionSendLedger, test_pid: self())
+
+    recipient = %Agent{
+      id: "agt_runtime_ack_recipient",
+      account_id: "acc_runtime_ack",
+      address: "atp://agent/agt_runtime_ack_recipient",
+      status: "active"
+    }
+
+    params = %{"status" => "completed"}
+    route = "POST /api/deliveries/dlv_runtime_ack/acks"
+
+    assert {:ok, 201,
+            %{
+              "ack" => %{"status" => "completed"},
+              "message_status" => %{"ack_status" => "completed"}
+            }} =
+             Runtime.ack_delivery(
+               recipient,
+               "dlv_runtime_ack",
+               params,
+               "runtime-delivery-ack",
+               route
+             )
+
+    assert_received {
+      :durable_delivery_ack,
+      ^recipient,
+      "dlv_runtime_ack",
+      ^params,
+      "runtime-delivery-ack",
+      ^route
+    }
+  end
+
   test "durable session sends reject non-open sessions", %{conn: conn} do
     {initiator_data, recipient_data} = register_session_agents!(conn, "ledger-non-open-session")
 
@@ -1939,7 +2007,7 @@ defmodule Atp.SessionRuntimeTest do
     route = "POST /api/deliveries/#{delivery["id"]}/acks"
 
     assert {:ok, 201, _accepted} =
-             Ledger.ack_delivery(
+             DurableLedger.ack_delivery(
                Repo.get!(Agent, recipient["id"]),
                delivery["id"],
                %{"status" => "accepted"},

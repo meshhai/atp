@@ -12,18 +12,14 @@ defmodule Atp.Transport.Ledger do
   alias Atp.Repo
 
   alias Atp.Transport.{
-    Ack,
     Delivery,
     Message,
-    Payload,
     Response,
     SenderPolicies,
     Session
   }
 
   @default_lease_seconds 60
-  @terminal_ack_statuses ~w(completed failed rejected)
-  @ack_statuses ~w(accepted completed failed rejected)
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -220,19 +216,6 @@ defmodule Atp.Transport.Ledger do
     end)
   end
 
-  @spec ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) :: api_result()
-  def ack_delivery(%Agent{} = agent, delivery_id, params, idempotency_key, route)
-      when is_binary(delivery_id) and is_map(params) do
-    agent
-    |> Idempotency.run(route, idempotency_key, params, fn ->
-      with {:ok, ack_status} <- fetch_ack_status(params),
-           {:ok, payload} <- fetch_optional_payload(params),
-           :ok <- Payload.validate_optional_a2a(payload) do
-        append_ack(agent, delivery_id, ack_status, payload)
-      end
-    end)
-  end
-
   @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   def upsert_sender_policy(%Agent{} = recipient, agent_id, params, idempotency_key, route)
@@ -258,12 +241,6 @@ defmodule Atp.Transport.Ledger do
         {:error, :invalid_lease}
     end
   end
-
-  defp fetch_ack_status(%{"status" => status}) when status in @ack_statuses, do: {:ok, status}
-  defp fetch_ack_status(%{"status" => _status}), do: {:error, :invalid_ack_status}
-  defp fetch_ack_status(_params), do: {:error, :ack_status_required}
-
-  defp fetch_optional_payload(params), do: {:ok, Map.get(params, "payload")}
 
   defp claim_next_message(%Agent{} = agent, lease_seconds) do
     Repo.transaction(fn ->
@@ -371,180 +348,6 @@ defmodule Atp.Transport.Ledger do
 
         {:ok, 200, Response.delivery_claim(updated_delivery, delivery.message)}
     end
-  end
-
-  defp append_ack(%Agent{} = agent, delivery_id, ack_status, payload) do
-    Repo.transaction(fn -> append_ack_in_transaction(agent, delivery_id, ack_status, payload) end)
-    |> unwrap_transaction_result()
-  end
-
-  defp append_ack_in_transaction(%Agent{} = agent, delivery_id, ack_status, payload) do
-    now = DateTime.utc_now(:microsecond)
-
-    case fetch_locked_delivery(agent, delivery_id) do
-      nil ->
-        Repo.rollback(:not_found)
-
-      %Delivery{} = delivery ->
-        persist_ack(agent, delivery, ack_status, payload, now)
-    end
-  end
-
-  defp persist_ack(%Agent{} = agent, %Delivery{} = delivery, ack_status, payload, now) do
-    with :ok <- validate_ack_lease(delivery, now),
-         :ok <- validate_ack_transition(delivery.message.current_ack_status, ack_status),
-         {:ok, opening_session} <- lock_opening_session(delivery.message),
-         :ok <- expire_due_opening_session(opening_session, delivery.message, now),
-         :ok <- validate_opening_session_ack(opening_session, ack_status),
-         {:ok, delivery} <- mark_acked_delivery_delivered(delivery, now),
-         {:ok, ack} <- insert_ack(delivery, ack_status, payload),
-         {:ok, message} <- cache_ack_status(delivery.message, ack_status, now),
-         {:ok, _session} <- cache_opening_session_ack_status(opening_session, ack_status, now) do
-      {201, Response.ack(agent, ack, message)}
-    else
-      {:commit_error, reason} -> {:commit_error, reason}
-      {:error, reason} -> Repo.rollback(reason)
-    end
-  end
-
-  defp mark_acked_delivery_delivered(%Delivery{mode: "polling", status: "leased"} = delivery, now) do
-    delivery
-    |> Ecto.Changeset.change(status: "delivered", delivered_at: now)
-    |> Repo.update()
-  end
-
-  defp mark_acked_delivery_delivered(%Delivery{} = delivery, _now), do: {:ok, delivery}
-
-  defp fetch_locked_delivery(%Agent{} = agent, delivery_id) do
-    Delivery
-    |> where([delivery], delivery.id == ^delivery_id)
-    |> where([delivery], delivery.recipient_agent_id == ^agent.id)
-    |> join(:inner, [delivery], message in assoc(delivery, :message))
-    |> preload([_delivery, message], message: message)
-    |> lock("FOR UPDATE")
-    |> Repo.one()
-  end
-
-  defp lock_opening_session(%Message{session_id: nil}), do: {:ok, nil}
-
-  defp lock_opening_session(%Message{} = message) do
-    query =
-      from(session in Session,
-        where: session.id == ^message.session_id,
-        where: session.opening_message_id == ^message.id,
-        lock: "FOR UPDATE"
-      )
-
-    {:ok, Repo.one(query)}
-  end
-
-  defp validate_opening_session_ack(nil, _ack_status), do: :ok
-
-  defp validate_opening_session_ack(%Session{status: "pending"}, "completed") do
-    {:error, :invalid_ack_transition}
-  end
-
-  defp validate_opening_session_ack(%Session{status: "pending"}, _ack_status), do: :ok
-
-  defp validate_opening_session_ack(%Session{}, _ack_status) do
-    {:error, :invalid_ack_transition}
-  end
-
-  defp expire_due_opening_session(nil, %Message{}, _now), do: :ok
-
-  defp expire_due_opening_session(
-         %Session{status: "pending"} = session,
-         %Message{expires_at: %DateTime{} = expires_at} = message,
-         now
-       ) do
-    if DateTime.compare(expires_at, now) == :gt do
-      :ok
-    else
-      {:ok, _message} = expire_opening_message(message, now)
-      {:ok, _session} = fail_pending_opening_session(session, now)
-
-      {:commit_error, :message_expired}
-    end
-  end
-
-  defp expire_due_opening_session(%Session{}, %Message{}, _now), do: :ok
-
-  defp validate_ack_lease(%Delivery{message: %Message{current_ack_status: "accepted"}}, _now) do
-    :ok
-  end
-
-  defp validate_ack_lease(%Delivery{mode: "webhook", status: "delivered"}, _now), do: :ok
-
-  defp validate_ack_lease(%Delivery{mode: "webhook"}, _now), do: {:error, :delivery_not_delivered}
-
-  defp validate_ack_lease(
-         %Delivery{mode: "polling", leased_until: %DateTime{} = leased_until},
-         now
-       ) do
-    if DateTime.compare(leased_until, now) == :gt do
-      :ok
-    else
-      {:error, :lease_expired}
-    end
-  end
-
-  defp validate_ack_transition(nil, _next_status), do: :ok
-
-  defp validate_ack_transition(current_status, _next_status)
-       when current_status in @terminal_ack_statuses do
-    {:error, :terminal_ack_status}
-  end
-
-  defp validate_ack_transition("accepted", next_status)
-       when next_status in ~w(completed failed) do
-    :ok
-  end
-
-  defp validate_ack_transition("accepted", _next_status), do: {:error, :invalid_ack_transition}
-
-  defp insert_ack(%Delivery{} = delivery, ack_status, payload) do
-    %Ack{id: ID.generate("ack")}
-    |> Ack.changeset(%{
-      message_id: delivery.message_id,
-      delivery_id: delivery.id,
-      recipient_agent_id: delivery.recipient_agent_id,
-      status: ack_status,
-      payload: payload
-    })
-    |> Repo.insert()
-  end
-
-  defp cache_ack_status(%Message{} = message, ack_status, now) do
-    message
-    |> Ecto.Changeset.change(
-      carrier_status: delivered_carrier_status(message),
-      current_ack_status: ack_status,
-      terminal_at: terminal_ack_timestamp(ack_status, now)
-    )
-    |> Repo.update()
-  end
-
-  defp delivered_carrier_status(%Message{carrier_status: status})
-       when status in ~w(queued delivery_failed) do
-    "delivered"
-  end
-
-  defp delivered_carrier_status(%Message{carrier_status: status}), do: status
-
-  defp terminal_ack_timestamp(status, now) when status in @terminal_ack_statuses, do: now
-  defp terminal_ack_timestamp(_status, _now), do: nil
-
-  defp cache_opening_session_ack_status(nil, _ack_status, _now), do: {:ok, nil}
-
-  defp cache_opening_session_ack_status(%Session{status: "pending"} = session, "accepted", now) do
-    session
-    |> Session.changeset(%{status: "open", opened_at: now})
-    |> Repo.update()
-  end
-
-  defp cache_opening_session_ack_status(%Session{status: "pending"} = session, status, now)
-       when status in ~w(rejected failed) do
-    terminalize_pending_opening_session(session, status, now)
   end
 
   defp unwrap_transaction_result({:ok, {:commit_error, reason}}), do: {:commit_error, reason}

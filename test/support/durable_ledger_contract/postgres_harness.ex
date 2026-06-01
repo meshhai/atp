@@ -27,10 +27,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   @spec prepare_direct_message_pair!(Plug.Conn.t(), String.t()) :: {Agent.t(), Agent.t()}
   def prepare_direct_message_pair!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     {get_agent!(sender["id"]), get_agent!(recipient["id"])}
   end
@@ -41,10 +38,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec prepare_active_webhook_direct_message_pair!(Plug.Conn.t(), String.t()) ::
           {Agent.t(), Agent.t()}
   def prepare_active_webhook_direct_message_pair!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     Atp.ConnCase.configure_webhook!(
       recipient,
@@ -104,10 +98,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   @spec prepare_due_webhook_delivery_context!(Plug.Conn.t(), String.t()) ::
           {Delivery.t(), Message.t(), Agent.t(), map()}
   def prepare_due_webhook_delivery_context!(conn, key) do
-    account = Atp.ConnCase.create_account!(conn)
-    account_token = account["account_api_key"]["token"]
-    sender = Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
-    recipient = Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+    {sender, recipient} = register_agent_pair!(conn, key)
 
     Atp.ConnCase.configure_webhook!(
       recipient,
@@ -131,6 +122,59 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     {:ok, delivery} = WebhookDelivery.prepare(message, recipient_agent)
 
     {delivery, message, recipient_agent, recipient}
+  end
+
+  @spec prepare_polling_delivery!(Plug.Conn.t(), String.t()) ::
+          {Delivery.t(), Message.t(), Agent.t(), Agent.t()}
+  def prepare_polling_delivery!(conn, key) do
+    {sender, recipient} = register_agent_pair!(conn, key)
+
+    sent =
+      Atp.ConnCase.send_message!(
+        sender["agent_api_key"]["token"],
+        "send-#{key}",
+        recipient["address"],
+        Atp.ConnCase.a2a_user_text(key, "claim this polling delivery")
+      )
+
+    delivery =
+      Atp.ConnCase.claim_inbox!(recipient["agent_api_key"]["token"], "claim-#{key}", %{
+        "lease_seconds" => 60
+      })
+
+    {
+      get_delivery!(delivery["id"]),
+      get_message!(sent["message"]["id"]),
+      get_agent!(sender["id"]),
+      get_agent!(recipient["id"])
+    }
+  end
+
+  @spec prepare_opening_polling_delivery!(Plug.Conn.t(), String.t()) ::
+          {Session.t(), Message.t(), Delivery.t(), Agent.t(), Agent.t()}
+  def prepare_opening_polling_delivery!(conn, key) do
+    {initiator, recipient} = register_agent_pair!(conn, key, "initiator", "recipient")
+
+    opened =
+      Atp.ConnCase.open_session!(
+        initiator["agent_api_key"]["token"],
+        "open-#{key}",
+        recipient["address"],
+        Atp.ConnCase.a2a_user_text("#{key}-opening", "open session")
+      )
+
+    delivery =
+      Atp.ConnCase.claim_inbox!(recipient["agent_api_key"]["token"], "claim-#{key}", %{
+        "lease_seconds" => 60
+      })
+
+    {
+      get_session!(opened["session"]["id"]),
+      get_message!(opened["message_status"]["message"]["id"]),
+      get_delivery!(delivery["id"]),
+      get_agent!(initiator["id"]),
+      get_agent!(recipient["id"])
+    }
   end
 
   @spec prepare_ordered_session_webhook_deliveries!(Plug.Conn.t(), String.t()) ::
@@ -195,9 +239,13 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     {first_delivery, second_delivery}
   end
 
-  @spec expire_delivery_lease!(Atp.Transport.DeliveryClaim.t()) :: Delivery.t()
-  def expire_delivery_lease!(claim) do
-    claim.delivery
+  @spec expire_delivery_lease!(Atp.Transport.DeliveryClaim.t() | Delivery.t()) :: Delivery.t()
+  def expire_delivery_lease!(%Atp.Transport.DeliveryClaim{} = claim) do
+    expire_delivery_lease!(claim.delivery)
+  end
+
+  def expire_delivery_lease!(%Delivery{} = delivery) do
+    delivery
     |> Ecto.Changeset.change(
       leased_until: DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
     )
@@ -304,6 +352,19 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   def webhook_attempt_count, do: Repo.aggregate(WebhookAttempt, :count, :id)
 
   defp get_agent!(agent_id), do: Repo.get!(Agent, agent_id)
+
+  defp register_agent_pair!(conn, key, sender_label \\ "sender", recipient_label \\ "recipient") do
+    account = Atp.ConnCase.create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+
+    sender =
+      Atp.ConnCase.register_agent!(account_token, "register-#{key}-#{sender_label}", %{})
+
+    recipient =
+      Atp.ConnCase.register_agent!(account_token, "register-#{key}-#{recipient_label}", %{})
+
+    {sender, recipient}
+  end
 
   defp promote_to_basic!(account) do
     Atp.Identity.Account
