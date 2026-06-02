@@ -7,7 +7,7 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
 
   alias Atp.Identity.{Account, Agent}
   alias Atp.Repo
-  alias Atp.Transport.Message
+  alias Atp.Transport.{Delivery, Message}
   alias Ecto.Adapters.SQL.Sandbox
 
   @claim_route "POST /api/inbox/claims"
@@ -234,6 +234,89 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
                  final_delivery.leased_until,
                  DateTime.add(original_lease, 170, :second)
                ) == :gt
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
+  test "postgres adapter serializes polling extension with expired lease reclaim", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-extend-reclaim-race"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling extend reclaim race"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+
+        sender_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+
+        recipient_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+        sender = Repo.get!(Agent, sender_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+        sent = accept_direct_message!(sender, recipient, key)
+
+        assert {:ok, 201, claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 1},
+                   "claim-#{key}",
+                   @claim_route
+                 )
+
+        message_id = sent["message"]["id"]
+        assert claim["message"]["id"] == message_id
+
+        delivery_lock_task = lock_delivery_until_release(claim["id"], self())
+        assert_receive {:delivery_locked, delivery_id}, 5_000
+        assert delivery_id == claim["id"]
+
+        extend_task =
+          extend_with_backend_task(
+            self(),
+            recipient,
+            claim["id"],
+            key,
+            120
+          )
+
+        assert_receive {:extend_backend_pid, backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(backend_pid, "polling lease extension")
+        wait_until_after!(claim["leased_until"])
+
+        assert {:ok, 200, %{"delivery" => nil}} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-while-extension-waits",
+                   @claim_route
+                 )
+
+        send(delivery_lock_task.pid, :release_delivery_lock)
+        assert :ok = Task.await(delivery_lock_task, 5_000)
+
+        assert {:error, :lease_expired} = Task.await(extend_task, 5_000)
+
+        assert {:ok, 201, reclaimed} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-after-extension",
+                   @claim_route
+                 )
+
+        assert reclaimed["id"] != claim["id"]
+        assert reclaimed["message"]["id"] == message_id
+
+        active_leases =
+          message_id
+          |> @ledger_harness.get_deliveries_for_message!()
+          |> Enum.filter(&active_polling_lease?/1)
+
+        assert [%Delivery{id: active_delivery_id}] = active_leases
+        assert active_delivery_id == reclaimed["id"]
       after
         delete_account!(account["id"])
       end
@@ -564,6 +647,29 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     |> Repo.one!()
   end
 
+  defp lock_delivery_until_release(delivery_id, parent) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn -> hold_delivery_lock!(delivery_id, parent) end)
+      :ok
+    end)
+  end
+
+  defp hold_delivery_lock!(delivery_id, parent) do
+    {:ok, :release_delivery_lock} =
+      Repo.transaction(fn ->
+        lock_delivery!(delivery_id)
+        send(parent, {:delivery_locked, delivery_id})
+        assert_receive :release_delivery_lock, 5_000
+      end)
+  end
+
+  defp lock_delivery!(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one!()
+  end
+
   defp concurrent_extend_task(parent, recipient, delivery_id, key, lease_seconds) do
     Task.async(fn ->
       checked_out_unboxed_repo(fn ->
@@ -575,6 +681,23 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
           delivery_id,
           %{"lease_seconds" => lease_seconds},
           "extend-#{key}-#{lease_seconds}",
+          "POST /api/deliveries/#{delivery_id}/extend"
+        )
+      end)
+    end)
+  end
+
+  defp extend_with_backend_task(parent, recipient, delivery_id, key, lease_seconds) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn ->
+        backend_pid = db_backend_pid!()
+        send(parent, {:extend_backend_pid, backend_pid})
+
+        @ledger_adapter.extend_delivery(
+          recipient,
+          delivery_id,
+          %{"lease_seconds" => lease_seconds},
+          "extend-#{key}",
           "POST /api/deliveries/#{delivery_id}/extend"
         )
       end)
@@ -598,6 +721,73 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
   defp parse_timestamp!(timestamp) do
     {:ok, parsed, 0} = DateTime.from_iso8601(timestamp)
     parsed
+  end
+
+  defp wait_until_after!(timestamp) do
+    timestamp
+    |> parse_timestamp!()
+    |> wait_until_after!(System.monotonic_time(:millisecond) + 2_000)
+  end
+
+  defp wait_until_after!(timestamp, deadline) do
+    if DateTime.compare(DateTime.utc_now(:microsecond), timestamp) == :gt do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) > deadline do
+        flunk("timestamp #{DateTime.to_iso8601(timestamp)} did not pass before deadline")
+      else
+        Process.sleep(10)
+        wait_until_after!(timestamp, deadline)
+      end
+    end
+  end
+
+  defp active_polling_lease?(%Delivery{
+         mode: "polling",
+         status: "leased",
+         leased_until: %DateTime{} = leased_until
+       }) do
+    DateTime.compare(leased_until, DateTime.utc_now(:microsecond)) == :gt
+  end
+
+  defp active_polling_lease?(%Delivery{}), do: false
+
+  defp assert_backend_waiting_on_lock!(backend_pid, label) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    assert_backend_waiting_on_lock!(backend_pid, label, deadline)
+  end
+
+  defp assert_backend_waiting_on_lock!(backend_pid, label, deadline) do
+    case backend_wait_event(backend_pid) do
+      "Lock" ->
+        :ok
+
+      _other ->
+        if System.monotonic_time(:millisecond) > deadline do
+          flunk("#{label} backend #{backend_pid} was not waiting on a lock")
+        else
+          Process.sleep(10)
+          assert_backend_waiting_on_lock!(backend_pid, label, deadline)
+        end
+    end
+  end
+
+  defp backend_wait_event(backend_pid) do
+    result =
+      Repo.query!(
+        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",
+        [backend_pid]
+      )
+
+    case result.rows do
+      [[wait_event_type]] -> wait_event_type
+      [] -> nil
+    end
+  end
+
+  defp db_backend_pid! do
+    %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()", [])
+    backend_pid
   end
 
   defp later_timestamp?(later, earlier) do
