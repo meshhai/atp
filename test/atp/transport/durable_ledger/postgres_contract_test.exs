@@ -234,6 +234,49 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
   end
 
+  test "postgres adapter does not let expired earlier session messages block polling claims", %{
+    conn: conn
+  } do
+    {initiator, recipient} =
+      @ledger_harness.prepare_session_pair!(conn, "polling-session-expired-prior")
+
+    opened = open_session!(initiator, recipient, "polling-session-expired-prior")
+    session_id = opened["session"]["id"]
+
+    assert {:ok, 201, opening_claim} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 60},
+               "claim-polling-session-expired-opening",
+               @claim_route
+             )
+
+    assert {:ok, 201, _ack} =
+             @ledger_adapter.ack_delivery(
+               recipient,
+               opening_claim["id"],
+               %{"status" => "accepted"},
+               "ack-polling-session-expired-opening",
+               "POST /api/deliveries/#{opening_claim["id"]}/acks"
+             )
+
+    first = send_session_message!(initiator, session_id, "polling-session-expired-first")
+    second = send_session_message!(initiator, session_id, "polling-session-expired-second")
+
+    first_message = @ledger_harness.get_message!(first["message_status"]["message"]["id"])
+    @ledger_harness.expire_message!(first_message)
+
+    assert {:ok, 201, second_claim} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 60},
+               "claim-polling-session-expired-second",
+               @claim_route
+             )
+
+    assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
+  end
+
   test "postgres adapter does not skip locked earlier polling session messages", %{conn: conn} do
     unboxed_repo(fn ->
       key = "polling-session-locked-order"
