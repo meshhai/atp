@@ -68,6 +68,56 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     assert reclaimed["message"]["id"] == message_id
   end
 
+  test "postgres adapter advances after losing a concurrent polling claim race", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-claim-race-advance"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling claim race advance"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+
+        sender_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+
+        recipient_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+        sender = Repo.get!(Agent, sender_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+        first = accept_direct_message!(sender, recipient, "#{key}-first")
+        second = accept_direct_message!(sender, recipient, "#{key}-second")
+        first_message_id = first["message"]["id"]
+        second_message_id = second["message"]["id"]
+
+        lock_task = lock_message_until_release(first_message_id, self())
+        assert_receive {:message_locked, ^first_message_id}, 5_000
+
+        claim_tasks =
+          for number <- 1..2 do
+            claim_with_backend_task(self(), recipient, "claim-#{key}-#{number}")
+          end
+
+        assert_receive {:claim_backend_pid, first_backend_pid}, 5_000
+        assert_receive {:claim_backend_pid, second_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(first_backend_pid, "first polling claim")
+        assert_backend_waiting_on_lock!(second_backend_pid, "second polling claim")
+
+        send(lock_task.pid, :release_message_lock)
+        assert :ok = Task.await(lock_task, 5_000)
+
+        claimed_message_ids =
+          claim_tasks
+          |> Enum.map(&Task.await(&1, 5_000))
+          |> Enum.map(fn {:ok, 201, claim} -> claim["message"]["id"] end)
+          |> Enum.sort()
+
+        assert claimed_message_ids == Enum.sort([first_message_id, second_message_id])
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   test "postgres adapter keeps ACKed and expired messages out of polling claims", %{conn: conn} do
     {sender, recipient} = @ledger_harness.prepare_direct_message_pair!(conn, "polling-invisible")
     acked = accept_direct_message!(sender, recipient, "polling-invisible-acked")

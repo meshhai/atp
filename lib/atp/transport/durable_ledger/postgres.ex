@@ -239,17 +239,24 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp claim_next_polling_message(%Agent{} = recipient, lease_seconds) do
     Repo.transaction(fn ->
-      now = DateTime.utc_now(:microsecond)
-
-      case Repo.one(claimable_polling_message_query(recipient, now)) do
-        nil ->
-          {200, %{"delivery" => nil}}
-
-        %Message{} = message ->
-          claim_polling_message!(message.id, recipient, lease_seconds)
-      end
+      claim_next_polling_message!(recipient, lease_seconds)
     end)
     |> unwrap_polling_transaction_result()
+  end
+
+  defp claim_next_polling_message!(%Agent{} = recipient, lease_seconds) do
+    now = DateTime.utc_now(:microsecond)
+
+    case Repo.one(claimable_polling_message_query(recipient, now)) do
+      nil ->
+        {200, %{"delivery" => nil}}
+
+      %Message{} = message ->
+        case claim_polling_message!(message.id, recipient, lease_seconds) do
+          :retry -> claim_next_polling_message!(recipient, lease_seconds)
+          result -> result
+        end
+    end
   end
 
   defp claimable_polling_message_query(%Agent{} = recipient, now) do
@@ -315,7 +322,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
     case lock_polling_message(message_id) do
       nil ->
-        {200, %{"delivery" => nil}}
+        :retry
 
       %Message{} = message ->
         claim_locked_polling_message!(message, recipient, lease_seconds)
@@ -343,10 +350,10 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
     cond do
       not claimable_polling_message?(message, recipient, now) ->
-        {200, %{"delivery" => nil}}
+        :retry
 
       active_polling_delivery?(message, recipient, now) ->
-        {200, %{"delivery" => nil}}
+        :retry
 
       true ->
         lease_until = DateTime.add(now, lease_seconds, :second)
