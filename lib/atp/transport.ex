@@ -56,7 +56,7 @@ defmodule Atp.Transport do
   defdelegate get_message_status(agent, message_id), to: Ledger
 
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
-  defdelegate claim_inbox(agent, params, idempotency_key, route), to: Ledger
+  defdelegate claim_inbox(agent, params, idempotency_key, route), to: DurableLedger
 
   @doc false
   @spec claim_webhook_delivery(String.t(), keyword()) ::
@@ -79,7 +79,8 @@ defmodule Atp.Transport do
 
   @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
-  defdelegate extend_delivery(agent, delivery_id, params, idempotency_key, route), to: Ledger
+  defdelegate extend_delivery(agent, delivery_id, params, idempotency_key, route),
+    to: DurableLedger
 
   @spec ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate ack_delivery(agent, delivery_id, params, idempotency_key, route), to: Runtime

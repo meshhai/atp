@@ -143,6 +143,32 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end)
   end
 
+  @impl DurableLedger
+  @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.polling_lease_result()
+  def claim_inbox(%Agent{} = recipient, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, lease_seconds} <- fetch_polling_lease_seconds(params) do
+        claim_next_polling_message(recipient, lease_seconds)
+      end
+    end)
+  end
+
+  @impl DurableLedger
+  @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.polling_lease_result()
+  def extend_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
+      when is_binary(delivery_id) and is_map(params) and is_binary(route) do
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, lease_seconds} <- fetch_polling_lease_seconds(params) do
+        extend_active_polling_delivery(recipient, delivery_id, lease_seconds)
+      end
+    end)
+  end
+
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
     with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
          :ok <-
@@ -210,6 +236,119 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       append_session_lifecycle_ack(recipient, delivery_id, "rejected", payload)
     end
   end
+
+  defp claim_next_polling_message(%Agent{} = recipient, lease_seconds) do
+    Repo.transaction(fn ->
+      now = DateTime.utc_now(:microsecond)
+
+      case Repo.one(claimable_polling_message_query(recipient, now)) do
+        nil ->
+          {200, %{"delivery" => nil}}
+
+        %Message{} = message ->
+          lease_until = DateTime.add(now, lease_seconds, :second)
+          delivery = insert_polling_delivery!(message, recipient, lease_until)
+          delivered_message = mark_polling_message_delivered!(message)
+
+          {201, Response.delivery_claim(delivery, delivered_message)}
+      end
+    end)
+    |> unwrap_polling_transaction_result()
+  end
+
+  defp claimable_polling_message_query(%Agent{} = recipient, now) do
+    active_delivery_message_ids =
+      from(delivery in Delivery,
+        where:
+          delivery.recipient_agent_id == ^recipient.id and delivery.status == "leased" and
+            delivery.leased_until > ^now,
+        select: delivery.message_id
+      )
+
+    from(message in Message,
+      as: :message,
+      where: message.recipient_agent_id == ^recipient.id,
+      where: message.carrier_status in ["queued", "delivered"],
+      where: is_nil(message.current_ack_status),
+      where: message.expires_at > ^now,
+      where: message.id not in subquery(active_delivery_message_ids),
+      where: ^polling_session_order_filter(now),
+      order_by: [asc: message.inserted_at],
+      limit: 1,
+      lock: "FOR UPDATE SKIP LOCKED"
+    )
+  end
+
+  defp polling_session_order_filter(now) do
+    dynamic(
+      [message: message],
+      is_nil(message.session_id) or is_nil(message.session_sequence) or
+        not exists(
+          from(prior_message in Message,
+            where: prior_message.session_id == parent_as(:message).session_id,
+            where: prior_message.session_sequence < parent_as(:message).session_sequence,
+            where: prior_message.carrier_status == "queued",
+            where: is_nil(prior_message.current_ack_status),
+            where: prior_message.expires_at > ^now,
+            select: 1
+          )
+        )
+    )
+  end
+
+  defp insert_polling_delivery!(%Message{} = message, %Agent{} = recipient, lease_until) do
+    %Delivery{id: ID.generate("dlv")}
+    |> Delivery.changeset(%{
+      message_id: message.id,
+      recipient_agent_id: recipient.id,
+      mode: "polling",
+      status: "leased",
+      leased_until: lease_until
+    })
+    |> Repo.insert!()
+  end
+
+  defp mark_polling_message_delivered!(%Message{} = message) do
+    message
+    |> Ecto.Changeset.change(carrier_status: "delivered")
+    |> Repo.update!()
+  end
+
+  defp extend_active_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
+    delivery =
+      Delivery
+      |> Repo.get_by(id: delivery_id, recipient_agent_id: recipient.id)
+      |> Repo.preload(:message)
+
+    now = DateTime.utc_now(:microsecond)
+
+    cond do
+      is_nil(delivery) ->
+        {:error, :not_found}
+
+      delivery.mode != "polling" or delivery.status != "leased" or is_nil(delivery.leased_until) ->
+        {:error, :invalid_lease}
+
+      DateTime.compare(delivery.leased_until, now) != :gt ->
+        {:error, :lease_expired}
+
+      true ->
+        updated_delivery =
+          delivery
+          |> Ecto.Changeset.change(
+            leased_until: DateTime.add(delivery.leased_until, lease_seconds, :second)
+          )
+          |> Repo.update!()
+
+        {:ok, 200, Response.delivery_claim(updated_delivery, delivery.message)}
+    end
+  end
+
+  defp unwrap_polling_transaction_result({:ok, {:commit_error, reason}}),
+    do: {:commit_error, reason}
+
+  defp unwrap_polling_transaction_result({:ok, {status, body}}), do: {:ok, status, body}
+  defp unwrap_polling_transaction_result({:error, reason}), do: {:error, reason}
 
   defp prepared_session_intake_response(body, %Session{}, nil), do: {:ok, 201, body}
 
@@ -304,6 +443,16 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp fetch_ack_status(%{"status" => status}) when status in @ack_statuses, do: {:ok, status}
   defp fetch_ack_status(%{"status" => _status}), do: {:error, :invalid_ack_status}
   defp fetch_ack_status(_params), do: {:error, :ack_status_required}
+
+  defp fetch_polling_lease_seconds(params) do
+    case Map.get(params, "lease_seconds", @default_polling_lease_seconds) do
+      seconds when is_integer(seconds) and seconds >= 0 ->
+        {:ok, seconds}
+
+      _other ->
+        {:error, :invalid_lease}
+    end
+  end
 
   defp fetch_session_message_payload(params) do
     with {:ok, payload} <- fetch_payload(params),

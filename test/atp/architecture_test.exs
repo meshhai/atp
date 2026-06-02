@@ -114,6 +114,15 @@ defmodule Atp.ArchitectureTest do
     refute postgres_source =~ legacy_ack_call
   end
 
+  test "Postgres durable ledger adapter owns polling lease mutations" do
+    postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+    legacy_claim_call = Enum.join(["Ledger", "claim_inbox"], ".")
+    legacy_extend_call = Enum.join(["Ledger", "extend_delivery"], ".")
+
+    refute postgres_source =~ legacy_claim_call
+    refute postgres_source =~ legacy_extend_call
+  end
+
   test "runtime routes session lifecycle mutations through durable ledger" do
     runtime_source = File.read!("lib/atp/transport/runtime.ex")
     runtime_lines = String.split(runtime_source, "\n")
@@ -134,6 +143,15 @@ defmodule Atp.ArchitectureTest do
     refute Enum.any?(runtime_lines, &String.contains?(&1, legacy_ack_pipe))
   end
 
+  test "transport facade routes polling lease mutations through durable ledger" do
+    transport_source = File.read!("lib/atp/transport.ex")
+
+    assert transport_source =~ polling_delegate_pattern(:claim_inbox, :DurableLedger)
+    assert transport_source =~ polling_delegate_pattern(:extend_delivery, :DurableLedger)
+    refute transport_source =~ polling_delegate_pattern(:claim_inbox, :Ledger)
+    refute transport_source =~ polling_delegate_pattern(:extend_delivery, :Ledger)
+  end
+
   test "legacy ledger does not expose session lifecycle entry points" do
     ledger_functions = TransportLedger.__info__(:functions)
 
@@ -143,6 +161,13 @@ defmodule Atp.ArchitectureTest do
 
   test "legacy ledger does not expose delivery ACK entry point" do
     refute {:ack_delivery, 5} in TransportLedger.__info__(:functions)
+  end
+
+  test "legacy ledger does not expose polling lease entry points" do
+    ledger_functions = TransportLedger.__info__(:functions)
+
+    refute {:claim_inbox, 4} in ledger_functions
+    refute {:extend_delivery, 5} in ledger_functions
   end
 
   test "Postgres durable ledger keeps ACK mutation in one state-machine flow" do
@@ -184,5 +209,13 @@ defmodule Atp.ArchitectureTest do
 
   defp product_domain_pattern do
     ~r/\b(SourceMonitor|RLM|MarketEvents|Billing|Corpus|Missions)\b/
+  end
+
+  defp polling_delegate_pattern(:claim_inbox, module) do
+    ~r/defdelegate\s+claim_inbox\(agent,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
+  end
+
+  defp polling_delegate_pattern(:extend_delivery, module) do
+    ~r/defdelegate\s+extend_delivery\(agent,\s*delivery_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
   end
 end

@@ -107,6 +107,33 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def claim_inbox(recipient, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :claim_inbox,
+        recipient,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 200, %{"delivery" => nil}}
+    end
+
+    @impl DurableLedger
+    def extend_delivery(recipient, delivery_id, params, idempotency_key, route) do
+      send(Map.fetch!(params, :test_pid), {
+        :extend_delivery,
+        recipient,
+        delivery_id,
+        Map.delete(params, :test_pid),
+        idempotency_key,
+        route
+      })
+
+      {:ok, 200, %{"delivery" => %{"id" => delivery_id}}}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(opts) do
       notify_test_pid(opts, {:claim_due_webhook_delivery, opts})
       {:ok, nil}
@@ -289,6 +316,55 @@ defmodule Atp.DurableLedgerTest do
       },
       "transport-session-open-key",
       "POST /api/sessions"
+    }
+  end
+
+  test "transport facade delegates polling leases to the durable ledger" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    recipient = %Agent{
+      id: "agt_transport_polling_recipient",
+      account_id: "acc_transport_polling",
+      address: "atp://agent/agt_transport_polling_recipient",
+      status: "active"
+    }
+
+    claim_params = %{"lease_seconds" => 30, test_pid: self()}
+
+    assert {:ok, 200, %{"delivery" => nil}} =
+             Transport.claim_inbox(
+               recipient,
+               claim_params,
+               "transport-polling-claim-key",
+               "POST /api/inbox/claims"
+             )
+
+    assert_received {
+      :claim_inbox,
+      ^recipient,
+      %{"lease_seconds" => 30},
+      "transport-polling-claim-key",
+      "POST /api/inbox/claims"
+    }
+
+    extend_params = %{"lease_seconds" => 45, test_pid: self()}
+
+    assert {:ok, 200, %{"delivery" => %{"id" => "dlv_transport_polling"}}} =
+             Transport.extend_delivery(
+               recipient,
+               "dlv_transport_polling",
+               extend_params,
+               "transport-polling-extend-key",
+               "POST /api/deliveries/dlv_transport_polling/lease"
+             )
+
+    assert_received {
+      :extend_delivery,
+      ^recipient,
+      "dlv_transport_polling",
+      %{"lease_seconds" => 45},
+      "transport-polling-extend-key",
+      "POST /api/deliveries/dlv_transport_polling/lease"
     }
   end
 
@@ -525,6 +601,55 @@ defmodule Atp.DurableLedgerTest do
     }
   end
 
+  test "durable ledger delegates polling lease operations to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+
+    recipient = %Agent{
+      id: "agt_polling_recipient",
+      account_id: "acc_polling",
+      address: "atp://agent/agt_polling_recipient",
+      status: "active"
+    }
+
+    claim_params = %{"lease_seconds" => 30, test_pid: self()}
+
+    assert {:ok, 200, %{"delivery" => nil}} =
+             DurableLedger.claim_inbox(
+               recipient,
+               claim_params,
+               "polling-claim-key",
+               "POST /api/inbox/claims"
+             )
+
+    assert_received {
+      :claim_inbox,
+      ^recipient,
+      %{"lease_seconds" => 30},
+      "polling-claim-key",
+      "POST /api/inbox/claims"
+    }
+
+    extend_params = %{"lease_seconds" => 45, test_pid: self()}
+
+    assert {:ok, 200, %{"delivery" => %{"id" => "dlv_polling"}}} =
+             DurableLedger.extend_delivery(
+               recipient,
+               "dlv_polling",
+               extend_params,
+               "polling-extend-key",
+               "POST /api/deliveries/dlv_polling/lease"
+             )
+
+    assert_received {
+      :extend_delivery,
+      ^recipient,
+      "dlv_polling",
+      %{"lease_seconds" => 45},
+      "polling-extend-key",
+      "POST /api/deliveries/dlv_polling/lease"
+    }
+  end
+
   test "durable ledger delegates delivery claim operations to configured adapter" do
     Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
 
@@ -650,6 +775,27 @@ defmodule Atp.DurableLedgerTest do
     assert ack_delivery_doc =~ "durable opening-session state transitions"
     assert_no_active_webhook_dispatch(ack_delivery_doc)
     refute ack_delivery_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    claim_inbox_doc = callback_doc(docs, :claim_inbox, 4)
+
+    assert claim_inbox_doc =~ "recipient-owned inbox polling"
+    assert claim_inbox_doc =~ "idempotency"
+    assert claim_inbox_doc =~ "stable replay"
+    assert claim_inbox_doc =~ "active leases"
+    assert claim_inbox_doc =~ "expired leases"
+    assert claim_inbox_doc =~ "ACKed"
+    assert claim_inbox_doc =~ "session order"
+    refute claim_inbox_doc =~ ~r/\b(SQL|Ecto|table|row|lock|Postgres)\b/i
+
+    extend_delivery_doc = callback_doc(docs, :extend_delivery, 5)
+
+    assert extend_delivery_doc =~ "recipient-owned polling lease"
+    assert extend_delivery_doc =~ "idempotency"
+    assert extend_delivery_doc =~ "stable replay"
+    assert extend_delivery_doc =~ "ownership"
+    assert extend_delivery_doc =~ "polling mode"
+    assert extend_delivery_doc =~ "non-expired"
+    refute extend_delivery_doc =~ ~r/\b(SQL|Ecto|table|row|lock|Postgres)\b/i
   end
 
   defp callback_doc(docs, name, arity) do

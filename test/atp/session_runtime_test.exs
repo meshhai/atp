@@ -151,6 +151,16 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
+    def claim_inbox(_recipient, _params, _idempotency_key, _route) do
+      {:error, :unexpected_claim_inbox}
+    end
+
+    @impl DurableLedger
+    def extend_delivery(_recipient, _delivery_id, _params, _idempotency_key, _route) do
+      {:error, :unexpected_extend_delivery}
+    end
+
+    @impl DurableLedger
     def claim_due_webhook_delivery(_opts), do: {:error, :unexpected_claim}
 
     @impl DurableLedger
