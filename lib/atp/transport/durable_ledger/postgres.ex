@@ -285,11 +285,18 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       is_nil(message.session_id) or is_nil(message.session_sequence) or
         not exists(
           from(prior_message in Message,
+            left_join: active_delivery in Delivery,
+            on:
+              active_delivery.message_id == prior_message.id and
+                active_delivery.mode == "polling" and
+                active_delivery.status == "leased" and
+                active_delivery.leased_until > ^now,
             where: prior_message.session_id == parent_as(:message).session_id,
             where: prior_message.session_sequence < parent_as(:message).session_sequence,
-            where: prior_message.carrier_status == "queued",
+            where: prior_message.carrier_status in ["queued", "delivered"],
             where: is_nil(prior_message.current_ack_status),
             where: prior_message.expires_at > ^now,
+            where: is_nil(active_delivery.id),
             select: 1
           )
         )
@@ -317,7 +324,10 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp extend_active_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
     delivery =
       Delivery
-      |> Repo.get_by(id: delivery_id, recipient_agent_id: recipient.id)
+      |> where([delivery], delivery.id == ^delivery_id)
+      |> where([delivery], delivery.recipient_agent_id == ^recipient.id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
       |> Repo.preload(:message)
 
     now = DateTime.utc_now(:microsecond)

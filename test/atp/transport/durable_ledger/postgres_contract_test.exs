@@ -185,6 +185,61 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
              )
   end
 
+  test "postgres adapter serializes concurrent polling lease extensions", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-extend-concurrent"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling extend concurrency"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+
+        sender_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+
+        recipient_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+        sender = Repo.get!(Agent, sender_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+        sent = accept_direct_message!(sender, recipient, key)
+
+        assert {:ok, 201, claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}",
+                   @claim_route
+                 )
+
+        assert claim["message"]["id"] == sent["message"]["id"]
+        parent = self()
+
+        tasks =
+          for lease_seconds <- [60, 120] do
+            concurrent_extend_task(parent, recipient, claim["id"], key, lease_seconds)
+          end
+
+        assert_receive {:extend_ready, 60}, 5_000
+        assert_receive {:extend_ready, 120}, 5_000
+        Enum.each(tasks, fn task -> send(task.pid, :extend_delivery) end)
+
+        results = Enum.map(tasks, &Task.await(&1, 5_000))
+
+        assert Enum.all?(results, &match?({:ok, 200, _body}, &1))
+
+        final_delivery = @ledger_harness.get_delivery!(claim["id"])
+        original_lease = parse_timestamp!(claim["leased_until"])
+
+        assert DateTime.compare(
+                 final_delivery.leased_until,
+                 DateTime.add(original_lease, 170, :second)
+               ) == :gt
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   test "postgres adapter claims polling session messages in sequence", %{conn: conn} do
     {initiator, recipient} = @ledger_harness.prepare_session_pair!(conn, "polling-session-order")
     opened = open_session!(initiator, recipient, "polling-session-order")
@@ -352,6 +407,97 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     end)
   end
 
+  test "postgres adapter does not skip locked earlier messages after polling lease expiry", %{
+    conn: conn
+  } do
+    unboxed_repo(fn ->
+      key = "polling-session-expired-lease-locked"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling expired lease order"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+        initiator_response = Atp.ConnCase.register_agent!(account_token, "register-#{key}-i", %{})
+        recipient_response = Atp.ConnCase.register_agent!(account_token, "register-#{key}-r", %{})
+        initiator = Repo.get!(Agent, initiator_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+
+        opened = open_session!(initiator, recipient, key)
+        session_id = opened["session"]["id"]
+
+        assert {:ok, 201, opening_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-opening",
+                   @claim_route
+                 )
+
+        assert {:ok, 201, _ack} =
+                 @ledger_adapter.ack_delivery(
+                   recipient,
+                   opening_claim["id"],
+                   %{"status" => "accepted"},
+                   "ack-#{key}-opening",
+                   "POST /api/deliveries/#{opening_claim["id"]}/acks"
+                 )
+
+        first = send_session_message!(initiator, session_id, "#{key}-first")
+        second = send_session_message!(initiator, session_id, "#{key}-second")
+
+        assert {:ok, 201, first_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-first-initial",
+                   @claim_route
+                 )
+
+        first_message_id = first["message_status"]["message"]["id"]
+        assert first_claim["message"]["id"] == first_message_id
+
+        first_claim["id"]
+        |> @ledger_harness.get_delivery!()
+        |> @ledger_harness.expire_delivery_lease!()
+
+        lock_task = lock_message_until_release(first_message_id, self())
+        assert_receive {:message_locked, ^first_message_id}, 5_000
+
+        assert {:ok, 200, %{"delivery" => nil}} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-while-first-expired-locked",
+                   @claim_route
+                 )
+
+        send(lock_task.pid, :release_message_lock)
+        assert :ok = Task.await(lock_task, 5_000)
+
+        assert {:ok, 201, reclaimed_first} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-first-reclaimed",
+                   @claim_route
+                 )
+
+        assert reclaimed_first["message"]["id"] == first_message_id
+
+        assert {:ok, 201, second_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-second",
+                   @claim_route
+                 )
+
+        assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   defp accept_direct_message!(sender, recipient, key) do
     assert {:ok, 201, body, _prepared} =
              @ledger_adapter.accept_direct_message(
@@ -418,6 +564,23 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     |> Repo.one!()
   end
 
+  defp concurrent_extend_task(parent, recipient, delivery_id, key, lease_seconds) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn ->
+        send(parent, {:extend_ready, lease_seconds})
+        assert_receive :extend_delivery, 5_000
+
+        @ledger_adapter.extend_delivery(
+          recipient,
+          delivery_id,
+          %{"lease_seconds" => lease_seconds},
+          "extend-#{key}-#{lease_seconds}",
+          "POST /api/deliveries/#{delivery_id}/extend"
+        )
+      end)
+    end)
+  end
+
   defp unboxed_repo(fun), do: Sandbox.unboxed_run(Repo, fun)
 
   defp checked_out_unboxed_repo(fun) do
@@ -430,6 +593,11 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     Account
     |> Repo.get!(account_id)
     |> Repo.delete!()
+  end
+
+  defp parse_timestamp!(timestamp) do
+    {:ok, parsed, 0} = DateTime.from_iso8601(timestamp)
+    parsed
   end
 
   defp later_timestamp?(later, earlier) do
