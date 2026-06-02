@@ -246,11 +246,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
           {200, %{"delivery" => nil}}
 
         %Message{} = message ->
-          lease_until = DateTime.add(now, lease_seconds, :second)
-          delivery = insert_polling_delivery!(message, recipient, lease_until)
-          delivered_message = mark_polling_message_delivered!(message)
-
-          {201, Response.delivery_claim(delivery, delivered_message)}
+          claim_polling_message!(message.id, recipient, lease_seconds)
       end
     end)
     |> unwrap_polling_transaction_result()
@@ -274,8 +270,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       where: message.id not in subquery(active_delivery_message_ids),
       where: ^polling_session_order_filter(now),
       order_by: [asc: message.inserted_at],
-      limit: 1,
-      lock: "FOR UPDATE SKIP LOCKED"
+      limit: 1
     )
   end
 
@@ -315,6 +310,69 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> Repo.insert!()
   end
 
+  defp claim_polling_message!(message_id, %Agent{} = recipient, lease_seconds) do
+    lock_polling_deliveries_for_message!(message_id)
+
+    case lock_polling_message(message_id) do
+      nil ->
+        {200, %{"delivery" => nil}}
+
+      %Message{} = message ->
+        claim_locked_polling_message!(message, recipient, lease_seconds)
+    end
+  end
+
+  defp lock_polling_deliveries_for_message!(message_id) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message_id)
+    |> where([delivery], delivery.mode == "polling")
+    |> order_by([delivery], asc: delivery.inserted_at)
+    |> lock("FOR UPDATE")
+    |> Repo.all()
+  end
+
+  defp lock_polling_message(message_id) do
+    Message
+    |> where([message], message.id == ^message_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp claim_locked_polling_message!(%Message{} = message, %Agent{} = recipient, lease_seconds) do
+    now = DateTime.utc_now(:microsecond)
+
+    cond do
+      not claimable_polling_message?(message, recipient, now) ->
+        {200, %{"delivery" => nil}}
+
+      active_polling_delivery?(message, recipient, now) ->
+        {200, %{"delivery" => nil}}
+
+      true ->
+        lease_until = DateTime.add(now, lease_seconds, :second)
+        delivery = insert_polling_delivery!(message, recipient, lease_until)
+        delivered_message = mark_polling_message_delivered!(message)
+
+        {201, Response.delivery_claim(delivery, delivered_message)}
+    end
+  end
+
+  defp claimable_polling_message?(%Message{} = message, %Agent{} = recipient, now) do
+    message.recipient_agent_id == recipient.id and
+      message.carrier_status in ["queued", "delivered"] and
+      is_nil(message.current_ack_status) and
+      DateTime.compare(message.expires_at, now) == :gt
+  end
+
+  defp active_polling_delivery?(%Message{} = message, %Agent{} = recipient, now) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message.id)
+    |> where([delivery], delivery.recipient_agent_id == ^recipient.id)
+    |> where([delivery], delivery.status == "leased")
+    |> where([delivery], delivery.leased_until > ^now)
+    |> Repo.exists?()
+  end
+
   defp mark_polling_message_delivered!(%Message{} = message) do
     message
     |> Ecto.Changeset.change(carrier_status: "delivered")
@@ -322,7 +380,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp extend_active_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
-    delivery = lock_polling_extension_delivery(recipient, delivery_id)
+    delivery = locked_extension_delivery(recipient, delivery_id)
 
     now = DateTime.utc_now(:microsecond)
 
@@ -346,32 +404,6 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
         {:ok, 200, Response.delivery_claim(updated_delivery, delivery.message)}
     end
-  end
-
-  defp lock_polling_extension_delivery(%Agent{} = recipient, delivery_id) do
-    case extension_delivery_message_id(recipient, delivery_id) do
-      nil ->
-        nil
-
-      message_id ->
-        lock_polling_message!(message_id)
-        locked_extension_delivery(recipient, delivery_id)
-    end
-  end
-
-  defp extension_delivery_message_id(%Agent{} = recipient, delivery_id) do
-    Delivery
-    |> where([delivery], delivery.id == ^delivery_id)
-    |> where([delivery], delivery.recipient_agent_id == ^recipient.id)
-    |> select([delivery], delivery.message_id)
-    |> Repo.one()
-  end
-
-  defp lock_polling_message!(message_id) do
-    Message
-    |> where([message], message.id == ^message_id)
-    |> lock("FOR UPDATE")
-    |> Repo.one!()
   end
 
   defp locked_extension_delivery(%Agent{} = recipient, delivery_id) do

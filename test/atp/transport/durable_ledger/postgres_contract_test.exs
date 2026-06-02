@@ -286,26 +286,21 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
         assert_backend_waiting_on_lock!(backend_pid, "polling lease extension")
         wait_until_after!(claim["leased_until"])
 
-        assert {:ok, 200, %{"delivery" => nil}} =
-                 @ledger_adapter.claim_inbox(
-                   recipient,
-                   %{"lease_seconds" => 60},
-                   "claim-#{key}-while-extension-waits",
-                   @claim_route
-                 )
+        reclaim_task =
+          claim_with_backend_task(
+            self(),
+            recipient,
+            "claim-#{key}-while-extension-waits"
+          )
+
+        assert_receive {:claim_backend_pid, claim_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(claim_backend_pid, "polling reclaim")
 
         send(delivery_lock_task.pid, :release_delivery_lock)
         assert :ok = Task.await(delivery_lock_task, 5_000)
 
         assert {:error, :lease_expired} = Task.await(extend_task, 5_000)
-
-        assert {:ok, 201, reclaimed} =
-                 @ledger_adapter.claim_inbox(
-                   recipient,
-                   %{"lease_seconds" => 60},
-                   "claim-#{key}-after-extension",
-                   @claim_route
-                 )
+        assert {:ok, 201, reclaimed} = Task.await(reclaim_task, 5_000)
 
         assert reclaimed["id"] != claim["id"]
         assert reclaimed["message"]["id"] == message_id
@@ -317,6 +312,71 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
 
         assert [%Delivery{id: active_delivery_id}] = active_leases
         assert active_delivery_id == reclaimed["id"]
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
+  test "postgres adapter serializes polling lease extension with ACK", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-extend-ack-race"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling extend ACK race"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+
+        sender_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+
+        recipient_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+        sender = Repo.get!(Agent, sender_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+        sent = accept_direct_message!(sender, recipient, key)
+
+        assert {:ok, 201, claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}",
+                   @claim_route
+                 )
+
+        assert claim["message"]["id"] == sent["message"]["id"]
+
+        delivery_lock_task = lock_delivery_until_release(claim["id"], self())
+        assert_receive {:delivery_locked, delivery_id}, 5_000
+        assert delivery_id == claim["id"]
+
+        extend_task =
+          extend_with_backend_task(
+            self(),
+            recipient,
+            claim["id"],
+            key,
+            120
+          )
+
+        assert_receive {:extend_backend_pid, extend_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(extend_backend_pid, "polling lease extension")
+
+        ack_task = ack_with_backend_task(self(), recipient, claim["id"], key)
+        assert_receive {:ack_backend_pid, ack_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(ack_backend_pid, "polling ACK")
+
+        send(delivery_lock_task.pid, :release_delivery_lock)
+        assert :ok = Task.await(delivery_lock_task, 5_000)
+
+        extend_result = Task.await(extend_task, 5_000)
+        ack_result = Task.await(ack_task, 5_000)
+
+        assert match?({:ok, 200, _body}, extend_result) or
+                 extend_result == {:error, :invalid_lease}
+
+        assert {:ok, 201, acked} = ack_result
+        assert acked["ack"]["status"] == "accepted"
       after
         delete_account!(account["id"])
       end
@@ -454,25 +514,20 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
         lock_task = lock_message_until_release(first_message_id, self())
         assert_receive {:message_locked, ^first_message_id}, 5_000
 
-        assert {:ok, 200, %{"delivery" => nil}} =
-                 @ledger_adapter.claim_inbox(
-                   recipient,
-                   %{"lease_seconds" => 60},
-                   "claim-#{key}-while-first-locked",
-                   @claim_route
-                 )
+        first_claim_task =
+          claim_with_backend_task(
+            self(),
+            recipient,
+            "claim-#{key}-while-first-locked"
+          )
+
+        assert_receive {:claim_backend_pid, claim_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(claim_backend_pid, "locked earlier polling message")
 
         send(lock_task.pid, :release_message_lock)
         assert :ok = Task.await(lock_task, 5_000)
 
-        assert {:ok, 201, first_claim} =
-                 @ledger_adapter.claim_inbox(
-                   recipient,
-                   %{"lease_seconds" => 60},
-                   "claim-#{key}-first",
-                   @claim_route
-                 )
-
+        assert {:ok, 201, first_claim} = Task.await(first_claim_task, 5_000)
         assert first_claim["message"]["id"] == first_message_id
 
         assert {:ok, 201, second_claim} =
@@ -545,25 +600,20 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
         lock_task = lock_message_until_release(first_message_id, self())
         assert_receive {:message_locked, ^first_message_id}, 5_000
 
-        assert {:ok, 200, %{"delivery" => nil}} =
-                 @ledger_adapter.claim_inbox(
-                   recipient,
-                   %{"lease_seconds" => 60},
-                   "claim-#{key}-while-first-expired-locked",
-                   @claim_route
-                 )
+        first_reclaim_task =
+          claim_with_backend_task(
+            self(),
+            recipient,
+            "claim-#{key}-while-first-expired-locked"
+          )
+
+        assert_receive {:claim_backend_pid, claim_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(claim_backend_pid, "locked expired polling message")
 
         send(lock_task.pid, :release_message_lock)
         assert :ok = Task.await(lock_task, 5_000)
 
-        assert {:ok, 201, reclaimed_first} =
-                 @ledger_adapter.claim_inbox(
-                   recipient,
-                   %{"lease_seconds" => 60},
-                   "claim-#{key}-first-reclaimed",
-                   @claim_route
-                 )
-
+        assert {:ok, 201, reclaimed_first} = Task.await(first_reclaim_task, 5_000)
         assert reclaimed_first["message"]["id"] == first_message_id
 
         assert {:ok, 201, second_claim} =
@@ -699,6 +749,33 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
           %{"lease_seconds" => lease_seconds},
           "extend-#{key}",
           "POST /api/deliveries/#{delivery_id}/extend"
+        )
+      end)
+    end)
+  end
+
+  defp claim_with_backend_task(parent, recipient, key) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn ->
+        backend_pid = db_backend_pid!()
+        send(parent, {:claim_backend_pid, backend_pid})
+        @ledger_adapter.claim_inbox(recipient, %{"lease_seconds" => 60}, key, @claim_route)
+      end)
+    end)
+  end
+
+  defp ack_with_backend_task(parent, recipient, delivery_id, key) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn ->
+        backend_pid = db_backend_pid!()
+        send(parent, {:ack_backend_pid, backend_pid})
+
+        @ledger_adapter.ack_delivery(
+          recipient,
+          delivery_id,
+          %{"status" => "accepted"},
+          "ack-#{key}",
+          "POST /api/deliveries/#{delivery_id}/acks"
         )
       end)
     end)
