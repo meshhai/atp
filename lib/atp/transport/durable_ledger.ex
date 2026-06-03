@@ -149,8 +149,9 @@ defmodule Atp.Transport.DurableLedger do
   Implementations must validate requested lease duration, apply idempotency for
   the recipient, route, key, and body, return stable replay results, and expose
   at most one eligible delivery. Implementations must keep active leases hidden
-  until expiry, allow expired leases to become eligible again, keep ACKed
-  messages invisible, and preserve session order eligibility.
+  across all delivery modes until expiry, allow expired leases to become
+  eligible again, keep ACKed messages invisible, and preserve session order
+  eligibility.
   """
   @callback claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
               polling_lease_result()
@@ -169,17 +170,19 @@ defmodule Atp.Transport.DurableLedger do
   @doc """
   Claims the next due webhook delivery eligible for carrier work.
 
-  Implementations must return one current lease at most, respect active leases,
-  reclaim expired leases, and preserve session delivery order eligibility.
+  Implementations must return one current lease at most, respect active leases
+  across all delivery modes, reclaim expired leases, and preserve session
+  delivery order eligibility.
   """
   @callback claim_due_webhook_delivery(keyword()) :: due_claim_result()
 
   @doc """
   Claims a specific webhook delivery for carrier work.
 
-  Implementations must reject active leases, terminalize already-ACKed or
-  expired messages without requiring a webhook attempt, and return the same
-  carrier result shapes as the public transport facade.
+  Implementations must reject active leases across all delivery modes,
+  terminalize already-ACKed or expired messages without requiring a webhook
+  attempt, and return the same carrier result shapes as the public transport
+  facade.
   """
   @callback claim_webhook_delivery(String.t(), keyword()) :: claim_result()
 

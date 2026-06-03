@@ -849,7 +849,7 @@ defmodule Atp.WebhookAPITest do
     assert [_first_attempt, _second_attempt, %{"result" => "failed"}] = attempts
   end
 
-  test "failed webhook attempts do not downgrade polling-delivered messages", %{conn: conn} do
+  test "active polling leases block webhook delivery for the same message", %{conn: conn} do
     Req.Test.stub(WebhookDelivery, fn request_conn ->
       Plug.Conn.send_resp(request_conn, 400, "")
     end)
@@ -876,6 +876,15 @@ defmodule Atp.WebhookAPITest do
       })
 
     assert polling_delivery["message"]["id"] == webhook_delivery.message_id
+
+    assert WebhookDelivery.deliver_now(delivery_id) == {:error, :delivery_in_progress}
+    assert WebhookDelivery.deliver_due(limit: 10) == {:ok, []}
+
+    Atp.Repo.get!(Delivery, polling_delivery["id"])
+    |> Ecto.Changeset.change(
+      leased_until: DateTime.add(DateTime.utc_now(:microsecond), -1, :second)
+    )
+    |> Atp.Repo.update!()
 
     assert {:ok, delivered_message} = WebhookDelivery.deliver_now(delivery_id)
     assert delivered_message.carrier_status == "delivered"

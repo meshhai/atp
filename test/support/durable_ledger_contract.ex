@@ -116,6 +116,8 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_polling_empty_inbox, "polling-empty-inbox"},
       {"contract: polling active leases hide messages until expiry",
        :assert_polling_active_lease_reclaim, "polling-active-reclaim"},
+      {"contract: active polling leases block webhook claims for the same message",
+       :assert_polling_lease_blocks_webhook_claims, "polling-blocks-webhook"},
       {"contract: polling claims exclude ACKed and expired messages",
        :assert_polling_claim_visibility, "polling-claim-visibility"},
       {"contract: polling lease extension validates ownership and lease state",
@@ -1652,6 +1654,35 @@ defmodule Atp.Support.DurableLedgerContract do
     assert persisted_reclaim.mode == "polling"
     assert persisted_reclaim.status == "leased"
     assert persisted_reclaim.message_id == sent["message"]["id"]
+
+    :ok
+  end
+
+  @spec assert_polling_lease_blocks_webhook_claims(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_polling_lease_blocks_webhook_claims(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {webhook_delivery, message, recipient} = harness.prepare_due_webhook_delivery!(conn, key)
+
+    assert {:ok, 201, polling_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-polling-claim")
+
+    assert polling_claim["message"]["id"] == message.id
+
+    assert {:error, :delivery_in_progress} =
+             claim_delivery(adapter, webhook_delivery.id, lease_seconds: 60)
+
+    assert {:ok, nil} = claim_due(adapter, lease_seconds: 60)
+
+    polling_claim["id"]
+    |> harness.get_delivery!()
+    |> harness.expire_delivery_lease!()
+
+    assert {:ok, %DeliveryClaim{} = webhook_claim} =
+             claim_delivery(adapter, webhook_delivery.id, lease_seconds: 60)
+
+    assert webhook_claim.delivery.id == webhook_delivery.id
+    assert webhook_claim.message.id == message.id
 
     :ok
   end

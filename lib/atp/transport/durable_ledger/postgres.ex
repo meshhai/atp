@@ -1166,10 +1166,17 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp claimable_webhook_delivery_query(now) do
+    active_delivery_message_ids =
+      from(delivery in Delivery,
+        where: delivery.status == "leased" and delivery.leased_until > ^now,
+        select: delivery.message_id
+      )
+
     Delivery
     |> join(:inner, [delivery], message in assoc(delivery, :message), as: :message)
     |> where([delivery], delivery.mode == "webhook")
     |> where(^due_webhook_delivery_filter(now))
+    |> where([message: message], message.id not in subquery(active_delivery_message_ids))
     |> where(^webhook_session_order_filter())
     |> order_by([delivery], asc: delivery.inserted_at)
     |> limit(1)
@@ -1218,6 +1225,9 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       active_webhook_claim?(delivery, now) ->
         Repo.rollback(:delivery_in_progress)
 
+      active_other_delivery_claim?(delivery, now) ->
+        Repo.rollback(:delivery_in_progress)
+
       acked?(delivery.message) ->
         stop_delivery_after_ack!(delivery)
 
@@ -1237,6 +1247,15 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp active_webhook_claim?(%Delivery{}, _now), do: false
+
+  defp active_other_delivery_claim?(%Delivery{} = delivery, now) do
+    Delivery
+    |> where([other_delivery], other_delivery.message_id == ^delivery.message_id)
+    |> where([other_delivery], other_delivery.id != ^delivery.id)
+    |> where([other_delivery], other_delivery.status == "leased")
+    |> where([other_delivery], other_delivery.leased_until > ^now)
+    |> Repo.exists?()
+  end
 
   defp acked?(%Message{current_ack_status: status}), do: not is_nil(status)
 
