@@ -284,13 +284,13 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       where: message.expires_at > ^now,
       where: message.id not in subquery(active_delivery_message_ids),
       where: message.id not in subquery(delivered_webhook_message_ids),
-      where: ^polling_session_order_filter(now),
+      where: ^delivery_session_order_filter(now),
       order_by: [asc: message.inserted_at],
       limit: 1
     )
   end
 
-  defp polling_session_order_filter(now) do
+  defp delivery_session_order_filter(now) do
     dynamic(
       [message: message],
       is_nil(message.session_id) or is_nil(message.session_sequence) or
@@ -773,10 +773,11 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp ensure_session_lifecycle_delivery(%Agent{} = agent, session_id) do
     with {:ok, opening_message_id} <- opening_message_id_for_session_lifecycle(agent, session_id) do
       now = DateTime.utc_now(:microsecond)
+      lock_deliveries_for_message!(opening_message_id)
 
       case fetch_ackable_delivery(agent, opening_message_id, now) do
         %Delivery{id: delivery_id} -> {:ok, delivery_id}
-        nil -> insert_session_action_delivery(agent, opening_message_id, now)
+        nil -> prepare_session_action_delivery(agent, opening_message_id, now)
       end
     end
   end
@@ -814,6 +815,22 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          not is_nil(delivery.leased_until) and delivery.leased_until > ^now) or
         (delivery.mode == "webhook" and delivery.status == "delivered")
     )
+  end
+
+  defp prepare_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
+    if active_delivery_for_message?(opening_message_id, now) do
+      {:error, :delivery_in_progress}
+    else
+      insert_session_action_delivery(agent, opening_message_id, now)
+    end
+  end
+
+  defp active_delivery_for_message?(message_id, now) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message_id)
+    |> where([delivery], delivery.status == "leased")
+    |> where([delivery], delivery.leased_until > ^now)
+    |> Repo.exists?()
   end
 
   defp insert_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
@@ -1183,7 +1200,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> where([delivery], delivery.mode == "webhook")
     |> where(^due_webhook_delivery_filter(now))
     |> where([message: message], message.id not in subquery(active_delivery_message_ids))
-    |> where(^webhook_session_order_filter())
+    |> where(^delivery_session_order_filter(now))
     |> order_by([delivery], asc: delivery.inserted_at)
     |> limit(1)
     |> lock("FOR UPDATE SKIP LOCKED")
@@ -1196,24 +1213,6 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          (is_nil(delivery.next_attempt_at) or delivery.next_attempt_at <= ^now)) or
         (delivery.status == "leased" and not is_nil(delivery.leased_until) and
            delivery.leased_until <= ^now)
-    )
-  end
-
-  defp webhook_session_order_filter do
-    dynamic(
-      [message: message],
-      is_nil(message.session_id) or is_nil(message.session_sequence) or
-        not exists(
-          from(prior_delivery in Delivery,
-            join: prior_message in Message,
-            on: prior_message.id == prior_delivery.message_id,
-            where: prior_delivery.mode == "webhook",
-            where: prior_delivery.status not in ["delivered", "failed"],
-            where: prior_message.session_id == parent_as(:message).session_id,
-            where: prior_message.session_sequence < parent_as(:message).session_sequence,
-            select: 1
-          )
-        )
     )
   end
 

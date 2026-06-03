@@ -556,6 +556,51 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     end)
   end
 
+  test "postgres adapter does not create session lifecycle polling lease over active webhook lease",
+       %{conn: conn} do
+    {initiator, recipient} =
+      @ledger_harness.prepare_active_webhook_session_pair!(
+        conn,
+        "session-lifecycle-webhook-lease"
+      )
+
+    assert {:ok, 201, opened, %{commit_value: {session_id, webhook_delivery_id}}} =
+             @ledger_adapter.open_session(
+               initiator,
+               %{
+                 "to" => recipient.address,
+                 "payload" =>
+                   a2a_user_text(
+                     "session-lifecycle-webhook-lease-opening",
+                     "open over webhook"
+                   )
+               },
+               "open-session-lifecycle-webhook-lease",
+               "POST /api/sessions"
+             )
+
+    opening_message_id = opened["message_status"]["message"]["id"]
+
+    assert {:ok, %Atp.Transport.DeliveryClaim{} = webhook_claim} =
+             @ledger_adapter.claim_webhook_delivery(webhook_delivery_id, lease_seconds: 60)
+
+    assert webhook_claim.message.id == opening_message_id
+
+    assert {:error, :delivery_in_progress} =
+             @ledger_adapter.accept_session(
+               recipient,
+               session_id,
+               %{},
+               "accept-session-lifecycle-webhook-lease",
+               "POST /api/sessions/#{session_id}/accept"
+             )
+
+    deliveries = @ledger_harness.get_deliveries_for_message!(opening_message_id)
+
+    assert [%Delivery{id: ^webhook_delivery_id, mode: "webhook", status: "leased"}] =
+             deliveries
+  end
+
   test "postgres adapter claims polling session messages in sequence", %{conn: conn} do
     {initiator, recipient} = @ledger_harness.prepare_session_pair!(conn, "polling-session-order")
     opened = open_session!(initiator, recipient, "polling-session-order")
@@ -649,6 +694,72 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
              )
 
     assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
+  end
+
+  test "postgres adapter blocks later webhook session delivery behind expired polling-only prior",
+       %{conn: conn} do
+    {initiator, recipient} =
+      @ledger_harness.prepare_session_pair!(conn, "webhook-session-polling-prior")
+
+    opened = open_session!(initiator, recipient, "webhook-session-polling-prior")
+    session_id = opened["session"]["id"]
+
+    assert {:ok, 201, opening_claim} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 60},
+               "claim-webhook-session-polling-prior-opening",
+               @claim_route
+             )
+
+    assert {:ok, 201, _ack} =
+             @ledger_adapter.ack_delivery(
+               recipient,
+               opening_claim["id"],
+               %{"status" => "accepted"},
+               "ack-webhook-session-polling-prior-opening",
+               "POST /api/deliveries/#{opening_claim["id"]}/acks"
+             )
+
+    first = send_session_message!(initiator, session_id, "webhook-session-polling-prior-first")
+
+    assert {:ok, 201, first_claim} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 1},
+               "claim-webhook-session-polling-prior-first",
+               @claim_route
+             )
+
+    assert first_claim["message"]["id"] == first["message_status"]["message"]["id"]
+
+    first_claim["id"]
+    |> @ledger_harness.get_delivery!()
+    |> @ledger_harness.expire_delivery_lease!()
+
+    enable_webhook!(recipient, "webhook-session-polling-prior")
+
+    second = send_session_message!(initiator, session_id, "webhook-session-polling-prior-second")
+    second_message_id = second["message_status"]["message"]["id"]
+    second_webhook_delivery = get_webhook_delivery_for_message!(second_message_id)
+
+    assert {:ok, nil} = @ledger_adapter.claim_due_webhook_delivery(lease_seconds: 60)
+
+    assert {:ok, 201, reclaimed_first} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 60},
+               "claim-webhook-session-polling-prior-first-reclaim",
+               @claim_route
+             )
+
+    assert reclaimed_first["message"]["id"] == first["message_status"]["message"]["id"]
+
+    assert {:ok, %Atp.Transport.DeliveryClaim{} = second_webhook_claim} =
+             @ledger_adapter.claim_due_webhook_delivery(lease_seconds: 60)
+
+    assert second_webhook_claim.delivery.id == second_webhook_delivery.id
+    assert second_webhook_claim.message.id == second_message_id
   end
 
   test "postgres adapter does not let expired earlier session messages block polling claims", %{

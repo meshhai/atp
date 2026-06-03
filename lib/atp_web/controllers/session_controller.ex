@@ -13,6 +13,7 @@ defmodule AtpWeb.SessionController do
     message_expired: :conflict,
     invalid_ack_transition: :conflict,
     terminal_ack_status: :conflict,
+    delivery_in_progress: :conflict,
     delivery_not_delivered: :conflict,
     lease_expired: :conflict,
     unknown_sender_rate_limited: :too_many_requests,

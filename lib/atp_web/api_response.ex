@@ -10,6 +10,7 @@ defmodule AtpWeb.APIResponse do
     "agent_key_required" => "An agent API key is required for this operation.",
     "cross_account_not_supported" => "Cross-account delivery is not supported by this endpoint.",
     "delivery_not_delivered" => "The delivery has not been delivered by the carrier.",
+    "delivery_in_progress" => "The delivery is already in progress.",
     "idempotency_conflict" =>
       "The idempotency key was already used with a different request body.",
     "idempotency_in_progress" => "The idempotency key is already processing.",
