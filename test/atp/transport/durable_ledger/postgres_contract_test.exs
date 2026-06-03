@@ -727,6 +727,81 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     end)
   end
 
+  test "postgres adapter retries locked polling candidate when prior lease expires", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-session-stale-later-candidate"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling stale candidate order"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+        initiator_response = Atp.ConnCase.register_agent!(account_token, "register-#{key}-i", %{})
+        recipient_response = Atp.ConnCase.register_agent!(account_token, "register-#{key}-r", %{})
+        initiator = Repo.get!(Agent, initiator_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"])
+
+        opened = open_session!(initiator, recipient, key)
+        session_id = opened["session"]["id"]
+
+        assert {:ok, 201, opening_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-opening",
+                   @claim_route
+                 )
+
+        assert {:ok, 201, _ack} =
+                 @ledger_adapter.ack_delivery(
+                   recipient,
+                   opening_claim["id"],
+                   %{"status" => "accepted"},
+                   "ack-#{key}-opening",
+                   "POST /api/deliveries/#{opening_claim["id"]}/acks"
+                 )
+
+        first = send_session_message!(initiator, session_id, "#{key}-first")
+        second = send_session_message!(initiator, session_id, "#{key}-second")
+        first_message_id = first["message_status"]["message"]["id"]
+        second_message_id = second["message_status"]["message"]["id"]
+
+        assert {:ok, 201, first_claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 60},
+                   "claim-#{key}-first-initial",
+                   @claim_route
+                 )
+
+        assert first_claim["message"]["id"] == first_message_id
+
+        lock_task = lock_message_until_release(second_message_id, self())
+        assert_receive {:message_locked, ^second_message_id}, 5_000
+
+        later_claim_task =
+          claim_with_backend_task(
+            self(),
+            recipient,
+            "claim-#{key}-while-second-locked"
+          )
+
+        assert_receive {:claim_backend_pid, claim_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(claim_backend_pid, "locked stale later polling message")
+
+        first_claim["id"]
+        |> @ledger_harness.get_delivery!()
+        |> @ledger_harness.expire_delivery_lease!()
+
+        send(lock_task.pid, :release_message_lock)
+        assert :ok = Task.await(lock_task, 5_000)
+
+        assert {:ok, 201, reclaimed_first} = Task.await(later_claim_task, 5_000)
+        assert reclaimed_first["message"]["id"] == first_message_id
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   defp accept_direct_message!(sender, recipient, key) do
     assert {:ok, 201, body, _prepared} =
              @ledger_adapter.accept_direct_message(

@@ -363,35 +363,21 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp claim_locked_polling_message!(%Message{} = message, %Agent{} = recipient, lease_seconds) do
     now = DateTime.utc_now(:microsecond)
 
-    cond do
-      not claimable_polling_message?(message, recipient, now) ->
-        :retry
+    if claimable_polling_message?(message, recipient, now) do
+      lease_until = DateTime.add(now, lease_seconds, :second)
+      delivery = insert_polling_delivery!(message, recipient, lease_until)
+      delivered_message = mark_polling_message_delivered!(message)
 
-      active_polling_delivery?(message, recipient, now) ->
-        :retry
-
-      true ->
-        lease_until = DateTime.add(now, lease_seconds, :second)
-        delivery = insert_polling_delivery!(message, recipient, lease_until)
-        delivered_message = mark_polling_message_delivered!(message)
-
-        {201, Response.delivery_claim(delivery, delivered_message)}
+      {201, Response.delivery_claim(delivery, delivered_message)}
+    else
+      :retry
     end
   end
 
   defp claimable_polling_message?(%Message{} = message, %Agent{} = recipient, now) do
-    message.recipient_agent_id == recipient.id and
-      message.carrier_status in ["queued", "delivered"] and
-      is_nil(message.current_ack_status) and
-      DateTime.compare(message.expires_at, now) == :gt
-  end
-
-  defp active_polling_delivery?(%Message{} = message, %Agent{} = recipient, now) do
-    Delivery
-    |> where([delivery], delivery.message_id == ^message.id)
-    |> where([delivery], delivery.recipient_agent_id == ^recipient.id)
-    |> where([delivery], delivery.status == "leased")
-    |> where([delivery], delivery.leased_until > ^now)
+    recipient
+    |> claimable_polling_message_query(now)
+    |> where([message: claimable_message], claimable_message.id == ^message.id)
     |> Repo.exists?()
   end
 
