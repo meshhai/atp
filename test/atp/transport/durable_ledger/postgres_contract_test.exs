@@ -118,6 +118,61 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     end)
   end
 
+  test "postgres adapter rechecks polling eligibility after webhook delivery lease commits", %{
+    conn: conn
+  } do
+    unboxed_repo(fn ->
+      key = "polling-webhook-lease-race"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling webhook lease race"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+
+        sender_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+
+        recipient_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+        sender = Repo.get!(Agent, sender_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"]) |> enable_webhook!(key)
+        sent = accept_direct_message!(sender, recipient, key)
+        message_id = sent["message"]["id"]
+        webhook_delivery = get_webhook_delivery_for_message!(message_id)
+
+        webhook_lease_task =
+          lease_delivery_until_release(webhook_delivery.id, self(), key)
+
+        assert_receive {:delivery_leased, delivery_id}, 5_000
+        assert delivery_id == webhook_delivery.id
+
+        polling_claim_task =
+          claim_with_backend_task(
+            self(),
+            recipient,
+            "claim-#{key}-while-webhook-lease-waits"
+          )
+
+        assert_receive {:claim_backend_pid, claim_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(claim_backend_pid, "polling claim webhook lease")
+
+        send(webhook_lease_task.pid, :release_delivery_lock)
+        assert :ok = Task.await(webhook_lease_task, 5_000)
+
+        assert {:ok, 200, %{"delivery" => nil}} = Task.await(polling_claim_task, 5_000)
+
+        polling_deliveries =
+          message_id
+          |> @ledger_harness.get_deliveries_for_message!()
+          |> Enum.filter(&(&1.mode == "polling"))
+
+        assert polling_deliveries == []
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   test "postgres adapter keeps ACKed and expired messages out of polling claims", %{conn: conn} do
     {sender, recipient} = @ledger_harness.prepare_direct_message_pair!(conn, "polling-invisible")
     acked = accept_direct_message!(sender, recipient, "polling-invisible-acked")
@@ -880,6 +935,34 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
       Repo.transaction(fn ->
         lock_delivery!(delivery_id)
         send(parent, {:delivery_locked, delivery_id})
+        assert_receive :release_delivery_lock, 5_000
+      end)
+  end
+
+  defp lease_delivery_until_release(delivery_id, parent, key) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn -> hold_leased_delivery_lock!(delivery_id, parent, key) end)
+      :ok
+    end)
+  end
+
+  defp hold_leased_delivery_lock!(delivery_id, parent, key) do
+    {:ok, :release_delivery_lock} =
+      Repo.transaction(fn ->
+        delivery = lock_delivery!(delivery_id)
+        now = DateTime.utc_now(:microsecond)
+
+        delivery
+        |> Ecto.Changeset.change(
+          status: "leased",
+          claim_token: "dcl_#{key}",
+          claimed_at: now,
+          leased_until: DateTime.add(now, 60, :second),
+          attempt_count: delivery.attempt_count + 1
+        )
+        |> Repo.update!()
+
+        send(parent, {:delivery_leased, delivery_id})
         assert_receive :release_delivery_lock, 5_000
       end)
   end

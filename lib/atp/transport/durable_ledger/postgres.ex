@@ -333,7 +333,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp claim_polling_message!(message_id, %Agent{} = recipient, lease_seconds) do
-    lock_polling_deliveries_for_message!(message_id)
+    lock_deliveries_for_message!(message_id)
 
     case lock_polling_message(message_id) do
       nil ->
@@ -344,10 +344,9 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end
   end
 
-  defp lock_polling_deliveries_for_message!(message_id) do
+  defp lock_deliveries_for_message!(message_id) do
     Delivery
     |> where([delivery], delivery.message_id == ^message_id)
-    |> where([delivery], delivery.mode == "polling")
     |> order_by([delivery], asc: delivery.inserted_at)
     |> lock("FOR UPDATE")
     |> Repo.all()
