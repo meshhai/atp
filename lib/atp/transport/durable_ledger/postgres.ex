@@ -268,6 +268,14 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         select: delivery.message_id
       )
 
+    delivered_webhook_message_ids =
+      from(delivery in Delivery,
+        where:
+          delivery.recipient_agent_id == ^recipient.id and delivery.mode == "webhook" and
+            delivery.status == "delivered",
+        select: delivery.message_id
+      )
+
     from(message in Message,
       as: :message,
       where: message.recipient_agent_id == ^recipient.id,
@@ -275,6 +283,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       where: is_nil(message.current_ack_status),
       where: message.expires_at > ^now,
       where: message.id not in subquery(active_delivery_message_ids),
+      where: message.id not in subquery(delivered_webhook_message_ids),
       where: ^polling_session_order_filter(now),
       order_by: [asc: message.inserted_at],
       limit: 1
@@ -287,18 +296,24 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       is_nil(message.session_id) or is_nil(message.session_sequence) or
         not exists(
           from(prior_message in Message,
-            left_join: active_delivery in Delivery,
+            left_join: active_polling_delivery in Delivery,
             on:
-              active_delivery.message_id == prior_message.id and
-                active_delivery.mode == "polling" and
-                active_delivery.status == "leased" and
-                active_delivery.leased_until > ^now,
+              active_polling_delivery.message_id == prior_message.id and
+                active_polling_delivery.mode == "polling" and
+                active_polling_delivery.status == "leased" and
+                active_polling_delivery.leased_until > ^now,
+            left_join: delivered_webhook_delivery in Delivery,
+            on:
+              delivered_webhook_delivery.message_id == prior_message.id and
+                delivered_webhook_delivery.mode == "webhook" and
+                delivered_webhook_delivery.status == "delivered",
             where: prior_message.session_id == parent_as(:message).session_id,
             where: prior_message.session_sequence < parent_as(:message).session_sequence,
             where: prior_message.carrier_status in ["queued", "delivered"],
             where: is_nil(prior_message.current_ack_status),
             where: prior_message.expires_at > ^now,
-            where: is_nil(active_delivery.id),
+            where: is_nil(active_polling_delivery.id),
+            where: is_nil(delivered_webhook_delivery.id),
             select: 1
           )
         )

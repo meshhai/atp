@@ -482,6 +482,52 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
   end
 
+  test "postgres adapter allows polling after prior session message was delivered by webhook", %{
+    conn: conn
+  } do
+    {initiator, recipient} =
+      @ledger_harness.prepare_session_pair!(conn, "polling-session-after-webhook")
+
+    opened = open_session!(initiator, recipient, "polling-session-after-webhook")
+    session_id = opened["session"]["id"]
+
+    assert {:ok, 201, opening_claim} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 60},
+               "claim-polling-session-after-webhook-opening",
+               @claim_route
+             )
+
+    assert {:ok, 201, _ack} =
+             @ledger_adapter.ack_delivery(
+               recipient,
+               opening_claim["id"],
+               %{"status" => "accepted"},
+               "ack-polling-session-after-webhook-opening",
+               "POST /api/deliveries/#{opening_claim["id"]}/acks"
+             )
+
+    webhook_recipient = enable_webhook!(recipient, "polling-session-after-webhook")
+    first = send_session_message!(initiator, session_id, "polling-session-after-webhook-first")
+    first_message = @ledger_harness.get_message!(first["message_status"]["message"]["id"])
+    first_delivery = get_webhook_delivery_for_message!(first_message.id)
+    mark_webhook_delivery_delivered!(first_delivery, first_message)
+
+    disable_webhook!(webhook_recipient)
+    second = send_session_message!(initiator, session_id, "polling-session-after-webhook-second")
+
+    assert {:ok, 201, second_claim} =
+             @ledger_adapter.claim_inbox(
+               recipient,
+               %{"lease_seconds" => 60},
+               "claim-polling-session-after-webhook-second",
+               @claim_route
+             )
+
+    assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
+  end
+
   test "postgres adapter does not let expired earlier session messages block polling claims", %{
     conn: conn
   } do
@@ -829,6 +875,41 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
         )
       end)
     end)
+  end
+
+  defp enable_webhook!(%Agent{} = agent, key) do
+    agent
+    |> Ecto.Changeset.change(
+      webhook_active: true,
+      webhook_url: "https://recipient.example.test/atp/#{key}",
+      webhook_secret: "whsec_#{key}"
+    )
+    |> Repo.update!()
+  end
+
+  defp disable_webhook!(%Agent{} = agent) do
+    agent
+    |> Ecto.Changeset.change(webhook_active: false)
+    |> Repo.update!()
+  end
+
+  defp get_webhook_delivery_for_message!(message_id) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message_id)
+    |> where([delivery], delivery.mode == "webhook")
+    |> Repo.one!()
+  end
+
+  defp mark_webhook_delivery_delivered!(%Delivery{} = delivery, %Message{} = message) do
+    now = DateTime.utc_now(:microsecond)
+
+    delivery
+    |> Ecto.Changeset.change(status: "delivered", delivered_at: now)
+    |> Repo.update!()
+
+    message
+    |> Ecto.Changeset.change(carrier_status: "delivered")
+    |> Repo.update!()
   end
 
   defp unboxed_repo(fun), do: Sandbox.unboxed_run(Repo, fun)
