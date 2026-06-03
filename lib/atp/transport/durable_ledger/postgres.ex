@@ -388,6 +388,13 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp extend_active_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
+    Repo.transaction(fn ->
+      extend_locked_polling_delivery(recipient, delivery_id, lease_seconds)
+    end)
+    |> unwrap_extension_transaction_result()
+  end
+
+  defp extend_locked_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
     delivery = locked_extension_delivery(recipient, delivery_id)
 
     now = DateTime.utc_now(:microsecond)
@@ -428,6 +435,9 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp unwrap_polling_transaction_result({:ok, {status, body}}), do: {:ok, status, body}
   defp unwrap_polling_transaction_result({:error, reason}), do: {:error, reason}
+
+  defp unwrap_extension_transaction_result({:ok, result}), do: result
+  defp unwrap_extension_transaction_result({:error, reason}), do: {:error, reason}
 
   defp prepared_session_intake_response(body, %Session{}, nil), do: {:ok, 201, body}
 
