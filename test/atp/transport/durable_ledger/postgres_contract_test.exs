@@ -423,6 +423,74 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
     end)
   end
 
+  test "postgres adapter serializes polling lease extension with webhook claim", %{conn: conn} do
+    unboxed_repo(fn ->
+      key = "polling-extend-webhook-race"
+      account = Atp.ConnCase.create_account!(conn, %{"name" => "Polling extend webhook race"})
+
+      try do
+        account_token = account["account_api_key"]["token"]
+
+        sender_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-sender", %{})
+
+        recipient_response =
+          Atp.ConnCase.register_agent!(account_token, "register-#{key}-recipient", %{})
+
+        sender = Repo.get!(Agent, sender_response["id"])
+        recipient = Repo.get!(Agent, recipient_response["id"]) |> enable_webhook!(key)
+        sent = accept_direct_message!(sender, recipient, key)
+        message_id = sent["message"]["id"]
+        webhook_delivery = get_webhook_delivery_for_message!(message_id)
+
+        assert {:ok, 201, claim} =
+                 @ledger_adapter.claim_inbox(
+                   recipient,
+                   %{"lease_seconds" => 1},
+                   "claim-#{key}",
+                   @claim_route
+                 )
+
+        assert claim["message"]["id"] == message_id
+
+        extension_lock_task =
+          extend_delivery_lease_until_release(
+            claim["id"],
+            self(),
+            120
+          )
+
+        assert_receive {:delivery_extended, delivery_id}, 5_000
+        assert delivery_id == claim["id"]
+        wait_until_after!(claim["leased_until"])
+
+        webhook_claim_task =
+          claim_webhook_with_backend_task(
+            self(),
+            webhook_delivery.id
+          )
+
+        assert_receive {:webhook_claim_backend_pid, webhook_claim_backend_pid}, 5_000
+        assert_backend_waiting_on_lock!(webhook_claim_backend_pid, "webhook claim")
+
+        send(extension_lock_task.pid, :release_delivery_lock)
+        assert :ok = Task.await(extension_lock_task, 5_000)
+
+        assert {:error, :delivery_in_progress} = Task.await(webhook_claim_task, 5_000)
+
+        active_leases =
+          message_id
+          |> @ledger_harness.get_deliveries_for_message!()
+          |> Enum.filter(&active_polling_lease?/1)
+
+        assert [%Delivery{id: active_delivery_id}] = active_leases
+        assert active_delivery_id == claim["id"]
+      after
+        delete_account!(account["id"])
+      end
+    end)
+  end
+
   test "postgres adapter serializes polling lease extension with ACK", %{conn: conn} do
     unboxed_repo(fn ->
       key = "polling-extend-ack-race"
@@ -967,6 +1035,32 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
       end)
   end
 
+  defp extend_delivery_lease_until_release(delivery_id, parent, lease_seconds) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn ->
+        hold_extended_delivery_lease!(delivery_id, parent, lease_seconds)
+      end)
+
+      :ok
+    end)
+  end
+
+  defp hold_extended_delivery_lease!(delivery_id, parent, lease_seconds) do
+    {:ok, :release_delivery_lock} =
+      Repo.transaction(fn ->
+        delivery = lock_delivery!(delivery_id)
+
+        delivery
+        |> Ecto.Changeset.change(
+          leased_until: DateTime.add(delivery.leased_until, lease_seconds, :second)
+        )
+        |> Repo.update!()
+
+        send(parent, {:delivery_extended, delivery_id})
+        assert_receive :release_delivery_lock, 5_000
+      end)
+  end
+
   defp lock_delivery!(delivery_id) do
     Delivery
     |> where([delivery], delivery.id == ^delivery_id)
@@ -1014,6 +1108,16 @@ defmodule Atp.Transport.DurableLedger.PostgresContractTest do
         backend_pid = db_backend_pid!()
         send(parent, {:claim_backend_pid, backend_pid})
         @ledger_adapter.claim_inbox(recipient, %{"lease_seconds" => 60}, key, @claim_route)
+      end)
+    end)
+  end
+
+  defp claim_webhook_with_backend_task(parent, delivery_id) do
+    Task.async(fn ->
+      checked_out_unboxed_repo(fn ->
+        backend_pid = db_backend_pid!()
+        send(parent, {:webhook_claim_backend_pid, backend_pid})
+        @ledger_adapter.claim_webhook_delivery(delivery_id, lease_seconds: 60)
       end)
     end)
   end

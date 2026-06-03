@@ -1093,7 +1093,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp claim_locked_webhook_delivery!(delivery_id, now, lease_seconds) do
-    case locked_webhook_delivery(delivery_id) do
+    case fetch_webhook_delivery(delivery_id) do
       nil ->
         Repo.rollback(:not_found)
 
@@ -1165,6 +1165,12 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> Repo.one()
   end
 
+  defp fetch_webhook_delivery(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id and delivery.mode == "webhook")
+    |> Repo.one()
+  end
+
   defp claimable_webhook_delivery_query(now) do
     active_delivery_message_ids =
       from(delivery in Delivery,
@@ -1216,8 +1222,29 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          %DateTime{} = now,
          lease_seconds
        ) do
-    delivery = Repo.preload(delivery, :message)
+    case lock_webhook_delivery_family(delivery) do
+      nil ->
+        Repo.rollback(:not_found)
 
+      %Delivery{} = locked_delivery ->
+        claim_or_terminalize_locked_webhook_delivery!(locked_delivery, now, lease_seconds)
+    end
+  end
+
+  defp lock_webhook_delivery_family(%Delivery{id: delivery_id, message_id: message_id}) do
+    lock_deliveries_for_message!(message_id)
+
+    case locked_webhook_delivery(delivery_id) do
+      nil -> nil
+      %Delivery{} = locked_delivery -> Repo.preload(locked_delivery, :message)
+    end
+  end
+
+  defp claim_or_terminalize_locked_webhook_delivery!(
+         %Delivery{} = delivery,
+         %DateTime{} = now,
+         lease_seconds
+       ) do
     cond do
       delivery.status in ["delivered", "failed"] ->
         delivery.message
