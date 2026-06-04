@@ -44,88 +44,6 @@ defmodule Atp.Transport.Ledger do
     Response.session_transcript(session, messages, viewer)
   end
 
-  @spec expire_pending_opening_session(String.t(), DateTime.t()) ::
-          {:ok, Session.t()}
-          | {:error, :not_found | :opening_session_not_due | :session_not_pending}
-  def expire_pending_opening_session(session_id, %DateTime{} = now) when is_binary(session_id) do
-    Repo.transaction(fn ->
-      with {:ok, message} <- lock_opening_message_for_session(session_id),
-           {:ok, session} <- lock_pending_session_for_opening_message(session_id, message.id) do
-        expire_locked_pending_opening_session(session, message, now)
-      else
-        {:error, reason} -> Repo.rollback(reason)
-      end
-    end)
-    |> case do
-      {:ok, %Session{} = session} -> {:ok, session}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp lock_opening_message_for_session(session_id) do
-    Session
-    |> where([session], session.id == ^session_id)
-    |> select([session], %{
-      status: session.status,
-      opening_message_id: session.opening_message_id
-    })
-    |> Repo.one()
-    |> case do
-      nil ->
-        {:error, :not_found}
-
-      %{status: "pending", opening_message_id: opening_message_id}
-      when is_binary(opening_message_id) ->
-        lock_opening_message(opening_message_id)
-
-      _session ->
-        {:error, :session_not_pending}
-    end
-  end
-
-  defp lock_opening_message(opening_message_id) do
-    Message
-    |> where([message], message.id == ^opening_message_id)
-    |> lock("FOR UPDATE")
-    |> Repo.one()
-    |> case do
-      %Message{} = message -> {:ok, message}
-      nil -> {:error, :session_not_pending}
-    end
-  end
-
-  defp lock_pending_session_for_opening_message(session_id, opening_message_id) do
-    Session
-    |> where([session], session.id == ^session_id)
-    |> lock("FOR UPDATE")
-    |> Repo.one()
-    |> case do
-      nil ->
-        {:error, :not_found}
-
-      %Session{status: "pending", opening_message_id: ^opening_message_id} = session ->
-        {:ok, session}
-
-      %Session{} ->
-        {:error, :session_not_pending}
-    end
-  end
-
-  defp expire_locked_pending_opening_session(
-         %Session{} = session,
-         %Message{expires_at: expires_at} = message,
-         now
-       ) do
-    if DateTime.compare(expires_at, now) == :gt do
-      Repo.rollback(:opening_session_not_due)
-    else
-      {:ok, _message} = expire_opening_message(message, now)
-      {:ok, expired_session} = fail_pending_opening_session(session, now)
-
-      expired_session
-    end
-  end
-
   @spec get_message_status(Agent.t(), String.t()) :: {:ok, map()} | {:error, :not_found}
   def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
     case Repo.get(Message, message_id) do
@@ -155,24 +73,4 @@ defmodule Atp.Transport.Ledger do
 
   defp ensure_own_agent(%Agent{id: agent_id}, agent_id), do: :ok
   defp ensure_own_agent(%Agent{}, _agent_id), do: {:error, :not_found}
-
-  defp expire_opening_message(%Message{carrier_status: status} = message, now)
-       when status in ~w(queued delivered delivery_failed) do
-    message
-    |> Ecto.Changeset.change(carrier_status: "expired", terminal_at: now)
-    |> Repo.update()
-  end
-
-  defp expire_opening_message(%Message{} = message, _now), do: {:ok, message}
-
-  defp fail_pending_opening_session(%Session{status: "pending"} = session, now) do
-    terminalize_pending_opening_session(session, "failed", now)
-  end
-
-  defp terminalize_pending_opening_session(%Session{status: "pending"} = session, status, now)
-       when status in ~w(failed rejected) do
-    session
-    |> Session.changeset(%{status: status, terminal_at: now})
-    |> Repo.update()
-  end
 end

@@ -152,6 +152,24 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   @impl DurableLedger
+  @spec expire_pending_opening_session(String.t(), DateTime.t()) ::
+          DurableLedger.pending_opening_expiry_result()
+  def expire_pending_opening_session(session_id, %DateTime{} = now) when is_binary(session_id) do
+    Repo.transaction(fn ->
+      with {:ok, message} <- lock_opening_message_for_session(session_id),
+           {:ok, session} <- lock_pending_session_for_opening_message(session_id, message.id) do
+        expire_locked_pending_opening_session(session, message, now)
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, %Session{} = session} -> {:ok, session}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl DurableLedger
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
@@ -1092,6 +1110,70 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       )
 
     {:ok, Repo.one(query)}
+  end
+
+  defp lock_opening_message_for_session(session_id) do
+    Session
+    |> where([session], session.id == ^session_id)
+    |> select([session], %{
+      status: session.status,
+      opening_message_id: session.opening_message_id
+    })
+    |> Repo.one()
+    |> case do
+      nil ->
+        {:error, :not_found}
+
+      %{status: "pending", opening_message_id: opening_message_id}
+      when is_binary(opening_message_id) ->
+        lock_opening_message(opening_message_id)
+
+      _session ->
+        {:error, :session_not_pending}
+    end
+  end
+
+  defp lock_opening_message(opening_message_id) do
+    Message
+    |> where([message], message.id == ^opening_message_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      %Message{} = message -> {:ok, message}
+      nil -> {:error, :session_not_pending}
+    end
+  end
+
+  defp lock_pending_session_for_opening_message(session_id, opening_message_id) do
+    Session
+    |> where([session], session.id == ^session_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      nil ->
+        {:error, :not_found}
+
+      %Session{status: "pending", opening_message_id: ^opening_message_id} = session ->
+        {:ok, session}
+
+      %Session{} ->
+        {:error, :session_not_pending}
+    end
+  end
+
+  defp expire_locked_pending_opening_session(
+         %Session{} = session,
+         %Message{expires_at: expires_at} = message,
+         now
+       ) do
+    if DateTime.compare(expires_at, now) == :gt do
+      Repo.rollback(:opening_session_not_due)
+    else
+      {:ok, _message} = expire_opening_message(message, now)
+      {:ok, expired_session} = fail_pending_opening_session(session, now)
+
+      expired_session
+    end
   end
 
   defp expire_due_opening_session(

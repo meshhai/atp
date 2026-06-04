@@ -3,7 +3,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
 
   use GenServer
 
-  alias Atp.Transport.{DurableLedger, Ledger, Session, SessionIntake}
+  alias Atp.Transport.{DurableLedger, Session, SessionIntake}
   alias Atp.Transport.Runtime.SessionState
 
   @registry Atp.Transport.Runtime.SessionRegistry
@@ -212,7 +212,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
       ) do
     now = DateTime.utc_now(:microsecond)
 
-    case Ledger.expire_pending_opening_session(session_id, now) do
+    case DurableLedger.expire_pending_opening_session(session_id, now) do
       {:ok, %Session{} = session} ->
         refreshed_state =
           state

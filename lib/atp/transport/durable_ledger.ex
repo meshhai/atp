@@ -32,6 +32,9 @@ defmodule Atp.Transport.DurableLedger do
   @type open_session_fetch_result :: {:ok, Session.t()} | {:error, :not_found | :session_not_open}
   @type runtime_session_fetch_result ::
           {:ok, Session.t()} | {:error, :not_found | :session_not_active}
+  @type pending_opening_expiry_result ::
+          {:ok, Session.t()}
+          | {:error, :not_found | :opening_session_not_due | :session_not_pending}
   @type sender_policy_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
@@ -133,6 +136,15 @@ defmodule Atp.Transport.DurableLedger do
   Lists pending sessions that have opening messages and need live timer hydration.
   """
   @callback list_pending_session_ids() :: [String.t()]
+
+  @doc """
+  Expires a due pending opening session in the durable carrier ledger.
+
+  Implementations must atomically expire the opening message and fail the
+  pending session only when the opening message is due.
+  """
+  @callback expire_pending_opening_session(String.t(), DateTime.t()) ::
+              pending_opening_expiry_result()
 
   @doc """
   Accepts a pending session opening in the durable carrier ledger.
@@ -322,6 +334,12 @@ defmodule Atp.Transport.DurableLedger do
   @spec list_pending_session_ids() :: [String.t()]
   def list_pending_session_ids do
     adapter().list_pending_session_ids()
+  end
+
+  @spec expire_pending_opening_session(String.t(), DateTime.t()) ::
+          pending_opening_expiry_result()
+  def expire_pending_opening_session(session_id, %DateTime{} = now) when is_binary(session_id) do
+    adapter().expire_pending_opening_session(session_id, now)
   end
 
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::

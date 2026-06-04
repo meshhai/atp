@@ -146,6 +146,13 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def expire_pending_opening_session(session_id, now) do
+      notify_configured_test_pid({:expire_pending_opening_session, session_id, now})
+
+      {:ok, %Session{id: session_id, status: "failed", terminal_at: now}}
+    end
+
+    @impl DurableLedger
     def opening_session_id_for_delivery(agent, delivery_id) do
       notify_configured_test_pid({:opening_session_id_for_delivery, agent, delivery_id})
 
@@ -517,6 +524,13 @@ defmodule Atp.DurableLedgerTest do
     assert ["ses_pending_configured"] = DurableLedger.list_pending_session_ids()
 
     assert_received :list_pending_session_ids
+
+    now = DateTime.utc_now(:microsecond)
+
+    assert {:ok, %Session{id: "ses_expired_configured", status: "failed", terminal_at: ^now}} =
+             DurableLedger.expire_pending_opening_session("ses_expired_configured", now)
+
+    assert_received {:expire_pending_opening_session, "ses_expired_configured", ^now}
 
     assert "ses_opening_configured" =
              DurableLedger.opening_session_id_for_delivery(agent, "dlv_configured")

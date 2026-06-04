@@ -217,6 +217,15 @@ defmodule Atp.ArchitectureTest do
     refute {:fetch_runtime_session, 1} in ledger_functions
     refute {:list_pending_session_ids, 0} in ledger_functions
     refute {:opening_session_id_for_delivery, 2} in ledger_functions
+    refute {:expire_pending_opening_session, 2} in ledger_functions
+  end
+
+  test "session runtime routes pending opening expiry through durable ledger" do
+    session_server_source = File.read!("lib/atp/transport/runtime/session_server.ex")
+    session_server_lines = String.split(session_server_source, "\n")
+
+    assert session_server_source =~ "DurableLedger.expire_pending_opening_session"
+    refute legacy_call?(session_server_lines, "expire_pending_opening_session")
   end
 
   test "Postgres durable ledger keeps ACK mutation in one state-machine flow" do
