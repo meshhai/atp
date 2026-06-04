@@ -3,7 +3,7 @@ defmodule Atp.DurableLedgerTest do
 
   alias Atp.Identity.Agent
   alias Atp.Transport
-  alias Atp.Transport.{Delivery, DeliveryClaim, Message}
+  alias Atp.Transport.{Delivery, DeliveryClaim, Message, Session}
   alias Atp.Transport.DurableLedger
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
@@ -122,6 +122,34 @@ defmodule Atp.DurableLedgerTest do
          "session" => %{"id" => session_id, "status" => "pending"},
          "messages" => []
        }}
+    end
+
+    @impl DurableLedger
+    def fetch_open_session(session_id) do
+      notify_configured_test_pid({:fetch_open_session, session_id})
+
+      {:ok, %Session{id: session_id, status: "open"}}
+    end
+
+    @impl DurableLedger
+    def fetch_runtime_session(session_id) do
+      notify_configured_test_pid({:fetch_runtime_session, session_id})
+
+      {:ok, %Session{id: session_id, status: "pending"}}
+    end
+
+    @impl DurableLedger
+    def list_pending_session_ids do
+      notify_configured_test_pid(:list_pending_session_ids)
+
+      ["ses_pending_configured"]
+    end
+
+    @impl DurableLedger
+    def opening_session_id_for_delivery(agent, delivery_id) do
+      notify_configured_test_pid({:opening_session_id_for_delivery, agent, delivery_id})
+
+      "ses_opening_configured"
     end
 
     @impl DurableLedger
@@ -463,6 +491,37 @@ defmodule Atp.DurableLedgerTest do
       "policy-key",
       "PUT /api/agents/agt_public_read/sender_policies"
     }
+  end
+
+  test "durable ledger delegates runtime session helpers to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+    Application.put_env(:atp, RecordingLedger, test_pid: self())
+
+    agent = %Agent{
+      id: "agt_runtime_helper",
+      account_id: "acc_runtime_helper",
+      address: "atp://agent/agt_runtime_helper",
+      status: "active"
+    }
+
+    assert {:ok, %Session{id: "ses_open_configured", status: "open"}} =
+             DurableLedger.fetch_open_session("ses_open_configured")
+
+    assert_received {:fetch_open_session, "ses_open_configured"}
+
+    assert {:ok, %Session{id: "ses_runtime_configured", status: "pending"}} =
+             DurableLedger.fetch_runtime_session("ses_runtime_configured")
+
+    assert_received {:fetch_runtime_session, "ses_runtime_configured"}
+
+    assert ["ses_pending_configured"] = DurableLedger.list_pending_session_ids()
+
+    assert_received :list_pending_session_ids
+
+    assert "ses_opening_configured" =
+             DurableLedger.opening_session_id_for_delivery(agent, "dlv_configured")
+
+    assert_received {:opening_session_id_for_delivery, ^agent, "dlv_configured"}
   end
 
   test "transport facade delegates public status reads and sender policies to the durable ledger" do

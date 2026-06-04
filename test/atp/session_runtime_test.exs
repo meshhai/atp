@@ -157,6 +157,21 @@ defmodule Atp.SessionRuntimeTest do
     def get_session(_agent, _session_id), do: {:error, :unexpected_get_session}
 
     @impl DurableLedger
+    def fetch_open_session(session_id), do: DurableLedger.Postgres.fetch_open_session(session_id)
+
+    @impl DurableLedger
+    def fetch_runtime_session(session_id),
+      do: DurableLedger.Postgres.fetch_runtime_session(session_id)
+
+    @impl DurableLedger
+    def list_pending_session_ids, do: DurableLedger.Postgres.list_pending_session_ids()
+
+    @impl DurableLedger
+    def opening_session_id_for_delivery(agent, delivery_id) do
+      DurableLedger.Postgres.opening_session_id_for_delivery(agent, delivery_id)
+    end
+
+    @impl DurableLedger
     def upsert_sender_policy(_recipient, _agent_id, _params, _idempotency_key, _route) do
       {:error, :unexpected_sender_policy}
     end

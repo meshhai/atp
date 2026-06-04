@@ -12,7 +12,6 @@ defmodule Atp.Transport.Ledger do
   alias Atp.Repo
 
   alias Atp.Transport.{
-    Delivery,
     Message,
     Response,
     SenderPolicies,
@@ -43,42 +42,6 @@ defmodule Atp.Transport.Ledger do
       |> Repo.all()
 
     Response.session_transcript(session, messages, viewer)
-  end
-
-  @spec fetch_open_session(String.t()) ::
-          {:ok, Session.t()} | {:error, :not_found | :session_not_open}
-  def fetch_open_session(session_id) when is_binary(session_id) do
-    case Repo.get(Session, session_id) do
-      %Session{status: "open"} = session -> {:ok, session}
-      %Session{} -> {:error, :session_not_open}
-      nil -> {:error, :not_found}
-    end
-  end
-
-  @spec fetch_runtime_session(String.t()) ::
-          {:ok, Session.t()} | {:error, :not_found | :session_not_active}
-  def fetch_runtime_session(session_id) when is_binary(session_id) do
-    case Session |> Repo.get(session_id) |> Repo.preload(:opening_message) do
-      %Session{status: status} = session when status in ~w(pending open) ->
-        {:ok, session}
-
-      %Session{} ->
-        {:error, :session_not_active}
-
-      nil ->
-        {:error, :not_found}
-    end
-  end
-
-  @doc false
-  @spec list_pending_session_ids() :: [String.t()]
-  def list_pending_session_ids do
-    Session
-    |> where([session], session.status == "pending")
-    |> where([session], not is_nil(session.opening_message_id))
-    |> order_by([session], asc: session.inserted_at)
-    |> select([session], session.id)
-    |> Repo.all()
   end
 
   @spec expire_pending_opening_session(String.t(), DateTime.t()) ::
@@ -161,21 +124,6 @@ defmodule Atp.Transport.Ledger do
 
       expired_session
     end
-  end
-
-  @doc false
-  @spec opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
-  def opening_session_id_for_delivery(%Agent{} = agent, delivery_id)
-      when is_binary(delivery_id) do
-    Delivery
-    |> where([delivery], delivery.id == ^delivery_id)
-    |> where([delivery], delivery.recipient_agent_id == ^agent.id)
-    |> join(:inner, [delivery], message in assoc(delivery, :message))
-    |> join(:inner, [_delivery, message], session in Session,
-      on: session.id == message.session_id and session.opening_message_id == message.id
-    )
-    |> select([_delivery, _message, session], session.id)
-    |> Repo.one()
   end
 
   @spec get_message_status(Agent.t(), String.t()) :: {:ok, map()} | {:error, :not_found}

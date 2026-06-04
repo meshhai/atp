@@ -9,7 +9,7 @@ defmodule Atp.Transport.Runtime do
   require Logger
 
   alias Atp.Identity.Agent
-  alias Atp.Transport.{DurableLedger, Ledger, SessionIntake}
+  alias Atp.Transport.{DurableLedger, SessionIntake}
   alias Atp.Transport.Runtime.SessionServer
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
@@ -85,7 +85,7 @@ defmodule Atp.Transport.Runtime do
   @spec ensure_session_started(String.t()) ::
           {:ok, pid()} | {:error, :not_found | :session_not_open}
   def ensure_session_started(session_id) when is_binary(session_id) do
-    with {:ok, _session} <- Ledger.fetch_open_session(session_id),
+    with {:ok, _session} <- DurableLedger.fetch_open_session(session_id),
          {:ok, pid} <- start_session_process(session_id),
          {:ok, _state} <- SessionServer.refresh_session(pid) do
       {:ok, pid}
@@ -153,7 +153,7 @@ defmodule Atp.Transport.Runtime do
 
   defp opening_session_id_for_ack(%Agent{} = agent, delivery_id, %{"status" => status})
        when status in ~w(accepted rejected failed) do
-    Ledger.opening_session_id_for_delivery(agent, delivery_id)
+    DurableLedger.opening_session_id_for_delivery(agent, delivery_id)
   end
 
   defp opening_session_id_for_ack(%Agent{}, _delivery_id, _params), do: nil

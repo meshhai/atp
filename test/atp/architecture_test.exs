@@ -173,6 +173,25 @@ defmodule Atp.ArchitectureTest do
            end)
   end
 
+  test "runtime routes session helper reads through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    session_server_source = File.read!("lib/atp/transport/runtime/session_server.ex")
+    rehydrator_source = File.read!("lib/atp/transport/runtime/pending_session_rehydrator.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+    session_server_lines = String.split(session_server_source, "\n")
+    rehydrator_lines = String.split(rehydrator_source, "\n")
+
+    assert runtime_source =~ "DurableLedger.fetch_open_session"
+    assert runtime_source =~ "DurableLedger.opening_session_id_for_delivery"
+    assert session_server_source =~ "DurableLedger.fetch_runtime_session"
+    assert rehydrator_source =~ "DurableLedger.list_pending_session_ids"
+
+    refute legacy_call?(runtime_lines, "fetch_open_session")
+    refute legacy_call?(runtime_lines, "opening_session_id_for_delivery")
+    refute legacy_call?(session_server_lines, "fetch_runtime_session")
+    refute legacy_call?(rehydrator_lines, "list_pending_session_ids")
+  end
+
   test "legacy ledger does not expose session lifecycle entry points" do
     ledger_functions = TransportLedger.__info__(:functions)
 
@@ -189,6 +208,15 @@ defmodule Atp.ArchitectureTest do
 
     refute {:claim_inbox, 4} in ledger_functions
     refute {:extend_delivery, 5} in ledger_functions
+  end
+
+  test "legacy ledger does not expose runtime session helper reads" do
+    ledger_functions = TransportLedger.__info__(:functions)
+
+    refute {:fetch_open_session, 1} in ledger_functions
+    refute {:fetch_runtime_session, 1} in ledger_functions
+    refute {:list_pending_session_ids, 0} in ledger_functions
+    refute {:opening_session_id_for_delivery, 2} in ledger_functions
   end
 
   test "Postgres durable ledger keeps ACK mutation in one state-machine flow" do
@@ -246,5 +274,12 @@ defmodule Atp.ArchitectureTest do
 
   defp transport_delegate_pattern(:upsert_sender_policy, module) do
     ~r/defdelegate\s+upsert_sender_policy\(recipient,\s*agent_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
+  end
+
+  defp legacy_call?(lines, function_name) do
+    Enum.any?(lines, fn line ->
+      String.contains?(line, "Ledger.#{function_name}") and
+        not String.contains?(line, "DurableLedger.#{function_name}")
+    end)
   end
 end

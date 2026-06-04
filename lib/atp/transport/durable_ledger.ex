@@ -14,7 +14,7 @@ defmodule Atp.Transport.DurableLedger do
   """
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.{DeliveryClaim, Message}
+  alias Atp.Transport.{DeliveryClaim, Message, Session}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @type prepared_after_commit :: Idempotency.prepared_after_commit() | nil
@@ -29,6 +29,9 @@ defmodule Atp.Transport.DurableLedger do
   @type ack_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type polling_lease_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type read_result :: {:ok, map()} | {:error, :not_found}
+  @type open_session_fetch_result :: {:ok, Session.t()} | {:error, :not_found | :session_not_open}
+  @type runtime_session_fetch_result ::
+          {:ok, Session.t()} | {:error, :not_found | :session_not_active}
   @type sender_policy_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
@@ -110,6 +113,28 @@ defmodule Atp.Transport.DurableLedger do
   @callback get_session(Agent.t(), String.t()) :: read_result()
 
   @doc """
+  Fetches one open session for live runtime startup.
+
+  Implementations must return the persisted session only when the session is
+  currently open. Pending and terminal sessions are not startable as open live
+  session processes through this helper.
+  """
+  @callback fetch_open_session(String.t()) :: open_session_fetch_result()
+
+  @doc """
+  Fetches one runtime-active session with its opening message preloaded.
+
+  Implementations must return pending and open sessions for live process
+  hydration, and reject terminal sessions as inactive.
+  """
+  @callback fetch_runtime_session(String.t()) :: runtime_session_fetch_result()
+
+  @doc """
+  Lists pending sessions that have opening messages and need live timer hydration.
+  """
+  @callback list_pending_session_ids() :: [String.t()]
+
+  @doc """
   Accepts a pending session opening in the durable carrier ledger.
 
   Implementations must allow only the opening session recipient to accept,
@@ -153,6 +178,14 @@ defmodule Atp.Transport.DurableLedger do
   """
   @callback ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
               ack_result()
+
+  @doc """
+  Finds the pending opening session associated with a recipient-owned delivery.
+
+  This helper lets the live runtime apply ACK side effects after the durable ACK
+  mutation without exposing delivery or message storage internals.
+  """
+  @callback opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
 
   @doc """
   Reads a participant-visible message status from the durable carrier ledger.
@@ -276,6 +309,21 @@ defmodule Atp.Transport.DurableLedger do
     adapter().get_session(agent, session_id)
   end
 
+  @spec fetch_open_session(String.t()) :: open_session_fetch_result()
+  def fetch_open_session(session_id) when is_binary(session_id) do
+    adapter().fetch_open_session(session_id)
+  end
+
+  @spec fetch_runtime_session(String.t()) :: runtime_session_fetch_result()
+  def fetch_runtime_session(session_id) when is_binary(session_id) do
+    adapter().fetch_runtime_session(session_id)
+  end
+
+  @spec list_pending_session_ids() :: [String.t()]
+  def list_pending_session_ids do
+    adapter().list_pending_session_ids()
+  end
+
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
@@ -295,6 +343,12 @@ defmodule Atp.Transport.DurableLedger do
   def ack_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
       when is_binary(delivery_id) and is_map(params) and is_binary(route) do
     adapter().ack_delivery(recipient, delivery_id, params, idempotency_key, route)
+  end
+
+  @spec opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
+  def opening_session_id_for_delivery(%Agent{} = agent, delivery_id)
+      when is_binary(delivery_id) do
+    adapter().opening_session_id_for_delivery(agent, delivery_id)
   end
 
   @spec get_message_status(Agent.t(), String.t()) :: read_result()

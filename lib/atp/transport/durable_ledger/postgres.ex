@@ -116,6 +116,42 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   @impl DurableLedger
+  @spec fetch_open_session(String.t()) :: DurableLedger.open_session_fetch_result()
+  def fetch_open_session(session_id) when is_binary(session_id) do
+    case Repo.get(Session, session_id) do
+      %Session{status: "open"} = session -> {:ok, session}
+      %Session{} -> {:error, :session_not_open}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  @impl DurableLedger
+  @spec fetch_runtime_session(String.t()) :: DurableLedger.runtime_session_fetch_result()
+  def fetch_runtime_session(session_id) when is_binary(session_id) do
+    case Session |> Repo.get(session_id) |> Repo.preload(:opening_message) do
+      %Session{status: status} = session when status in ~w(pending open) ->
+        {:ok, session}
+
+      %Session{} ->
+        {:error, :session_not_active}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  @impl DurableLedger
+  @spec list_pending_session_ids() :: [String.t()]
+  def list_pending_session_ids do
+    Session
+    |> where([session], session.status == "pending")
+    |> where([session], not is_nil(session.opening_message_id))
+    |> order_by([session], asc: session.inserted_at)
+    |> select([session], session.id)
+    |> Repo.all()
+  end
+
+  @impl DurableLedger
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
@@ -156,6 +192,21 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         append_ack(recipient, delivery_id, ack_status, payload, :delivery)
       end
     end)
+  end
+
+  @impl DurableLedger
+  @spec opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
+  def opening_session_id_for_delivery(%Agent{} = agent, delivery_id)
+      when is_binary(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id)
+    |> where([delivery], delivery.recipient_agent_id == ^agent.id)
+    |> join(:inner, [delivery], message in assoc(delivery, :message))
+    |> join(:inner, [_delivery, message], session in Session,
+      on: session.id == message.session_id and session.opening_message_id == message.id
+    )
+    |> select([_delivery, _message, session], session.id)
+    |> Repo.one()
   end
 
   @impl DurableLedger

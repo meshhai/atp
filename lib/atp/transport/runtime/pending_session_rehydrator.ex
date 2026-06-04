@@ -5,7 +5,7 @@ defmodule Atp.Transport.Runtime.PendingSessionRehydrator do
 
   require Logger
 
-  alias Atp.Transport.Ledger
+  alias Atp.Transport.DurableLedger
   alias Atp.Transport.Runtime.SessionServer
 
   @session_supervisor Atp.Transport.Runtime.SessionSupervisor
@@ -21,7 +21,7 @@ defmodule Atp.Transport.Runtime.PendingSessionRehydrator do
     state = %{
       session_supervisor: Keyword.get(opts, :session_supervisor, @session_supervisor),
       list_pending_session_ids:
-        Keyword.get(opts, :list_pending_session_ids, &Ledger.list_pending_session_ids/0),
+        Keyword.get(opts, :list_pending_session_ids, &DurableLedger.list_pending_session_ids/0),
       retry_interval_ms: Keyword.get(opts, :retry_interval_ms, @default_retry_interval_ms)
     }
 
