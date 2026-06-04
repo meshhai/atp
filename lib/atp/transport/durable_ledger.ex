@@ -36,7 +36,7 @@ defmodule Atp.Transport.DurableLedger do
           {:ok, Session.t()}
           | {:error, :not_found | :opening_session_not_due | :session_not_pending}
   @type sender_policy_result :: {:ok, pos_integer(), map()} | {:error, term()}
-  @type terminalization_reason :: :message_acked | :message_expired
+  @type terminalization_reason :: :message_acked | :message_expired | :webhook_endpoint_inactive
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
   @type finish_result :: {:ok, Message.t()} | {:error, term()}
@@ -273,7 +273,8 @@ defmodule Atp.Transport.DurableLedger do
   Terminalizes a claimed webhook delivery without an outbound attempt.
 
   Implementations must validate claim ownership and only allow terminalization
-  for carrier-observed ACKed or expired messages.
+  for carrier-observed ACKed messages, expired messages, or stale webhook
+  deliveries whose recipient endpoint is no longer active.
   """
   @callback terminalize_claimed_webhook_delivery(
               DeliveryClaim.t(),
@@ -423,7 +424,8 @@ defmodule Atp.Transport.DurableLedger do
           keyword()
         ) :: finish_result()
   def terminalize_claimed_webhook_delivery(%DeliveryClaim{} = claim, reason, opts \\ [])
-      when reason in [:message_acked, :message_expired] and is_list(opts) do
+      when reason in [:message_acked, :message_expired, :webhook_endpoint_inactive] and
+             is_list(opts) do
     adapter().terminalize_claimed_webhook_delivery(claim, reason, opts)
   end
 end

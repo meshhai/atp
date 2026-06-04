@@ -1,7 +1,14 @@
 defmodule Atp.WebhookAPITest do
   use Atp.ConnCase, async: true
 
-  alias Atp.Transport.{Delivery, WebhookDelivery, WebhookDispatcher, WebhookSignature}
+  alias Atp.Transport.{
+    Delivery,
+    WebhookAttempt,
+    WebhookDelivery,
+    WebhookDispatcher,
+    WebhookSignature
+  }
+
   alias Ecto.Adapters.SQL.Sandbox
 
   test "an agent configures an active webhook endpoint with a generated secret", %{conn: conn} do
@@ -488,6 +495,42 @@ defmodule Atp.WebhookAPITest do
 
   test "direct webhook delivery reports unknown delivery ids" do
     assert WebhookDelivery.deliver_now("dlv_missing") == {:error, :not_found}
+  end
+
+  test "stale webhook deliveries fail without crashing after endpoint is removed", %{conn: conn} do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-stale-webhook-sender", %{})
+    recipient = register_agent!(account_token, "register-stale-webhook-recipient", %{})
+
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-stale-webhook-message",
+        recipient["address"],
+        a2a_user_text("stale-webhook-message", "endpoint removed before dispatch")
+      )
+
+    configure_webhook!(recipient, "configure-stale-webhook-recipient")
+
+    message = Atp.Repo.get!(Atp.Transport.Message, sent["message"]["id"])
+    recipient_agent = Atp.Repo.get!(Atp.Identity.Agent, recipient["id"])
+
+    assert {:ok, delivery} = WebhookDelivery.prepare(message, recipient_agent)
+
+    recipient_agent
+    |> Ecto.Changeset.change(webhook_active: false, webhook_url: nil, webhook_secret: nil)
+    |> Atp.Repo.update!()
+
+    assert {:ok, failed_message} = WebhookDelivery.deliver_now(delivery.id)
+    assert failed_message.id == message.id
+    assert failed_message.carrier_status == "delivery_failed"
+
+    persisted_delivery = Atp.Repo.get!(Delivery, delivery.id)
+    assert persisted_delivery.status == "failed"
+    assert persisted_delivery.last_error == "webhook_endpoint_inactive"
+
+    refute Atp.Repo.get_by(WebhookAttempt, delivery_id: delivery.id)
   end
 
   test "direct webhook delivery leases before posting so retry dispatch cannot duplicate it", %{

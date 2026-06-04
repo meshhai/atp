@@ -628,7 +628,8 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         reason,
         opts
       )
-      when is_binary(delivery_id) and reason in [:message_acked, :message_expired] and
+      when is_binary(delivery_id) and
+             reason in [:message_acked, :message_expired, :webhook_endpoint_inactive] and
              is_list(opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
@@ -1596,18 +1597,50 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp validate_webhook_terminal_claim(delivery, claim, reason, now) do
     case validate_webhook_delivery_claim(delivery, claim, now) do
-      :ok -> validate_webhook_terminal_reason(delivery.message, reason, now)
+      :ok -> validate_webhook_terminal_reason(delivery.message, claim, reason, now)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp validate_webhook_terminal_reason(%Message{} = message, :message_acked, _now) do
+  defp validate_webhook_terminal_reason(
+         %Message{} = message,
+         %DeliveryClaim{},
+         :message_acked,
+         _now
+       ) do
     if acked?(message), do: :ok, else: {:error, :stale_delivery_claim}
   end
 
-  defp validate_webhook_terminal_reason(%Message{} = message, :message_expired, now) do
+  defp validate_webhook_terminal_reason(
+         %Message{} = message,
+         %DeliveryClaim{},
+         :message_expired,
+         now
+       ) do
     if expired?(message, now), do: :ok, else: {:error, :stale_delivery_claim}
   end
+
+  defp validate_webhook_terminal_reason(
+         %Message{},
+         %DeliveryClaim{} = claim,
+         :webhook_endpoint_inactive,
+         _now
+       ) do
+    if inactive_webhook_endpoint?(claim.recipient_agent),
+      do: :ok,
+      else: {:error, :stale_delivery_claim}
+  end
+
+  defp inactive_webhook_endpoint?(%Agent{
+         webhook_active: true,
+         webhook_url: url,
+         webhook_secret: secret
+       })
+       when is_binary(url) and is_binary(secret) do
+    String.trim(url) == "" or String.trim(secret) == ""
+  end
+
+  defp inactive_webhook_endpoint?(%Agent{}), do: true
 
   defp current_webhook_claim_lease?(
          %Delivery{leased_until: %DateTime{} = leased_until},
@@ -1690,6 +1723,32 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> where([persisted_message], persisted_message.id == ^message.id)
     |> where([persisted_message], persisted_message.carrier_status != "delivered")
     |> Repo.update_all(set: [carrier_status: "expired", terminal_at: now, updated_at: now])
+
+    Repo.get!(Message, message.id)
+  end
+
+  defp terminalize_claimed_webhook_delivery!(
+         %Delivery{message: %Message{} = message} = delivery,
+         :webhook_endpoint_inactive,
+         _now
+       ) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "webhook_endpoint_inactive"
+    )
+    |> Repo.update!()
+
+    Message
+    |> where([persisted_message], persisted_message.id == ^message.id)
+    |> where([persisted_message], persisted_message.carrier_status != "delivered")
+    |> Repo.update_all(
+      set: [carrier_status: "delivery_failed", updated_at: DateTime.utc_now(:microsecond)]
+    )
 
     Repo.get!(Message, message.id)
   end
