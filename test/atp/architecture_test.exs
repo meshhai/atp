@@ -152,6 +152,27 @@ defmodule Atp.ArchitectureTest do
     refute transport_source =~ polling_delegate_pattern(:extend_delivery, :Ledger)
   end
 
+  test "transport facade routes status reads and sender policy mutation through durable ledger" do
+    transport_source = File.read!("lib/atp/transport.ex")
+
+    assert transport_source =~ transport_delegate_pattern(:get_message_status, :DurableLedger)
+    assert transport_source =~ transport_delegate_pattern(:upsert_sender_policy, :DurableLedger)
+    refute transport_source =~ transport_delegate_pattern(:get_message_status, :Ledger)
+    refute transport_source =~ transport_delegate_pattern(:upsert_sender_policy, :Ledger)
+  end
+
+  test "runtime routes session transcript reads through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+
+    assert runtime_source =~ "DurableLedger.get_session"
+
+    refute Enum.any?(runtime_lines, fn line ->
+             String.contains?(line, "Ledger.get_session") and
+               not String.contains?(line, "DurableLedger.get_session")
+           end)
+  end
+
   test "legacy ledger does not expose session lifecycle entry points" do
     ledger_functions = TransportLedger.__info__(:functions)
 
@@ -217,5 +238,13 @@ defmodule Atp.ArchitectureTest do
 
   defp polling_delegate_pattern(:extend_delivery, module) do
     ~r/defdelegate\s+extend_delivery\(agent,\s*delivery_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
+  end
+
+  defp transport_delegate_pattern(:get_message_status, module) do
+    ~r/defdelegate\s+get_message_status\(agent,\s*message_id\),\s*to:\s*#{module}/
+  end
+
+  defp transport_delegate_pattern(:upsert_sender_policy, module) do
+    ~r/defdelegate\s+upsert_sender_policy\(recipient,\s*agent_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
   end
 end

@@ -62,7 +62,7 @@ defmodule Atp.Transport.Runtime do
 
   @spec get_session(Agent.t(), String.t()) :: {:ok, map()} | {:error, :not_found}
   def get_session(%Agent{} = agent, session_id) when is_binary(session_id) do
-    case Ledger.get_session(agent, session_id) do
+    case DurableLedger.get_session(agent, session_id) do
       {:ok, %{"session" => %{"status" => "open"}} = body} ->
         _result = ensure_session_started(session_id)
         {:ok, body}

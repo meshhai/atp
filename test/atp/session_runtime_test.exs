@@ -151,6 +151,17 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
+    def get_message_status(_agent, _message_id), do: {:error, :unexpected_message_status}
+
+    @impl DurableLedger
+    def get_session(_agent, _session_id), do: {:error, :unexpected_get_session}
+
+    @impl DurableLedger
+    def upsert_sender_policy(_recipient, _agent_id, _params, _idempotency_key, _route) do
+      {:error, :unexpected_sender_policy}
+    end
+
+    @impl DurableLedger
     def claim_inbox(_recipient, _params, _idempotency_key, _route) do
       {:error, :unexpected_claim_inbox}
     end

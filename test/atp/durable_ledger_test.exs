@@ -107,6 +107,45 @@ defmodule Atp.DurableLedgerTest do
     end
 
     @impl DurableLedger
+    def get_message_status(agent, message_id) do
+      notify_configured_test_pid({:get_message_status, agent, message_id})
+
+      {:ok, %{"message" => %{"id" => message_id}, "viewer_agent_id" => agent.id}}
+    end
+
+    @impl DurableLedger
+    def get_session(agent, session_id) do
+      notify_configured_test_pid({:get_session, agent, session_id})
+
+      {:ok,
+       %{
+         "session" => %{"id" => session_id, "status" => "pending"},
+         "messages" => []
+       }}
+    end
+
+    @impl DurableLedger
+    def upsert_sender_policy(recipient, agent_id, params, idempotency_key, route) do
+      notify_configured_test_pid({
+        :upsert_sender_policy,
+        recipient,
+        agent_id,
+        params,
+        idempotency_key,
+        route
+      })
+
+      {:ok, 200,
+       %{
+         "sender_policy" => %{
+           "recipient_agent_id" => recipient.id,
+           "sender_agent_id" => Map.get(params, "sender_agent_id"),
+           "effect" => Map.get(params, "effect")
+         }
+       }}
+    end
+
+    @impl DurableLedger
     def claim_inbox(recipient, params, idempotency_key, route) do
       send(Map.fetch!(params, :test_pid), {
         :claim_inbox,
@@ -173,15 +212,31 @@ defmodule Atp.DurableLedgerTest do
         :error -> :ok
       end
     end
+
+    defp notify_configured_test_pid(message) do
+      :atp
+      |> Application.get_env(__MODULE__, [])
+      |> Keyword.get(:test_pid)
+      |> case do
+        test_pid when is_pid(test_pid) -> send(test_pid, message)
+        nil -> :ok
+      end
+    end
   end
 
   setup do
     original_config = Application.get_env(:atp, DurableLedger)
+    original_recording_config = Application.get_env(:atp, RecordingLedger)
 
     on_exit(fn ->
       case original_config do
         nil -> Application.delete_env(:atp, DurableLedger)
         config -> Application.put_env(:atp, DurableLedger, config)
+      end
+
+      case original_recording_config do
+        nil -> Application.delete_env(:atp, RecordingLedger)
+        config -> Application.put_env(:atp, RecordingLedger, config)
       end
     end)
 
@@ -365,6 +420,90 @@ defmodule Atp.DurableLedgerTest do
       %{"lease_seconds" => 45},
       "transport-polling-extend-key",
       "POST /api/deliveries/dlv_transport_polling/lease"
+    }
+  end
+
+  test "durable ledger delegates status reads and sender policy mutation to configured adapter" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+    Application.put_env(:atp, RecordingLedger, test_pid: self())
+
+    agent = %Agent{
+      id: "agt_public_read",
+      account_id: "acc_public_read",
+      address: "atp://agent/agt_public_read",
+      status: "active"
+    }
+
+    assert {:ok, %{"message" => %{"id" => "msg_configured"}}} =
+             DurableLedger.get_message_status(agent, "msg_configured")
+
+    assert_received {:get_message_status, ^agent, "msg_configured"}
+
+    assert {:ok, %{"session" => %{"id" => "ses_configured", "status" => "pending"}}} =
+             DurableLedger.get_session(agent, "ses_configured")
+
+    assert_received {:get_session, ^agent, "ses_configured"}
+
+    params = %{"effect" => "allow", "sender_agent_id" => "agt_sender"}
+
+    assert {:ok, 200, %{"sender_policy" => %{"effect" => "allow"}}} =
+             DurableLedger.upsert_sender_policy(
+               agent,
+               agent.id,
+               params,
+               "policy-key",
+               "PUT /api/agents/agt_public_read/sender_policies"
+             )
+
+    assert_received {
+      :upsert_sender_policy,
+      ^agent,
+      "agt_public_read",
+      ^params,
+      "policy-key",
+      "PUT /api/agents/agt_public_read/sender_policies"
+    }
+  end
+
+  test "transport facade delegates public status reads and sender policies to the durable ledger" do
+    Application.put_env(:atp, DurableLedger, adapter: RecordingLedger)
+    Application.put_env(:atp, RecordingLedger, test_pid: self())
+
+    agent = %Agent{
+      id: "agt_transport_public",
+      account_id: "acc_transport_public",
+      address: "atp://agent/agt_transport_public",
+      status: "active"
+    }
+
+    assert {:ok, %{"message" => %{"id" => "msg_transport_public"}}} =
+             Transport.get_message_status(agent, "msg_transport_public")
+
+    assert_received {:get_message_status, ^agent, "msg_transport_public"}
+
+    assert {:ok, %{"session" => %{"id" => "ses_transport_public", "status" => "pending"}}} =
+             Transport.get_session(agent, "ses_transport_public")
+
+    assert_received {:get_session, ^agent, "ses_transport_public"}
+
+    params = %{"effect" => "block", "sender_agent_id" => "agt_blocked_sender"}
+
+    assert {:ok, 200, %{"sender_policy" => %{"effect" => "block"}}} =
+             Transport.upsert_sender_policy(
+               agent,
+               agent.id,
+               params,
+               "transport-policy-key",
+               "PUT /api/agents/agt_transport_public/sender_policies"
+             )
+
+    assert_received {
+      :upsert_sender_policy,
+      ^agent,
+      "agt_transport_public",
+      ^params,
+      "transport-policy-key",
+      "PUT /api/agents/agt_transport_public/sender_policies"
     }
   end
 
@@ -775,6 +914,27 @@ defmodule Atp.DurableLedgerTest do
     assert ack_delivery_doc =~ "durable opening-session state transitions"
     assert_no_active_webhook_dispatch(ack_delivery_doc)
     refute ack_delivery_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    message_status_doc = callback_doc(docs, :get_message_status, 2)
+
+    assert message_status_doc =~ "message status"
+    assert message_status_doc =~ "sender or recipient"
+    assert message_status_doc =~ "public message status response shape"
+    refute message_status_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    session_read_doc = callback_doc(docs, :get_session, 2)
+
+    assert session_read_doc =~ "session transcript"
+    assert session_read_doc =~ "session participants"
+    assert session_read_doc =~ "ordered message status"
+    refute session_read_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
+
+    sender_policy_doc = callback_doc(docs, :upsert_sender_policy, 5)
+
+    assert sender_policy_doc =~ "sender policy"
+    assert sender_policy_doc =~ "idempotency"
+    assert sender_policy_doc =~ "public sender policy response shape"
+    refute sender_policy_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     claim_inbox_doc = callback_doc(docs, :claim_inbox, 4)
 

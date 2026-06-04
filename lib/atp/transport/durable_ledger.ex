@@ -28,6 +28,8 @@ defmodule Atp.Transport.DurableLedger do
   @type session_lifecycle_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type ack_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type polling_lease_result :: {:ok, pos_integer(), map()} | {:error, term()}
+  @type read_result :: {:ok, map()} | {:error, :not_found}
+  @type sender_policy_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type terminalization_reason :: :message_acked | :message_expired
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
@@ -99,6 +101,15 @@ defmodule Atp.Transport.DurableLedger do
               session_intake_result()
 
   @doc """
+  Reads a participant-visible session transcript from the durable carrier ledger.
+
+  Implementations must allow only session participants to read the session and
+  must return the same session and ordered message status shape exposed by the
+  public transport facade.
+  """
+  @callback get_session(Agent.t(), String.t()) :: read_result()
+
+  @doc """
   Accepts a pending session opening in the durable carrier ledger.
 
   Implementations must allow only the opening session recipient to accept,
@@ -142,6 +153,24 @@ defmodule Atp.Transport.DurableLedger do
   """
   @callback ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
               ack_result()
+
+  @doc """
+  Reads a participant-visible message status from the durable carrier ledger.
+
+  Implementations must allow only the sender or recipient to read the message
+  and must preserve the public message status response shape.
+  """
+  @callback get_message_status(Agent.t(), String.t()) :: read_result()
+
+  @doc """
+  Upserts a recipient-owned sender policy in the durable carrier ledger.
+
+  Implementations must require the authenticated recipient to own the target
+  agent id, apply idempotency for the recipient, route, key, and body, and
+  preserve the public sender policy response shape.
+  """
+  @callback upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              sender_policy_result()
 
   @doc """
   Claims the next recipient-owned inbox polling delivery.
@@ -242,6 +271,11 @@ defmodule Atp.Transport.DurableLedger do
     adapter().send_session_message(sender, session_id, params, idempotency_key, route)
   end
 
+  @spec get_session(Agent.t(), String.t()) :: read_result()
+  def get_session(%Agent{} = agent, session_id) when is_binary(session_id) do
+    adapter().get_session(agent, session_id)
+  end
+
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
@@ -261,6 +295,18 @@ defmodule Atp.Transport.DurableLedger do
   def ack_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
       when is_binary(delivery_id) and is_map(params) and is_binary(route) do
     adapter().ack_delivery(recipient, delivery_id, params, idempotency_key, route)
+  end
+
+  @spec get_message_status(Agent.t(), String.t()) :: read_result()
+  def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
+    adapter().get_message_status(agent, message_id)
+  end
+
+  @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          sender_policy_result()
+  def upsert_sender_policy(%Agent{} = recipient, agent_id, params, idempotency_key, route)
+      when is_binary(agent_id) and is_map(params) and is_binary(route) do
+    adapter().upsert_sender_policy(recipient, agent_id, params, idempotency_key, route)
   end
 
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::

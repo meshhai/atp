@@ -2,7 +2,7 @@ defmodule Atp.Transport do
   @moduledoc "Public ATP carrier facade for messages, sessions, polling leases, and status reads."
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.{DurableLedger, Ledger, Response, Runtime, WebhookDelivery}
+  alias Atp.Transport.{DurableLedger, Response, Runtime, WebhookDelivery}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -53,7 +53,7 @@ defmodule Atp.Transport do
   defdelegate get_session(agent, session_id), to: Runtime
 
   @spec get_message_status(Agent.t(), String.t()) :: {:ok, map()} | {:error, :not_found}
-  defdelegate get_message_status(agent, message_id), to: Ledger
+  defdelegate get_message_status(agent, message_id), to: DurableLedger
 
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate claim_inbox(agent, params, idempotency_key, route), to: DurableLedger
@@ -88,5 +88,5 @@ defmodule Atp.Transport do
   @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   defdelegate upsert_sender_policy(recipient, agent_id, params, idempotency_key, route),
-    to: Ledger
+    to: DurableLedger
 end
