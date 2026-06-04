@@ -143,6 +143,32 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     end)
   end
 
+  @impl DurableLedger
+  @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.polling_lease_result()
+  def claim_inbox(%Agent{} = recipient, params, idempotency_key, route)
+      when is_map(params) and is_binary(route) do
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, lease_seconds} <- fetch_polling_lease_seconds(params) do
+        claim_next_polling_message(recipient, lease_seconds)
+      end
+    end)
+  end
+
+  @impl DurableLedger
+  @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.polling_lease_result()
+  def extend_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
+      when is_binary(delivery_id) and is_map(params) and is_binary(route) do
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with {:ok, lease_seconds} <- fetch_polling_lease_seconds(params) do
+        extend_active_polling_delivery(recipient, delivery_id, lease_seconds)
+      end
+    end)
+  end
+
   defp persist_direct_message_send(%Agent{} = sender, recipient_address, payload) do
     with {:ok, recipient, trust, blocked?} <- fetch_recipient(sender, recipient_address),
          :ok <-
@@ -210,6 +236,207 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       append_session_lifecycle_ack(recipient, delivery_id, "rejected", payload)
     end
   end
+
+  defp claim_next_polling_message(%Agent{} = recipient, lease_seconds) do
+    Repo.transaction(fn ->
+      claim_next_polling_message!(recipient, lease_seconds)
+    end)
+    |> unwrap_polling_transaction_result()
+  end
+
+  defp claim_next_polling_message!(%Agent{} = recipient, lease_seconds) do
+    now = DateTime.utc_now(:microsecond)
+
+    case Repo.one(claimable_polling_message_query(recipient, now)) do
+      nil ->
+        {200, %{"delivery" => nil}}
+
+      %Message{} = message ->
+        case claim_polling_message!(message.id, recipient, lease_seconds) do
+          :retry -> claim_next_polling_message!(recipient, lease_seconds)
+          result -> result
+        end
+    end
+  end
+
+  defp claimable_polling_message_query(%Agent{} = recipient, now) do
+    active_delivery_message_ids =
+      from(delivery in Delivery,
+        where:
+          delivery.recipient_agent_id == ^recipient.id and delivery.status == "leased" and
+            delivery.leased_until > ^now,
+        select: delivery.message_id
+      )
+
+    delivered_webhook_message_ids =
+      from(delivery in Delivery,
+        where:
+          delivery.recipient_agent_id == ^recipient.id and delivery.mode == "webhook" and
+            delivery.status == "delivered",
+        select: delivery.message_id
+      )
+
+    from(message in Message,
+      as: :message,
+      where: message.recipient_agent_id == ^recipient.id,
+      where: message.carrier_status in ["queued", "delivered"],
+      where: is_nil(message.current_ack_status),
+      where: message.expires_at > ^now,
+      where: message.id not in subquery(active_delivery_message_ids),
+      where: message.id not in subquery(delivered_webhook_message_ids),
+      where: ^delivery_session_order_filter(now),
+      order_by: [asc: message.inserted_at],
+      limit: 1
+    )
+  end
+
+  defp delivery_session_order_filter(now) do
+    dynamic(
+      [message: message],
+      is_nil(message.session_id) or is_nil(message.session_sequence) or
+        not exists(
+          from(prior_message in Message,
+            left_join: active_polling_delivery in Delivery,
+            on:
+              active_polling_delivery.message_id == prior_message.id and
+                active_polling_delivery.mode == "polling" and
+                active_polling_delivery.status == "leased" and
+                active_polling_delivery.leased_until > ^now,
+            left_join: delivered_webhook_delivery in Delivery,
+            on:
+              delivered_webhook_delivery.message_id == prior_message.id and
+                delivered_webhook_delivery.mode == "webhook" and
+                delivered_webhook_delivery.status == "delivered",
+            where: prior_message.session_id == parent_as(:message).session_id,
+            where: prior_message.session_sequence < parent_as(:message).session_sequence,
+            where: prior_message.carrier_status in ["queued", "delivered"],
+            where: is_nil(prior_message.current_ack_status),
+            where: prior_message.expires_at > ^now,
+            where: is_nil(active_polling_delivery.id),
+            where: is_nil(delivered_webhook_delivery.id),
+            select: 1
+          )
+        )
+    )
+  end
+
+  defp insert_polling_delivery!(%Message{} = message, %Agent{} = recipient, lease_until) do
+    %Delivery{id: ID.generate("dlv")}
+    |> Delivery.changeset(%{
+      message_id: message.id,
+      recipient_agent_id: recipient.id,
+      mode: "polling",
+      status: "leased",
+      leased_until: lease_until
+    })
+    |> Repo.insert!()
+  end
+
+  defp claim_polling_message!(message_id, %Agent{} = recipient, lease_seconds) do
+    lock_deliveries_for_message!(message_id)
+
+    case lock_polling_message(message_id) do
+      nil ->
+        :retry
+
+      %Message{} = message ->
+        claim_locked_polling_message!(message, recipient, lease_seconds)
+    end
+  end
+
+  defp lock_deliveries_for_message!(message_id) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message_id)
+    |> order_by([delivery], asc: delivery.inserted_at)
+    |> lock("FOR UPDATE")
+    |> Repo.all()
+  end
+
+  defp lock_polling_message(message_id) do
+    Message
+    |> where([message], message.id == ^message_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp claim_locked_polling_message!(%Message{} = message, %Agent{} = recipient, lease_seconds) do
+    now = DateTime.utc_now(:microsecond)
+
+    if claimable_polling_message?(message, recipient, now) do
+      lease_until = DateTime.add(now, lease_seconds, :second)
+      delivery = insert_polling_delivery!(message, recipient, lease_until)
+      delivered_message = mark_polling_message_delivered!(message)
+
+      {201, Response.delivery_claim(delivery, delivered_message)}
+    else
+      :retry
+    end
+  end
+
+  defp claimable_polling_message?(%Message{} = message, %Agent{} = recipient, now) do
+    recipient
+    |> claimable_polling_message_query(now)
+    |> where([message: claimable_message], claimable_message.id == ^message.id)
+    |> Repo.exists?()
+  end
+
+  defp mark_polling_message_delivered!(%Message{} = message) do
+    message
+    |> Ecto.Changeset.change(carrier_status: "delivered")
+    |> Repo.update!()
+  end
+
+  defp extend_active_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
+    Repo.transaction(fn ->
+      extend_locked_polling_delivery(recipient, delivery_id, lease_seconds)
+    end)
+    |> unwrap_extension_transaction_result()
+  end
+
+  defp extend_locked_polling_delivery(%Agent{} = recipient, delivery_id, lease_seconds) do
+    delivery = locked_extension_delivery(recipient, delivery_id)
+
+    now = DateTime.utc_now(:microsecond)
+
+    cond do
+      is_nil(delivery) ->
+        {:error, :not_found}
+
+      delivery.mode != "polling" or delivery.status != "leased" or is_nil(delivery.leased_until) ->
+        {:error, :invalid_lease}
+
+      DateTime.compare(delivery.leased_until, now) != :gt ->
+        {:error, :lease_expired}
+
+      true ->
+        updated_delivery =
+          delivery
+          |> Ecto.Changeset.change(
+            leased_until: DateTime.add(delivery.leased_until, lease_seconds, :second)
+          )
+          |> Repo.update!()
+
+        {:ok, 200, Response.delivery_claim(updated_delivery, delivery.message)}
+    end
+  end
+
+  defp locked_extension_delivery(%Agent{} = recipient, delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id)
+    |> where([delivery], delivery.recipient_agent_id == ^recipient.id)
+    |> lock("FOR UPDATE")
+    |> preload(:message)
+    |> Repo.one()
+  end
+
+  defp unwrap_polling_transaction_result({:ok, {:commit_error, reason}}),
+    do: {:commit_error, reason}
+
+  defp unwrap_polling_transaction_result({:ok, {status, body}}), do: {:ok, status, body}
+  defp unwrap_polling_transaction_result({:error, reason}), do: {:error, reason}
+
+  defp unwrap_extension_transaction_result({:ok, result}), do: result
+  defp unwrap_extension_transaction_result({:error, reason}), do: {:error, reason}
 
   defp prepared_session_intake_response(body, %Session{}, nil), do: {:ok, 201, body}
 
@@ -304,6 +531,16 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp fetch_ack_status(%{"status" => status}) when status in @ack_statuses, do: {:ok, status}
   defp fetch_ack_status(%{"status" => _status}), do: {:error, :invalid_ack_status}
   defp fetch_ack_status(_params), do: {:error, :ack_status_required}
+
+  defp fetch_polling_lease_seconds(params) do
+    case Map.get(params, "lease_seconds", @default_polling_lease_seconds) do
+      seconds when is_integer(seconds) and seconds >= 0 ->
+        {:ok, seconds}
+
+      _other ->
+        {:error, :invalid_lease}
+    end
+  end
 
   defp fetch_session_message_payload(params) do
     with {:ok, payload} <- fetch_payload(params),
@@ -536,10 +773,11 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   defp ensure_session_lifecycle_delivery(%Agent{} = agent, session_id) do
     with {:ok, opening_message_id} <- opening_message_id_for_session_lifecycle(agent, session_id) do
       now = DateTime.utc_now(:microsecond)
+      lock_deliveries_for_message!(opening_message_id)
 
       case fetch_ackable_delivery(agent, opening_message_id, now) do
         %Delivery{id: delivery_id} -> {:ok, delivery_id}
-        nil -> insert_session_action_delivery(agent, opening_message_id, now)
+        nil -> prepare_session_action_delivery(agent, opening_message_id, now)
       end
     end
   end
@@ -577,6 +815,22 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          not is_nil(delivery.leased_until) and delivery.leased_until > ^now) or
         (delivery.mode == "webhook" and delivery.status == "delivered")
     )
+  end
+
+  defp prepare_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
+    if active_delivery_for_message?(opening_message_id, now) do
+      {:error, :delivery_in_progress}
+    else
+      insert_session_action_delivery(agent, opening_message_id, now)
+    end
+  end
+
+  defp active_delivery_for_message?(message_id, now) do
+    Delivery
+    |> where([delivery], delivery.message_id == ^message_id)
+    |> where([delivery], delivery.status == "leased")
+    |> where([delivery], delivery.leased_until > ^now)
+    |> Repo.exists?()
   end
 
   defp insert_session_action_delivery(%Agent{} = agent, opening_message_id, now) do
@@ -856,7 +1110,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp claim_locked_webhook_delivery!(delivery_id, now, lease_seconds) do
-    case locked_webhook_delivery(delivery_id) do
+    case fetch_webhook_delivery(delivery_id) do
       nil ->
         Repo.rollback(:not_found)
 
@@ -928,12 +1182,25 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> Repo.one()
   end
 
+  defp fetch_webhook_delivery(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id and delivery.mode == "webhook")
+    |> Repo.one()
+  end
+
   defp claimable_webhook_delivery_query(now) do
+    active_delivery_message_ids =
+      from(delivery in Delivery,
+        where: delivery.status == "leased" and delivery.leased_until > ^now,
+        select: delivery.message_id
+      )
+
     Delivery
     |> join(:inner, [delivery], message in assoc(delivery, :message), as: :message)
     |> where([delivery], delivery.mode == "webhook")
     |> where(^due_webhook_delivery_filter(now))
-    |> where(^webhook_session_order_filter())
+    |> where([message: message], message.id not in subquery(active_delivery_message_ids))
+    |> where(^delivery_session_order_filter(now))
     |> order_by([delivery], asc: delivery.inserted_at)
     |> limit(1)
     |> lock("FOR UPDATE SKIP LOCKED")
@@ -949,36 +1216,42 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     )
   end
 
-  defp webhook_session_order_filter do
-    dynamic(
-      [message: message],
-      is_nil(message.session_id) or is_nil(message.session_sequence) or
-        not exists(
-          from(prior_delivery in Delivery,
-            join: prior_message in Message,
-            on: prior_message.id == prior_delivery.message_id,
-            where: prior_delivery.mode == "webhook",
-            where: prior_delivery.status not in ["delivered", "failed"],
-            where: prior_message.session_id == parent_as(:message).session_id,
-            where: prior_message.session_sequence < parent_as(:message).session_sequence,
-            select: 1
-          )
-        )
-    )
-  end
-
   defp claim_or_terminalize_webhook_delivery!(
          %Delivery{} = delivery,
          %DateTime{} = now,
          lease_seconds
        ) do
-    delivery = Repo.preload(delivery, :message)
+    case lock_webhook_delivery_family(delivery) do
+      nil ->
+        Repo.rollback(:not_found)
 
+      %Delivery{} = locked_delivery ->
+        claim_or_terminalize_locked_webhook_delivery!(locked_delivery, now, lease_seconds)
+    end
+  end
+
+  defp lock_webhook_delivery_family(%Delivery{id: delivery_id, message_id: message_id}) do
+    lock_deliveries_for_message!(message_id)
+
+    case locked_webhook_delivery(delivery_id) do
+      nil -> nil
+      %Delivery{} = locked_delivery -> Repo.preload(locked_delivery, :message)
+    end
+  end
+
+  defp claim_or_terminalize_locked_webhook_delivery!(
+         %Delivery{} = delivery,
+         %DateTime{} = now,
+         lease_seconds
+       ) do
     cond do
       delivery.status in ["delivered", "failed"] ->
         delivery.message
 
       active_webhook_claim?(delivery, now) ->
+        Repo.rollback(:delivery_in_progress)
+
+      active_other_delivery_claim?(delivery, now) ->
         Repo.rollback(:delivery_in_progress)
 
       acked?(delivery.message) ->
@@ -1000,6 +1273,15 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp active_webhook_claim?(%Delivery{}, _now), do: false
+
+  defp active_other_delivery_claim?(%Delivery{} = delivery, now) do
+    Delivery
+    |> where([other_delivery], other_delivery.message_id == ^delivery.message_id)
+    |> where([other_delivery], other_delivery.id != ^delivery.id)
+    |> where([other_delivery], other_delivery.status == "leased")
+    |> where([other_delivery], other_delivery.leased_until > ^now)
+    |> Repo.exists?()
+  end
 
   defp acked?(%Message{current_ack_status: status}), do: not is_nil(status)
 

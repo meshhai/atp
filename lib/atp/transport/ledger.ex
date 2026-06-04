@@ -1,6 +1,6 @@
 defmodule Atp.Transport.Ledger do
   @moduledoc """
-  Durable ATP carrier operations for sessions, polling leases, and status reads.
+  Durable ATP carrier operations for sessions, sender policies, and status reads.
 
   This module owns remaining Postgres-backed carrier operations that have not
   moved behind semantic durable ledger callbacks yet.
@@ -8,7 +8,7 @@ defmodule Atp.Transport.Ledger do
 
   import Ecto.Query
 
-  alias Atp.Identity.{Agent, ID, Idempotency}
+  alias Atp.Identity.{Agent, Idempotency}
   alias Atp.Repo
 
   alias Atp.Transport.{
@@ -18,8 +18,6 @@ defmodule Atp.Transport.Ledger do
     SenderPolicies,
     Session
   }
-
-  @default_lease_seconds 60
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -194,28 +192,6 @@ defmodule Atp.Transport.Ledger do
     end
   end
 
-  @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
-  def claim_inbox(%Agent{} = agent, params, idempotency_key, route) when is_map(params) do
-    agent
-    |> Idempotency.run(route, idempotency_key, params, fn ->
-      with {:ok, lease_seconds} <- fetch_lease_seconds(params) do
-        claim_next_message(agent, lease_seconds)
-      end
-    end)
-  end
-
-  @spec extend_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
-          api_result()
-  def extend_delivery(%Agent{} = agent, delivery_id, params, idempotency_key, route)
-      when is_binary(delivery_id) and is_map(params) do
-    agent
-    |> Idempotency.run(route, idempotency_key, params, fn ->
-      with {:ok, lease_seconds} <- fetch_lease_seconds(params) do
-        extend_active_delivery(agent, delivery_id, lease_seconds)
-      end
-    end)
-  end
-
   @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           api_result()
   def upsert_sender_policy(%Agent{} = recipient, agent_id, params, idempotency_key, route)
@@ -231,74 +207,6 @@ defmodule Atp.Transport.Ledger do
 
   defp ensure_own_agent(%Agent{id: agent_id}, agent_id), do: :ok
   defp ensure_own_agent(%Agent{}, _agent_id), do: {:error, :not_found}
-
-  defp fetch_lease_seconds(params) do
-    case Map.get(params, "lease_seconds", @default_lease_seconds) do
-      seconds when is_integer(seconds) and seconds >= 0 ->
-        {:ok, seconds}
-
-      _other ->
-        {:error, :invalid_lease}
-    end
-  end
-
-  defp claim_next_message(%Agent{} = agent, lease_seconds) do
-    Repo.transaction(fn ->
-      now = DateTime.utc_now(:microsecond)
-
-      case Repo.one(claimable_message_query(agent, now)) do
-        nil ->
-          {200, %{"delivery" => nil}}
-
-        %Message{} = message ->
-          lease_until = DateTime.add(now, lease_seconds, :second)
-          delivery = insert_polling_delivery!(message, agent, lease_until)
-          delivered_message = mark_delivered!(message)
-
-          {201, Response.delivery_claim(delivery, delivered_message)}
-      end
-    end)
-    |> unwrap_transaction_result()
-  end
-
-  defp claimable_message_query(%Agent{} = agent, now) do
-    active_delivery_message_ids =
-      from(delivery in Delivery,
-        where:
-          delivery.recipient_agent_id == ^agent.id and delivery.status == "leased" and
-            delivery.leased_until > ^now,
-        select: delivery.message_id
-      )
-
-    from(message in Message,
-      where: message.recipient_agent_id == ^agent.id,
-      where: message.carrier_status in ["queued", "delivered"],
-      where: is_nil(message.current_ack_status),
-      where: message.expires_at > ^now,
-      where: message.id not in subquery(active_delivery_message_ids),
-      order_by: [asc: message.inserted_at],
-      limit: 1,
-      lock: "FOR UPDATE SKIP LOCKED"
-    )
-  end
-
-  defp insert_polling_delivery!(%Message{} = message, %Agent{} = agent, lease_until) do
-    %Delivery{id: ID.generate("dlv")}
-    |> Delivery.changeset(%{
-      message_id: message.id,
-      recipient_agent_id: agent.id,
-      mode: "polling",
-      status: "leased",
-      leased_until: lease_until
-    })
-    |> Repo.insert!()
-  end
-
-  defp mark_delivered!(%Message{} = message) do
-    message
-    |> Ecto.Changeset.change(carrier_status: "delivered")
-    |> Repo.update!()
-  end
 
   defp expire_opening_message(%Message{carrier_status: status} = message, now)
        when status in ~w(queued delivered delivery_failed) do
@@ -319,38 +227,4 @@ defmodule Atp.Transport.Ledger do
     |> Session.changeset(%{status: status, terminal_at: now})
     |> Repo.update()
   end
-
-  defp extend_active_delivery(%Agent{} = agent, delivery_id, lease_seconds) do
-    delivery =
-      Delivery
-      |> Repo.get_by(id: delivery_id, recipient_agent_id: agent.id)
-      |> Repo.preload(:message)
-
-    now = DateTime.utc_now(:microsecond)
-
-    cond do
-      is_nil(delivery) ->
-        {:error, :not_found}
-
-      delivery.mode != "polling" or delivery.status != "leased" or is_nil(delivery.leased_until) ->
-        {:error, :invalid_lease}
-
-      DateTime.compare(delivery.leased_until, now) != :gt ->
-        {:error, :lease_expired}
-
-      true ->
-        updated_delivery =
-          delivery
-          |> Ecto.Changeset.change(
-            leased_until: DateTime.add(delivery.leased_until, lease_seconds, :second)
-          )
-          |> Repo.update!()
-
-        {:ok, 200, Response.delivery_claim(updated_delivery, delivery.message)}
-    end
-  end
-
-  defp unwrap_transaction_result({:ok, {:commit_error, reason}}), do: {:commit_error, reason}
-  defp unwrap_transaction_result({:ok, {status, body}}), do: {:ok, status, body}
-  defp unwrap_transaction_result({:error, reason}), do: {:error, reason}
 end

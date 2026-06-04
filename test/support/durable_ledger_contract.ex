@@ -110,6 +110,20 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_delivery_ack_opening_session_side_effects, "delivery-ack-opening"},
       {"contract: expired opening delivery ACK fails the pending session",
        :assert_delivery_ack_expired_opening_session, "delivery-ack-expired-opening"},
+      {"contract: polling inbox claim creates a recipient-owned lease",
+       :assert_polling_claim_success, "polling-claim-success"},
+      {"contract: polling inbox claim returns an empty stable response",
+       :assert_polling_empty_inbox, "polling-empty-inbox"},
+      {"contract: polling active leases hide messages until expiry",
+       :assert_polling_active_lease_reclaim, "polling-active-reclaim"},
+      {"contract: active polling leases block webhook claims for the same message",
+       :assert_polling_lease_blocks_webhook_claims, "polling-blocks-webhook"},
+      {"contract: polling claims exclude ACKed and expired messages",
+       :assert_polling_claim_visibility, "polling-claim-visibility"},
+      {"contract: polling lease extension validates ownership and lease state",
+       :assert_polling_lease_extension, "polling-lease-extension"},
+      {"contract: polling session claims preserve message order",
+       :assert_polling_session_ordering, "polling-session-order"},
       {"contract: session message send replays stable idempotent responses",
        :assert_session_message_idempotent_replay, "session-send-replay"},
       {"contract: session message send rejects idempotency body conflicts",
@@ -135,6 +149,7 @@ defmodule Atp.Support.DurableLedgerContract do
 
   @direct_message_route "POST /api/messages"
   @session_open_route "POST /api/sessions"
+  @polling_claim_route "POST /api/inbox/claims"
 
   @type harness :: module()
 
@@ -1544,6 +1559,358 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_polling_claim_success(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_polling_claim_success(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    params = direct_message_params(recipient, "#{key}-message", "claim by polling lease")
+    before_counts = harness.carrier_counts()
+
+    assert {:ok, 201, sent} =
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
+
+    assert sent["carrier_status"] == "queued"
+    assert sent["message"]["to"] == recipient.address
+
+    assert {:ok, 201, claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
+
+    assert claim["id"] =~ "dlv_"
+    assert claim["message"] == sent["message"]
+    assert {:ok, _leased_until, 0} = DateTime.from_iso8601(claim["leased_until"])
+    refute Map.has_key?(claim, "claim_token")
+    refute Map.has_key?(claim, "claimed_at")
+
+    delivery = harness.get_delivery!(claim["id"])
+    message = harness.get_message!(sent["message"]["id"])
+
+    assert delivery.mode == "polling"
+    assert delivery.status == "leased"
+    assert delivery.recipient_agent_id == recipient.id
+    assert delivery.message_id == message.id
+    assert is_nil(delivery.claim_token)
+    assert is_nil(delivery.claimed_at)
+    assert message.carrier_status == "delivered"
+
+    assert {:ok, 201, replay} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
+
+    assert replay == claim
+    assert carrier_delta(before_counts, harness.carrier_counts()) == %{deliveries: 1, messages: 1}
+
+    :ok
+  end
+
+  @spec assert_polling_empty_inbox(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_polling_empty_inbox(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {_sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    before_counts = harness.carrier_counts()
+
+    assert {:ok, 200, empty} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
+
+    assert empty == %{"delivery" => nil}
+
+    assert {:ok, 200, replay} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
+
+    assert replay == empty
+    assert harness.carrier_counts() == before_counts
+
+    :ok
+  end
+
+  @spec assert_polling_active_lease_reclaim(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_polling_active_lease_reclaim(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    params = direct_message_params(recipient, "#{key}-message", "hide until lease expiry")
+
+    assert {:ok, 201, sent} =
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
+
+    assert {:ok, 201, first_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-first-claim")
+
+    assert first_claim["message"]["id"] == sent["message"]["id"]
+
+    assert {:ok, 200, %{"delivery" => nil}} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-hidden-claim")
+
+    first_claim["id"]
+    |> harness.get_delivery!()
+    |> harness.expire_delivery_lease!()
+
+    assert {:ok, 201, reclaimed} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 120}, "#{key}-reclaim")
+
+    assert reclaimed["id"] != first_claim["id"]
+    assert reclaimed["message"]["id"] == sent["message"]["id"]
+
+    persisted_reclaim = harness.get_delivery!(reclaimed["id"])
+
+    assert persisted_reclaim.mode == "polling"
+    assert persisted_reclaim.status == "leased"
+    assert persisted_reclaim.message_id == sent["message"]["id"]
+
+    :ok
+  end
+
+  @spec assert_polling_lease_blocks_webhook_claims(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_polling_lease_blocks_webhook_claims(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {webhook_delivery, message, recipient} = harness.prepare_due_webhook_delivery!(conn, key)
+
+    assert {:ok, 201, polling_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-polling-claim")
+
+    assert polling_claim["message"]["id"] == message.id
+
+    assert {:error, :delivery_in_progress} =
+             claim_delivery(adapter, webhook_delivery.id, lease_seconds: 60)
+
+    assert {:ok, nil} = claim_due(adapter, lease_seconds: 60)
+
+    polling_claim["id"]
+    |> harness.get_delivery!()
+    |> harness.expire_delivery_lease!()
+
+    assert {:ok, %DeliveryClaim{} = webhook_claim} =
+             claim_delivery(adapter, webhook_delivery.id, lease_seconds: 60)
+
+    assert webhook_claim.delivery.id == webhook_delivery.id
+    assert webhook_claim.message.id == message.id
+
+    :ok
+  end
+
+  @spec assert_polling_claim_visibility(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_polling_claim_visibility(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+
+    assert {:ok, 201, first_sent} =
+             accept_and_complete_direct_message(
+               adapter,
+               sender,
+               direct_message_params(recipient, "#{key}-first", "will be ACKed"),
+               "#{key}-send-first"
+             )
+
+    assert {:ok, 201, second_sent} =
+             accept_and_complete_direct_message(
+               adapter,
+               sender,
+               direct_message_params(recipient, "#{key}-second", "will expire"),
+               "#{key}-send-second"
+             )
+
+    message_ids = [
+      first_sent["message"]["id"],
+      second_sent["message"]["id"]
+    ]
+
+    assert {:ok, 201, claimed} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim-acked")
+
+    assert claimed["message"]["id"] in message_ids
+
+    assert {:ok, 201, _ack} =
+             ack_delivery(
+               adapter,
+               recipient,
+               claimed["id"],
+               %{"status" => "accepted"},
+               "#{key}-ack"
+             )
+
+    [expired_message_id] = message_ids -- [claimed["message"]["id"]]
+
+    expired_message_id
+    |> harness.get_message!()
+    |> harness.expire_message!()
+
+    assert {:ok, 200, %{"delivery" => nil}} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-empty")
+
+    assert harness.get_message!(claimed["message"]["id"]).current_ack_status == "accepted"
+
+    assert DateTime.compare(
+             harness.get_message!(expired_message_id).expires_at,
+             DateTime.utc_now()
+           ) == :lt
+
+    :ok
+  end
+
+  @spec assert_polling_lease_extension(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_polling_lease_extension(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+
+    assert {:ok, 201, sent} =
+             accept_and_complete_direct_message(
+               adapter,
+               sender,
+               direct_message_params(recipient, "#{key}-message", "extend this lease"),
+               "#{key}-send"
+             )
+
+    assert {:ok, 201, claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
+
+    assert claim["message"]["id"] == sent["message"]["id"]
+
+    assert {:ok, 200, extended} =
+             extend_delivery(
+               adapter,
+               recipient,
+               claim["id"],
+               %{"lease_seconds" => 120},
+               "#{key}-extend"
+             )
+
+    assert extended["id"] == claim["id"]
+    assert extended["message"] == claim["message"]
+    assert later_timestamp?(extended["leased_until"], claim["leased_until"])
+
+    assert {:ok, 200, replay} =
+             extend_delivery(
+               adapter,
+               recipient,
+               claim["id"],
+               %{"lease_seconds" => 120},
+               "#{key}-extend"
+             )
+
+    assert replay == extended
+
+    assert {:error, :idempotency_conflict} =
+             extend_delivery(
+               adapter,
+               recipient,
+               claim["id"],
+               %{"lease_seconds" => 121},
+               "#{key}-extend"
+             )
+
+    assert {:error, :not_found} =
+             extend_delivery(
+               adapter,
+               sender,
+               claim["id"],
+               %{"lease_seconds" => 120},
+               "#{key}-wrong-owner"
+             )
+
+    assert {:error, :invalid_lease} =
+             extend_delivery(
+               adapter,
+               recipient,
+               claim["id"],
+               %{"lease_seconds" => -1},
+               "#{key}-invalid-seconds"
+             )
+
+    claim["id"]
+    |> harness.get_delivery!()
+    |> harness.expire_delivery_lease!()
+
+    assert {:error, :lease_expired} =
+             extend_delivery(
+               adapter,
+               recipient,
+               claim["id"],
+               %{"lease_seconds" => 120},
+               "#{key}-expired"
+             )
+
+    {webhook_delivery, _webhook_message, webhook_recipient} =
+      harness.prepare_due_webhook_delivery!(conn, "#{key}-webhook")
+
+    assert {:error, :invalid_lease} =
+             extend_delivery(
+               adapter,
+               webhook_recipient,
+               webhook_delivery.id,
+               %{"lease_seconds" => 120},
+               "#{key}-webhook"
+             )
+
+    :ok
+  end
+
+  @spec assert_polling_session_ordering(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_polling_session_ordering(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+
+    assert {:ok, 201, opened} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-opening", "open polling session"),
+               "#{key}-open"
+             )
+
+    session_id = opened["session"]["id"]
+    opening_message_id = opened["message_status"]["message"]["id"]
+
+    assert {:ok, 201, opening_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim-opening")
+
+    assert opening_claim["message"]["id"] == opening_message_id
+
+    assert {:ok, 201, _ack} =
+             ack_delivery(
+               adapter,
+               recipient,
+               opening_claim["id"],
+               %{"status" => "accepted"},
+               "#{key}-ack-opening"
+             )
+
+    assert harness.get_session!(session_id).status == "open"
+
+    assert {:ok, 201, first} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session_id,
+               session_message_params("#{key}-first", "first polling session message"),
+               "#{key}-send-first"
+             )
+
+    assert {:ok, 201, second} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session_id,
+               session_message_params("#{key}-second", "second polling session message"),
+               "#{key}-send-second"
+             )
+
+    assert {:ok, 201, first_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim-first")
+
+    assert first_claim["message"]["id"] == first["message_status"]["message"]["id"]
+
+    assert {:ok, 201, second_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim-second")
+
+    assert second_claim["message"]["id"] == second["message_status"]["message"]["id"]
+
+    assert [1, 2, 3] =
+             session_id
+             |> harness.get_messages_for_session!()
+             |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
   @spec assert_session_message_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
           :ok
   def assert_session_message_idempotent_replay(adapter, harness, conn, key)
@@ -2121,6 +2488,21 @@ defmodule Atp.Support.DurableLedgerContract do
   defp ack_delivery(adapter, recipient, delivery_id, params, key) do
     route = "POST /api/deliveries/#{delivery_id}/acks"
     adapter.ack_delivery(recipient, delivery_id, params, key, route)
+  end
+
+  defp claim_inbox(adapter, recipient, params, key),
+    do: adapter.claim_inbox(recipient, params, key, @polling_claim_route)
+
+  defp extend_delivery(adapter, recipient, delivery_id, params, key) do
+    route = "POST /api/deliveries/#{delivery_id}/extend"
+    adapter.extend_delivery(recipient, delivery_id, params, key, route)
+  end
+
+  defp later_timestamp?(later, earlier) do
+    {:ok, later, 0} = DateTime.from_iso8601(later)
+    {:ok, earlier, 0} = DateTime.from_iso8601(earlier)
+
+    DateTime.compare(later, earlier) == :gt
   end
 
   defp assert_expired_session_action(adapter, harness, conn, key, action)
