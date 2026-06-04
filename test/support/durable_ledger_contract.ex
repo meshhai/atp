@@ -72,6 +72,8 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_blocked_direct_message_no_delivery_work, "direct-blocked"},
       {"contract: successful direct message intake creates message state and delivery work",
        :assert_successful_direct_message_intake, "direct-success"},
+      {"contract: message status reads preserve participant visibility",
+       :assert_message_status_reads, "message-status-reads"},
       {"contract: session open replays stable idempotent responses",
        :assert_open_session_idempotent_replay, "session-open-replay"},
       {"contract: concurrent session open retries create one committed session",
@@ -84,6 +86,8 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_blocked_session_open_no_delivery_work, "session-open-blocked"},
       {"contract: successful session open creates session state and delivery work",
        :assert_successful_session_open, "session-open-success"},
+      {"contract: session transcript reads preserve participant visibility and order",
+       :assert_session_transcript_reads, "session-transcript-reads"},
       {"contract: session accept records ACK and opens the pending session",
        :assert_successful_session_accept, "session-accept-success"},
       {"contract: session accept replays and conflicts idempotently",
@@ -108,8 +112,12 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_delivery_ack_request_validation_and_idempotency, "delivery-ack-request"},
       {"contract: opening delivery ACK updates durable session state",
        :assert_delivery_ack_opening_session_side_effects, "delivery-ack-opening"},
+      {"contract: opening delivery lookup returns only recipient-owned opening sessions",
+       :assert_opening_session_delivery_lookup, "opening-delivery-lookup"},
       {"contract: expired opening delivery ACK fails the pending session",
        :assert_delivery_ack_expired_opening_session, "delivery-ack-expired-opening"},
+      {"contract: pending opening expiry atomically fails the session and opening",
+       :assert_pending_opening_expiry, "pending-opening-expiry"},
       {"contract: polling inbox claim creates a recipient-owned lease",
        :assert_polling_claim_success, "polling-claim-success"},
       {"contract: polling inbox claim returns an empty stable response",
@@ -124,6 +132,10 @@ defmodule Atp.Support.DurableLedgerContract do
        :assert_polling_lease_extension, "polling-lease-extension"},
       {"contract: polling session claims preserve message order",
        :assert_polling_session_ordering, "polling-session-order"},
+      {"contract: sender policy upsert is recipient-owned and idempotent",
+       :assert_sender_policy_upsert, "sender-policy-upsert"},
+      {"contract: runtime session helpers expose only durable active sessions",
+       :assert_runtime_session_helpers, "runtime-session-helpers"},
       {"contract: session message send replays stable idempotent responses",
        :assert_session_message_idempotent_replay, "session-send-replay"},
       {"contract: session message send rejects idempotency body conflicts",
@@ -631,6 +643,42 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_message_status_reads(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_message_status_reads(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    {_outsider_sender, outsider} = harness.prepare_direct_message_pair!(conn, "#{key}-outsider")
+    params = direct_message_params(recipient, "#{key}-message", "read status")
+
+    assert {:ok, 201, sent} =
+             accept_and_complete_direct_message(adapter, sender, params, "#{key}-send")
+
+    assert {:ok, 201, claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
+
+    message_id = sent["message"]["id"]
+
+    assert claim["message"]["id"] == message_id
+
+    assert {:ok, sender_status} = adapter.get_message_status(sender, message_id)
+    assert {:ok, recipient_status} = adapter.get_message_status(recipient, message_id)
+
+    assert sender_status["message"] == sent["message"]
+    assert sender_status["carrier_status"] == "delivered"
+    assert sender_status["ack_status"] == nil
+
+    assert [%{"id" => delivery_id, "mode" => "polling", "status" => "leased"}] =
+             sender_status["deliveries"]
+
+    assert delivery_id == claim["id"]
+    assert recipient_status == sender_status
+
+    assert {:error, :not_found} = adapter.get_message_status(outsider, message_id)
+    assert {:error, :not_found} = adapter.get_message_status(sender, "msg_missing_#{key}")
+
+    :ok
+  end
+
   @spec assert_open_session_idempotent_replay(module(), harness(), Plug.Conn.t(), String.t()) ::
           :ok
   def assert_open_session_idempotent_replay(adapter, harness, conn, key)
@@ -897,6 +945,88 @@ defmodule Atp.Support.DurableLedgerContract do
            }
 
     assert {:ok, 201, ^body} = complete_prepared_session_open(prepared)
+
+    :ok
+  end
+
+  @spec assert_session_transcript_reads(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_session_transcript_reads(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {initiator, recipient} = harness.prepare_session_pair!(conn, key)
+    {_outsider_sender, outsider} = harness.prepare_session_pair!(conn, "#{key}-outsider")
+
+    assert {:ok, 201, opened} =
+             open_and_complete_session(
+               adapter,
+               initiator,
+               session_open_params(recipient, "#{key}-opening", "read transcript"),
+               "#{key}-open"
+             )
+
+    session_id = opened["session"]["id"]
+    opening_message_id = opened["message_status"]["message"]["id"]
+
+    assert {:ok, 201, opening_claim} =
+             claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim-opening")
+
+    assert opening_claim["message"]["id"] == opening_message_id
+
+    assert {:ok, 201, accepted} =
+             ack_delivery(
+               adapter,
+               recipient,
+               opening_claim["id"],
+               %{"status" => "accepted"},
+               "#{key}-accept-opening"
+             )
+
+    assert accepted["message_status"]["ack_status"] == "accepted"
+    assert harness.get_session!(session_id).status == "open"
+
+    assert {:ok, 201, recipient_reply} =
+             send_and_complete_session_message(
+               adapter,
+               recipient,
+               session_id,
+               session_message_params("#{key}-recipient", "recipient turn"),
+               "#{key}-recipient-reply"
+             )
+
+    assert {:ok, 201, initiator_reply} =
+             send_and_complete_session_message(
+               adapter,
+               initiator,
+               session_id,
+               session_message_params("#{key}-initiator", "initiator turn"),
+               "#{key}-initiator-reply"
+             )
+
+    assert {:ok, transcript} = adapter.get_session(initiator, session_id)
+    assert {:ok, recipient_transcript} = adapter.get_session(recipient, session_id)
+
+    assert transcript["session"]["id"] == session_id
+    assert transcript["session"]["status"] == "open"
+
+    assert Enum.map(transcript["messages"], &get_in(&1, ["message", "session_sequence"])) ==
+             [1, 2, 3]
+
+    assert Enum.map(transcript["messages"], &get_in(&1, ["message", "id"])) == [
+             opening_message_id,
+             recipient_reply["message_status"]["message"]["id"],
+             initiator_reply["message_status"]["message"]["id"]
+           ]
+
+    assert [
+             %{"ack_status" => "accepted"},
+             %{"carrier_status" => "queued"},
+             %{"carrier_status" => "queued"}
+           ] = transcript["messages"]
+
+    assert Enum.map(recipient_transcript["messages"], &get_in(&1, ["message", "id"])) ==
+             Enum.map(transcript["messages"], &get_in(&1, ["message", "id"]))
+
+    assert {:error, :not_found} = adapter.get_session(outsider, session_id)
+    assert {:error, :not_found} = adapter.get_session(initiator, "ses_missing_#{key}")
 
     :ok
   end
@@ -1521,6 +1651,45 @@ defmodule Atp.Support.DurableLedgerContract do
     :ok
   end
 
+  @spec assert_opening_session_delivery_lookup(module(), harness(), Plug.Conn.t(), String.t()) ::
+          :ok
+  def assert_opening_session_delivery_lookup(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {session, _opening, delivery, initiator, recipient} =
+      harness.prepare_opening_polling_delivery!(conn, key)
+
+    {_outsider_sender, outsider} = harness.prepare_session_pair!(conn, "#{key}-outsider")
+
+    assert adapter.opening_session_id_for_delivery(recipient, delivery.id) == session.id
+    assert adapter.opening_session_id_for_delivery(initiator, delivery.id) == nil
+    assert adapter.opening_session_id_for_delivery(outsider, delivery.id) == nil
+    assert adapter.opening_session_id_for_delivery(recipient, "dlv_missing_#{key}") == nil
+
+    {direct_sender, direct_recipient} =
+      harness.prepare_direct_message_pair!(conn, "#{key}-direct-message")
+
+    assert {:ok, 201, sent} =
+             accept_and_complete_direct_message(
+               adapter,
+               direct_sender,
+               direct_message_params(direct_recipient, "#{key}-direct", "not an opening"),
+               "#{key}-direct-send"
+             )
+
+    assert {:ok, 201, direct_claim} =
+             claim_inbox(
+               adapter,
+               direct_recipient,
+               %{"lease_seconds" => 60},
+               "#{key}-direct-claim"
+             )
+
+    assert direct_claim["message"]["id"] == sent["message"]["id"]
+    assert adapter.opening_session_id_for_delivery(direct_recipient, direct_claim["id"]) == nil
+
+    :ok
+  end
+
   @spec assert_delivery_ack_expired_opening_session(
           module(),
           harness(),
@@ -1555,6 +1724,94 @@ defmodule Atp.Support.DurableLedgerContract do
     assert %DateTime{} = persisted_opening.terminal_at
     refute persisted_opening.current_ack_status
     assert [] = harness.get_acks_for_message!(opening.id)
+
+    :ok
+  end
+
+  @spec assert_pending_opening_expiry(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_pending_opening_expiry(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    assert {:error, :not_found} =
+             adapter.expire_pending_opening_session(
+               "ses_missing_#{key}",
+               DateTime.utc_now(:microsecond)
+             )
+
+    {not_due_initiator, not_due_recipient} =
+      harness.prepare_session_pair!(conn, "#{key}-not-due")
+
+    assert {:ok, 201, not_due} =
+             open_and_complete_session(
+               adapter,
+               not_due_initiator,
+               session_open_params(
+                 not_due_recipient,
+                 "#{key}-not-due-opening",
+                 "not due"
+               ),
+               "#{key}-not-due-open"
+             )
+
+    assert {:error, :opening_session_not_due} =
+             adapter.expire_pending_opening_session(
+               not_due["session"]["id"],
+               DateTime.utc_now(:microsecond)
+             )
+
+    {_open_initiator, _open_recipient, open_session} =
+      prepare_open_session!(adapter, harness, conn, "#{key}-open")
+
+    assert {:error, :session_not_pending} =
+             adapter.expire_pending_opening_session(
+               open_session.id,
+               DateTime.utc_now(:microsecond)
+             )
+
+    {due_initiator, due_recipient} = harness.prepare_session_pair!(conn, "#{key}-due")
+
+    assert {:ok, 201, due} =
+             open_and_complete_session(
+               adapter,
+               due_initiator,
+               session_open_params(due_recipient, "#{key}-due-opening", "due"),
+               "#{key}-due-open"
+             )
+
+    due_session_id = due["session"]["id"]
+    due_opening_id = due["message_status"]["message"]["id"]
+
+    due_opening_id
+    |> harness.get_message!()
+    |> harness.expire_message!()
+
+    assert {:ok, %Session{} = expired_session} =
+             adapter.expire_pending_opening_session(
+               due_session_id,
+               DateTime.utc_now(:microsecond)
+             )
+
+    assert expired_session.id == due_session_id
+    assert expired_session.status == "failed"
+    assert %DateTime{} = expired_session.terminal_at
+    refute expired_session.opened_at
+
+    persisted_session = harness.get_session!(due_session_id)
+    persisted_opening = harness.get_message!(due_opening_id)
+
+    assert persisted_session.status == "failed"
+    assert %DateTime{} = persisted_session.terminal_at
+    refute persisted_session.opened_at
+
+    assert persisted_opening.carrier_status == "expired"
+    assert %DateTime{} = persisted_opening.terminal_at
+    refute persisted_opening.current_ack_status
+    assert harness.get_acks_for_message!(due_opening_id) == []
+
+    assert {:error, :session_not_pending} =
+             adapter.expire_pending_opening_session(
+               due_session_id,
+               DateTime.utc_now(:microsecond)
+             )
 
     :ok
   end
@@ -1907,6 +2164,177 @@ defmodule Atp.Support.DurableLedgerContract do
              session_id
              |> harness.get_messages_for_session!()
              |> Enum.map(& &1.session_sequence)
+
+    :ok
+  end
+
+  @spec assert_sender_policy_upsert(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_sender_policy_upsert(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {sender, recipient} = harness.prepare_direct_message_pair!(conn, key)
+    route = sender_policy_route(recipient.id)
+    before_count = harness.sender_policy_count()
+
+    allow_params = %{
+      "effect" => "allow",
+      "sender_agent_id" => sender.id
+    }
+
+    assert {:ok, 200, first} =
+             adapter.upsert_sender_policy(
+               recipient,
+               recipient.id,
+               allow_params,
+               "#{key}-allow",
+               route
+             )
+
+    assert first["sender_policy"]["recipient_agent_id"] == recipient.id
+    assert first["sender_policy"]["sender_agent_id"] == sender.id
+    assert first["sender_policy"]["effect"] == "allow"
+
+    assert {:ok, 200, replay} =
+             adapter.upsert_sender_policy(
+               recipient,
+               recipient.id,
+               allow_params,
+               "#{key}-allow",
+               route
+             )
+
+    assert replay == first
+
+    assert {:error, :idempotency_conflict} =
+             adapter.upsert_sender_policy(
+               recipient,
+               recipient.id,
+               %{allow_params | "effect" => "block"},
+               "#{key}-allow",
+               route
+             )
+
+    assert {:error, :not_found} =
+             adapter.upsert_sender_policy(
+               sender,
+               recipient.id,
+               allow_params,
+               "#{key}-wrong-owner",
+               route
+             )
+
+    assert {:error, :invalid_sender_policy} =
+             adapter.upsert_sender_policy(
+               recipient,
+               recipient.id,
+               %{"effect" => "allow"},
+               "#{key}-missing-target",
+               route
+             )
+
+    assert {:error, :not_found} =
+             adapter.upsert_sender_policy(
+               recipient,
+               recipient.id,
+               %{"effect" => "allow", "sender_agent_id" => "agt_missing_#{key}"},
+               "#{key}-missing-sender",
+               route
+             )
+
+    assert {:ok, 200, updated} =
+             adapter.upsert_sender_policy(
+               recipient,
+               recipient.id,
+               %{allow_params | "effect" => "block"},
+               "#{key}-block",
+               route
+             )
+
+    assert updated["sender_policy"]["id"] == first["sender_policy"]["id"]
+    assert updated["sender_policy"]["effect"] == "block"
+    assert harness.sender_policy_count() == before_count + 1
+
+    :ok
+  end
+
+  @spec assert_runtime_session_helpers(module(), harness(), Plug.Conn.t(), String.t()) :: :ok
+  def assert_runtime_session_helpers(adapter, harness, conn, key)
+      when is_atom(adapter) and is_atom(harness) and is_binary(key) do
+    {pending_initiator, pending_recipient} =
+      harness.prepare_session_pair!(conn, "#{key}-pending")
+
+    assert {:ok, 201, pending} =
+             open_and_complete_session(
+               adapter,
+               pending_initiator,
+               session_open_params(
+                 pending_recipient,
+                 "#{key}-pending-opening",
+                 "hydrate pending"
+               ),
+               "#{key}-pending-open"
+             )
+
+    pending_session_id = pending["session"]["id"]
+    pending_opening_id = pending["message_status"]["message"]["id"]
+
+    assert pending_session_id in adapter.list_pending_session_ids()
+    assert {:error, :session_not_open} = adapter.fetch_open_session(pending_session_id)
+
+    assert {:ok, %Session{} = pending_runtime_session} =
+             adapter.fetch_runtime_session(pending_session_id)
+
+    assert pending_runtime_session.id == pending_session_id
+    assert pending_runtime_session.status == "pending"
+    assert pending_runtime_session.opening_message.id == pending_opening_id
+
+    {_open_initiator, _open_recipient, open_session} =
+      prepare_open_session!(adapter, harness, conn, "#{key}-open")
+
+    assert {:ok, %Session{} = fetched_open_session} = adapter.fetch_open_session(open_session.id)
+    assert fetched_open_session.id == open_session.id
+    assert fetched_open_session.status == "open"
+
+    assert {:ok, %Session{} = open_runtime_session} =
+             adapter.fetch_runtime_session(open_session.id)
+
+    assert open_runtime_session.id == open_session.id
+    assert open_runtime_session.status == "open"
+    assert open_runtime_session.opening_message.id == open_session.opening_message_id
+    refute open_session.id in adapter.list_pending_session_ids()
+
+    {terminal_initiator, terminal_recipient} =
+      harness.prepare_session_pair!(conn, "#{key}-terminal")
+
+    assert {:ok, 201, terminal} =
+             open_and_complete_session(
+               adapter,
+               terminal_initiator,
+               session_open_params(
+                 terminal_recipient,
+                 "#{key}-terminal-opening",
+                 "terminal helper"
+               ),
+               "#{key}-terminal-open"
+             )
+
+    assert {:ok, 201, terminal_reject} =
+             reject_session(
+               adapter,
+               terminal_recipient,
+               terminal["session"]["id"],
+               %{},
+               "#{key}-reject"
+             )
+
+    assert terminal_reject["session"]["status"] == "rejected"
+
+    assert {:error, :session_not_open} = adapter.fetch_open_session(terminal["session"]["id"])
+
+    assert {:error, :session_not_active} =
+             adapter.fetch_runtime_session(terminal["session"]["id"])
+
+    assert {:error, :not_found} = adapter.fetch_open_session("ses_missing_#{key}")
+    assert {:error, :not_found} = adapter.fetch_runtime_session("ses_missing_#{key}")
 
     :ok
   end
@@ -2497,6 +2925,8 @@ defmodule Atp.Support.DurableLedgerContract do
     route = "POST /api/deliveries/#{delivery_id}/extend"
     adapter.extend_delivery(recipient, delivery_id, params, key, route)
   end
+
+  defp sender_policy_route(agent_id), do: "PUT /api/agents/#{agent_id}/sender_policies"
 
   defp later_timestamp?(later, earlier) do
     {:ok, later, 0} = DateTime.from_iso8601(later)
