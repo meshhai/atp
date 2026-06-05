@@ -89,6 +89,13 @@ defmodule Atp.Transport.WebhookDelivery do
       DateTime.compare(message.expires_at, now) != :gt ->
         DurableLedger.terminalize_claimed_webhook_delivery(claim, :message_expired, now: now)
 
+      not active_webhook_endpoint?(recipient) ->
+        DurableLedger.terminalize_claimed_webhook_delivery(
+          claim,
+          :webhook_endpoint_inactive,
+          now: now
+        )
+
       true ->
         attempt_delivery(claim, recipient, now)
     end
@@ -116,6 +123,17 @@ defmodule Atp.Transport.WebhookDelivery do
   end
 
   defp acked?(%Message{current_ack_status: status}), do: not is_nil(status)
+
+  defp active_webhook_endpoint?(%Agent{
+         webhook_active: true,
+         webhook_url: url,
+         webhook_secret: secret
+       })
+       when is_binary(url) and is_binary(secret) do
+    String.trim(url) != "" and String.trim(secret) != ""
+  end
+
+  defp active_webhook_endpoint?(%Agent{}), do: false
 
   defp attempt_delivery(
          %DeliveryClaim{delivery: delivery, message: message, attempt_number: attempt_number} =

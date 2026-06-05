@@ -101,6 +101,75 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   @impl DurableLedger
+  @spec get_session(Agent.t(), String.t()) :: DurableLedger.read_result()
+  def get_session(%Agent{} = agent, session_id) when is_binary(session_id) do
+    case Repo.get(Session, session_id) do
+      %Session{} = session when session.initiator_agent_id == agent.id ->
+        {:ok, session_transcript_response(session, agent)}
+
+      %Session{} = session when session.recipient_agent_id == agent.id ->
+        {:ok, session_transcript_response(session, agent)}
+
+      _other ->
+        {:error, :not_found}
+    end
+  end
+
+  @impl DurableLedger
+  @spec fetch_open_session(String.t()) :: DurableLedger.open_session_fetch_result()
+  def fetch_open_session(session_id) when is_binary(session_id) do
+    case Repo.get(Session, session_id) do
+      %Session{status: "open"} = session -> {:ok, session}
+      %Session{} -> {:error, :session_not_open}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  @impl DurableLedger
+  @spec fetch_runtime_session(String.t()) :: DurableLedger.runtime_session_fetch_result()
+  def fetch_runtime_session(session_id) when is_binary(session_id) do
+    case Session |> Repo.get(session_id) |> Repo.preload(:opening_message) do
+      %Session{status: status} = session when status in ~w(pending open) ->
+        {:ok, session}
+
+      %Session{} ->
+        {:error, :session_not_active}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  @impl DurableLedger
+  @spec list_pending_session_ids() :: [String.t()]
+  def list_pending_session_ids do
+    Session
+    |> where([session], session.status == "pending")
+    |> where([session], not is_nil(session.opening_message_id))
+    |> order_by([session], asc: session.inserted_at)
+    |> select([session], session.id)
+    |> Repo.all()
+  end
+
+  @impl DurableLedger
+  @spec expire_pending_opening_session(String.t(), DateTime.t()) ::
+          DurableLedger.pending_opening_expiry_result()
+  def expire_pending_opening_session(session_id, %DateTime{} = now) when is_binary(session_id) do
+    Repo.transaction(fn ->
+      with {:ok, message} <- lock_opening_message_for_session(session_id),
+           {:ok, session} <- lock_pending_session_for_opening_message(session_id, message.id) do
+        expire_locked_pending_opening_session(session, message, now)
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, %Session{} = session} -> {:ok, session}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl DurableLedger
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           DurableLedger.session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
@@ -139,6 +208,50 @@ defmodule Atp.Transport.DurableLedger.Postgres do
            {:ok, payload} <- fetch_optional_payload(params),
            :ok <- Payload.validate_optional_a2a(payload) do
         append_ack(recipient, delivery_id, ack_status, payload, :delivery)
+      end
+    end)
+  end
+
+  @impl DurableLedger
+  @spec opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
+  def opening_session_id_for_delivery(%Agent{} = agent, delivery_id)
+      when is_binary(delivery_id) do
+    Delivery
+    |> where([delivery], delivery.id == ^delivery_id)
+    |> where([delivery], delivery.recipient_agent_id == ^agent.id)
+    |> join(:inner, [delivery], message in assoc(delivery, :message))
+    |> join(:inner, [_delivery, message], session in Session,
+      on: session.id == message.session_id and session.opening_message_id == message.id
+    )
+    |> select([_delivery, _message, session], session.id)
+    |> Repo.one()
+  end
+
+  @impl DurableLedger
+  @spec get_message_status(Agent.t(), String.t()) :: DurableLedger.read_result()
+  def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
+    case Repo.get(Message, message_id) do
+      %Message{} = message when message.sender_agent_id == agent.id ->
+        {:ok, Response.message_status(message, agent)}
+
+      %Message{} = message when message.recipient_agent_id == agent.id ->
+        {:ok, Response.message_status(message, agent)}
+
+      _other ->
+        {:error, :not_found}
+    end
+  end
+
+  @impl DurableLedger
+  @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          DurableLedger.sender_policy_result()
+  def upsert_sender_policy(%Agent{} = recipient, agent_id, params, idempotency_key, route)
+      when is_binary(agent_id) and is_map(params) and is_binary(route) do
+    recipient
+    |> Idempotency.run(route, idempotency_key, params, fn ->
+      with :ok <- ensure_own_agent(recipient, agent_id),
+           {:ok, policy} <- SenderPolicies.upsert(recipient, params) do
+        {:ok, 200, SenderPolicies.to_response(policy)}
       end
     end)
   end
@@ -235,6 +348,16 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     with {:ok, delivery_id} <- ensure_session_lifecycle_delivery(recipient, session_id) do
       append_session_lifecycle_ack(recipient, delivery_id, "rejected", payload)
     end
+  end
+
+  defp session_transcript_response(%Session{} = session, %Agent{} = viewer) do
+    messages =
+      Message
+      |> where([message], message.session_id == ^session.id)
+      |> order_by([message], asc: message.session_sequence, asc: message.inserted_at)
+      |> Repo.all()
+
+    Response.session_transcript(session, messages, viewer)
   end
 
   defp claim_next_polling_message(%Agent{} = recipient, lease_seconds) do
@@ -505,7 +628,8 @@ defmodule Atp.Transport.DurableLedger.Postgres do
         reason,
         opts
       )
-      when is_binary(delivery_id) and reason in [:message_acked, :message_expired] and
+      when is_binary(delivery_id) and
+             reason in [:message_acked, :message_expired, :webhook_endpoint_inactive] and
              is_list(opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now(:microsecond))
 
@@ -565,6 +689,9 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp ensure_distinct_session_participant(%Agent{}, %Agent{}), do: :ok
+
+  defp ensure_own_agent(%Agent{id: agent_id}, agent_id), do: :ok
+  defp ensure_own_agent(%Agent{}, _agent_id), do: {:error, :not_found}
 
   defp fetch_locked_participant_session(%Agent{} = agent, session_id) do
     query =
@@ -984,6 +1111,70 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       )
 
     {:ok, Repo.one(query)}
+  end
+
+  defp lock_opening_message_for_session(session_id) do
+    Session
+    |> where([session], session.id == ^session_id)
+    |> select([session], %{
+      status: session.status,
+      opening_message_id: session.opening_message_id
+    })
+    |> Repo.one()
+    |> case do
+      nil ->
+        {:error, :not_found}
+
+      %{status: "pending", opening_message_id: opening_message_id}
+      when is_binary(opening_message_id) ->
+        lock_opening_message(opening_message_id)
+
+      _session ->
+        {:error, :session_not_pending}
+    end
+  end
+
+  defp lock_opening_message(opening_message_id) do
+    Message
+    |> where([message], message.id == ^opening_message_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      %Message{} = message -> {:ok, message}
+      nil -> {:error, :session_not_pending}
+    end
+  end
+
+  defp lock_pending_session_for_opening_message(session_id, opening_message_id) do
+    Session
+    |> where([session], session.id == ^session_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      nil ->
+        {:error, :not_found}
+
+      %Session{status: "pending", opening_message_id: ^opening_message_id} = session ->
+        {:ok, session}
+
+      %Session{} ->
+        {:error, :session_not_pending}
+    end
+  end
+
+  defp expire_locked_pending_opening_session(
+         %Session{} = session,
+         %Message{expires_at: expires_at} = message,
+         now
+       ) do
+    if DateTime.compare(expires_at, now) == :gt do
+      Repo.rollback(:opening_session_not_due)
+    else
+      {:ok, _message} = expire_opening_message(message, now)
+      {:ok, expired_session} = fail_pending_opening_session(session, now)
+
+      expired_session
+    end
   end
 
   defp expire_due_opening_session(
@@ -1406,18 +1597,50 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   defp validate_webhook_terminal_claim(delivery, claim, reason, now) do
     case validate_webhook_delivery_claim(delivery, claim, now) do
-      :ok -> validate_webhook_terminal_reason(delivery.message, reason, now)
+      :ok -> validate_webhook_terminal_reason(delivery.message, claim, reason, now)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp validate_webhook_terminal_reason(%Message{} = message, :message_acked, _now) do
+  defp validate_webhook_terminal_reason(
+         %Message{} = message,
+         %DeliveryClaim{},
+         :message_acked,
+         _now
+       ) do
     if acked?(message), do: :ok, else: {:error, :stale_delivery_claim}
   end
 
-  defp validate_webhook_terminal_reason(%Message{} = message, :message_expired, now) do
+  defp validate_webhook_terminal_reason(
+         %Message{} = message,
+         %DeliveryClaim{},
+         :message_expired,
+         now
+       ) do
     if expired?(message, now), do: :ok, else: {:error, :stale_delivery_claim}
   end
+
+  defp validate_webhook_terminal_reason(
+         %Message{},
+         %DeliveryClaim{} = claim,
+         :webhook_endpoint_inactive,
+         _now
+       ) do
+    if inactive_webhook_endpoint?(claim.recipient_agent),
+      do: :ok,
+      else: {:error, :stale_delivery_claim}
+  end
+
+  defp inactive_webhook_endpoint?(%Agent{
+         webhook_active: true,
+         webhook_url: url,
+         webhook_secret: secret
+       })
+       when is_binary(url) and is_binary(secret) do
+    String.trim(url) == "" or String.trim(secret) == ""
+  end
+
+  defp inactive_webhook_endpoint?(%Agent{}), do: true
 
   defp current_webhook_claim_lease?(
          %Delivery{leased_until: %DateTime{} = leased_until},
@@ -1500,6 +1723,32 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     |> where([persisted_message], persisted_message.id == ^message.id)
     |> where([persisted_message], persisted_message.carrier_status != "delivered")
     |> Repo.update_all(set: [carrier_status: "expired", terminal_at: now, updated_at: now])
+
+    Repo.get!(Message, message.id)
+  end
+
+  defp terminalize_claimed_webhook_delivery!(
+         %Delivery{message: %Message{} = message} = delivery,
+         :webhook_endpoint_inactive,
+         _now
+       ) do
+    delivery
+    |> Ecto.Changeset.change(
+      status: "failed",
+      claim_token: nil,
+      claimed_at: nil,
+      leased_until: nil,
+      next_attempt_at: nil,
+      last_error: "webhook_endpoint_inactive"
+    )
+    |> Repo.update!()
+
+    Message
+    |> where([persisted_message], persisted_message.id == ^message.id)
+    |> where([persisted_message], persisted_message.carrier_status != "delivered")
+    |> Repo.update_all(
+      set: [carrier_status: "delivery_failed", updated_at: DateTime.utc_now(:microsecond)]
+    )
 
     Repo.get!(Message, message.id)
   end

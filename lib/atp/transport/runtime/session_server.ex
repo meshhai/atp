@@ -3,10 +3,12 @@ defmodule Atp.Transport.Runtime.SessionServer do
 
   use GenServer
 
-  alias Atp.Transport.{DurableLedger, Ledger, Session, SessionIntake}
+  alias Atp.Transport.{DurableLedger, Session, SessionIntake}
   alias Atp.Transport.Runtime.SessionState
 
   @registry Atp.Transport.Runtime.SessionRegistry
+
+  @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
   @spec child_spec(String.t()) :: Supervisor.child_spec()
   def child_spec(session_id) when is_binary(session_id) do
@@ -31,7 +33,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
           map(),
           String.t() | nil,
           String.t()
-        ) :: Ledger.api_result()
+        ) :: api_result()
   def send_session_message(server, sender, params, idempotency_key, route) do
     with {:ok, status, body, prepared, dispatch_ticket} <-
            prepare_session_message_send(server, sender, params, idempotency_key, route) do
@@ -53,7 +55,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
 
   @impl true
   def init(session_id) do
-    case Ledger.fetch_runtime_session(session_id) do
+    case DurableLedger.fetch_runtime_session(session_id) do
       {:ok, %Session{} = session} ->
         {:ok, session |> SessionState.from_session() |> schedule_lifecycle_timer()}
 
@@ -132,7 +134,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
   end
 
   defp refresh_state_after_send({:ok, _status, _body, _prepared}, session_id, state) do
-    {:ok, %Session{} = session} = Ledger.fetch_runtime_session(session_id)
+    {:ok, %Session{} = session} = DurableLedger.fetch_runtime_session(session_id)
     state |> SessionState.refresh_from_session(session) |> schedule_lifecycle_timer()
   end
 
@@ -210,7 +212,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
       ) do
     now = DateTime.utc_now(:microsecond)
 
-    case Ledger.expire_pending_opening_session(session_id, now) do
+    case DurableLedger.expire_pending_opening_session(session_id, now) do
       {:ok, %Session{} = session} ->
         refreshed_state =
           state
@@ -248,7 +250,7 @@ defmodule Atp.Transport.Runtime.SessionServer do
   end
 
   defp refresh_state(session_id, %SessionState{} = state) do
-    with {:ok, %Session{} = session} <- Ledger.fetch_runtime_session(session_id) do
+    with {:ok, %Session{} = session} <- DurableLedger.fetch_runtime_session(session_id) do
       refreshed_state =
         state
         |> cancel_lifecycle_timer()

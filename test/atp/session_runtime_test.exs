@@ -10,7 +10,6 @@ defmodule Atp.SessionRuntimeTest do
   alias Atp.Transport.{
     Delivery,
     DurableLedger,
-    Ledger,
     Message,
     Runtime,
     Session,
@@ -148,6 +147,37 @@ defmodule Atp.SessionRuntimeTest do
          "ack" => %{"status" => params["status"]},
          "message_status" => %{"ack_status" => params["status"]}
        }}
+    end
+
+    @impl DurableLedger
+    def get_message_status(_agent, _message_id), do: {:error, :unexpected_message_status}
+
+    @impl DurableLedger
+    def get_session(_agent, _session_id), do: {:error, :unexpected_get_session}
+
+    @impl DurableLedger
+    def fetch_open_session(session_id), do: DurableLedger.Postgres.fetch_open_session(session_id)
+
+    @impl DurableLedger
+    def fetch_runtime_session(session_id),
+      do: DurableLedger.Postgres.fetch_runtime_session(session_id)
+
+    @impl DurableLedger
+    def list_pending_session_ids, do: DurableLedger.Postgres.list_pending_session_ids()
+
+    @impl DurableLedger
+    def expire_pending_opening_session(session_id, now) do
+      DurableLedger.Postgres.expire_pending_opening_session(session_id, now)
+    end
+
+    @impl DurableLedger
+    def opening_session_id_for_delivery(agent, delivery_id) do
+      DurableLedger.Postgres.opening_session_id_for_delivery(agent, delivery_id)
+    end
+
+    @impl DurableLedger
+    def upsert_sender_policy(_recipient, _agent_id, _params, _idempotency_key, _route) do
+      {:error, :unexpected_sender_policy}
     end
 
     @impl DurableLedger
@@ -456,6 +486,25 @@ defmodule Atp.SessionRuntimeTest do
     assert %DateTime{} = persisted_opening.terminal_at
   end
 
+  test "pending opening expiry returns durable validation errors", %{conn: conn} do
+    pending_session =
+      open_pending_session_without_runtime_context!(conn, "runtime-pending-expiry-errors")
+
+    accepted_session =
+      open_accepted_session_without_runtime_context!(conn, "runtime-pending-expiry-non-pending")
+
+    now = DateTime.utc_now(:microsecond)
+
+    assert {:error, :not_found} =
+             DurableLedger.expire_pending_opening_session("ses_missing_for_pending_expiry", now)
+
+    assert {:error, :opening_session_not_due} =
+             DurableLedger.expire_pending_opening_session(pending_session["id"], now)
+
+    assert {:error, :session_not_pending} =
+             DurableLedger.expire_pending_opening_session(accepted_session.session["id"], now)
+  end
+
   test "accepted opening ACK warms a hydrated session process", %{conn: conn} do
     {initiator, recipient} = register_session_agents!(conn, "runtime-opening-ack")
 
@@ -744,7 +793,7 @@ defmodule Atp.SessionRuntimeTest do
                 send(parent, {:expiry_backend_pid, backend_pid})
 
                 result =
-                  Ledger.expire_pending_opening_session(
+                  DurableLedger.expire_pending_opening_session(
                     session_id,
                     DateTime.utc_now(:microsecond)
                   )
@@ -809,7 +858,7 @@ defmodule Atp.SessionRuntimeTest do
           refute persisted_opening.current_ack_status
 
           assert {:ok, %{"session" => %{"status" => "failed"}}} =
-                   Ledger.get_session(Repo.get!(Agent, initiator["id"]), session_id)
+                   DurableLedger.get_session(Repo.get!(Agent, initiator["id"]), session_id)
         after
           send(session_lock_task.pid, :release_session_lock)
           Task.shutdown(session_lock_task, :brutal_kill)
@@ -866,7 +915,7 @@ defmodule Atp.SessionRuntimeTest do
     assert is_nil(Process.whereis(@session_supervisor))
 
     assert {:ok, %{"session" => %{"status" => "open"}}} =
-             Ledger.get_session(Repo.get!(Agent, initiator["id"]), session_id)
+             DurableLedger.get_session(Repo.get!(Agent, initiator["id"]), session_id)
   end
 
   test "terminal opening ACKs do not warm session processes", %{conn: conn} do
@@ -2026,7 +2075,7 @@ defmodule Atp.SessionRuntimeTest do
              )
 
     assert {:ok, session_status} =
-             Ledger.get_session(Repo.get!(Agent, initiator["id"]), pending_session["id"])
+             DurableLedger.get_session(Repo.get!(Agent, initiator["id"]), pending_session["id"])
 
     %{initiator: initiator, recipient: recipient, session: session_status["session"]}
   end

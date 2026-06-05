@@ -1,8 +1,6 @@
 defmodule Atp.ArchitectureTest do
   use ExUnit.Case, async: true
 
-  alias Atp.Transport.Ledger, as: TransportLedger
-
   test "ATP dependencies stay carrier scoped" do
     dep_apps =
       Atp.MixProject.project()
@@ -97,30 +95,31 @@ defmodule Atp.ArchitectureTest do
 
   test "Postgres durable ledger adapter owns session accept mutation" do
     postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+    postgres_lines = String.split(postgres_source, "\n")
 
-    refute postgres_source =~ "Ledger.accept_session"
+    refute legacy_call?(postgres_lines, "accept_session")
   end
 
   test "Postgres durable ledger adapter owns session reject mutation" do
     postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
+    postgres_lines = String.split(postgres_source, "\n")
 
-    refute postgres_source =~ "Ledger.reject_session"
+    refute legacy_call?(postgres_lines, "reject_session")
   end
 
   test "Postgres durable ledger adapter owns delivery ACK mutation" do
     postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
-    legacy_ack_call = Enum.join(["Ledger", "ack_delivery"], ".")
+    postgres_lines = String.split(postgres_source, "\n")
 
-    refute postgres_source =~ legacy_ack_call
+    refute legacy_call?(postgres_lines, "ack_delivery")
   end
 
   test "Postgres durable ledger adapter owns polling lease mutations" do
     postgres_source = File.read!("lib/atp/transport/durable_ledger/postgres.ex")
-    legacy_claim_call = Enum.join(["Ledger", "claim_inbox"], ".")
-    legacy_extend_call = Enum.join(["Ledger", "extend_delivery"], ".")
+    postgres_lines = String.split(postgres_source, "\n")
 
-    refute postgres_source =~ legacy_claim_call
-    refute postgres_source =~ legacy_extend_call
+    refute legacy_call?(postgres_lines, "claim_inbox")
+    refute legacy_call?(postgres_lines, "extend_delivery")
   end
 
   test "runtime routes session lifecycle mutations through durable ledger" do
@@ -130,17 +129,16 @@ defmodule Atp.ArchitectureTest do
     assert runtime_source =~ "DurableLedger.accept_session"
     assert runtime_source =~ "DurableLedger.reject_session"
 
-    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.accept_session"))
-    refute Enum.any?(runtime_lines, &String.contains?(&1, "|> Ledger.reject_session"))
+    refute legacy_call?(runtime_lines, "accept_session")
+    refute legacy_call?(runtime_lines, "reject_session")
   end
 
   test "runtime routes delivery ACK mutation through durable ledger" do
     runtime_source = File.read!("lib/atp/transport/runtime.ex")
     runtime_lines = String.split(runtime_source, "\n")
-    legacy_ack_pipe = "|> " <> Enum.join(["Ledger", "ack_delivery"], ".")
 
     assert runtime_source =~ "DurableLedger.ack_delivery"
-    refute Enum.any?(runtime_lines, &String.contains?(&1, legacy_ack_pipe))
+    refute legacy_call?(runtime_lines, "ack_delivery")
   end
 
   test "transport facade routes polling lease mutations through durable ledger" do
@@ -152,22 +150,69 @@ defmodule Atp.ArchitectureTest do
     refute transport_source =~ polling_delegate_pattern(:extend_delivery, :Ledger)
   end
 
-  test "legacy ledger does not expose session lifecycle entry points" do
-    ledger_functions = TransportLedger.__info__(:functions)
+  test "transport facade routes status reads and sender policy mutation through durable ledger" do
+    transport_source = File.read!("lib/atp/transport.ex")
 
-    refute {:accept_session, 5} in ledger_functions
-    refute {:reject_session, 5} in ledger_functions
+    assert transport_source =~ transport_delegate_pattern(:get_message_status, :DurableLedger)
+    assert transport_source =~ transport_delegate_pattern(:upsert_sender_policy, :DurableLedger)
+    refute transport_source =~ transport_delegate_pattern(:get_message_status, :Ledger)
+    refute transport_source =~ transport_delegate_pattern(:upsert_sender_policy, :Ledger)
   end
 
-  test "legacy ledger does not expose delivery ACK entry point" do
-    refute {:ack_delivery, 5} in TransportLedger.__info__(:functions)
+  test "runtime routes session transcript reads through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+
+    assert runtime_source =~ "DurableLedger.get_session"
+
+    refute legacy_call?(runtime_lines, "get_session")
   end
 
-  test "legacy ledger does not expose polling lease entry points" do
-    ledger_functions = TransportLedger.__info__(:functions)
+  test "runtime routes session helper reads through durable ledger" do
+    runtime_source = File.read!("lib/atp/transport/runtime.ex")
+    session_server_source = File.read!("lib/atp/transport/runtime/session_server.ex")
+    rehydrator_source = File.read!("lib/atp/transport/runtime/pending_session_rehydrator.ex")
+    runtime_lines = String.split(runtime_source, "\n")
+    session_server_lines = String.split(session_server_source, "\n")
+    rehydrator_lines = String.split(rehydrator_source, "\n")
 
-    refute {:claim_inbox, 4} in ledger_functions
-    refute {:extend_delivery, 5} in ledger_functions
+    assert runtime_source =~ "DurableLedger.fetch_open_session"
+    assert runtime_source =~ "DurableLedger.opening_session_id_for_delivery"
+    assert session_server_source =~ "DurableLedger.fetch_runtime_session"
+    assert rehydrator_source =~ "DurableLedger.list_pending_session_ids"
+
+    refute legacy_call?(runtime_lines, "fetch_open_session")
+    refute legacy_call?(runtime_lines, "opening_session_id_for_delivery")
+    refute legacy_call?(session_server_lines, "fetch_runtime_session")
+    refute legacy_call?(rehydrator_lines, "list_pending_session_ids")
+  end
+
+  test "legacy transport ledger module is removed" do
+    refute File.exists?("lib/atp/transport/ledger.ex")
+    refute Code.ensure_loaded?(legacy_transport_ledger_module())
+  end
+
+  test "source code does not reference the legacy transport ledger" do
+    matches =
+      legacy_reference_paths()
+      |> Enum.flat_map(fn path ->
+        path
+        |> File.read!()
+        |> String.split("\n")
+        |> Enum.with_index(1)
+        |> Enum.filter(fn {line, _line_number} -> legacy_transport_ledger_reference?(line) end)
+        |> Enum.map(fn {line, line_number} -> "#{path}:#{line_number}: #{line}" end)
+      end)
+
+    assert matches == []
+  end
+
+  test "session runtime routes pending opening expiry through durable ledger" do
+    session_server_source = File.read!("lib/atp/transport/runtime/session_server.ex")
+    session_server_lines = String.split(session_server_source, "\n")
+
+    assert session_server_source =~ "DurableLedger.expire_pending_opening_session"
+    refute legacy_call?(session_server_lines, "expire_pending_opening_session")
   end
 
   test "Postgres durable ledger keeps ACK mutation in one state-machine flow" do
@@ -217,5 +262,45 @@ defmodule Atp.ArchitectureTest do
 
   defp polling_delegate_pattern(:extend_delivery, module) do
     ~r/defdelegate\s+extend_delivery\(agent,\s*delivery_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
+  end
+
+  defp transport_delegate_pattern(:get_message_status, module) do
+    ~r/defdelegate\s+get_message_status\(agent,\s*message_id\),\s*to:\s*#{module}/
+  end
+
+  defp transport_delegate_pattern(:upsert_sender_policy, module) do
+    ~r/defdelegate\s+upsert_sender_policy\(recipient,\s*agent_id,\s*params,\s*idempotency_key,\s*route\),\s*to:\s*#{module}/
+  end
+
+  defp legacy_call?(lines, function_name) do
+    legacy_call = Enum.join(["Ledger", function_name], ".")
+
+    Enum.any?(lines, fn line ->
+      String.contains?(line, legacy_call) and
+        not String.contains?(line, "Durable" <> legacy_call)
+    end)
+  end
+
+  defp legacy_transport_ledger_module do
+    Module.concat([Atp, Transport, "Ledger"])
+  end
+
+  defp legacy_reference_paths do
+    ["lib/**/*.{ex,exs}", "test/**/*.{ex,exs}"]
+    |> Enum.flat_map(&Path.wildcard/1)
+  end
+
+  defp legacy_transport_ledger_reference?(line) do
+    String.contains?(line, legacy_transport_ledger_name()) or
+      Regex.match?(legacy_ledger_call_pattern(), line)
+  end
+
+  defp legacy_transport_ledger_name do
+    Enum.join(["Atp", "Transport", "Ledger"], ".")
+  end
+
+  defp legacy_ledger_call_pattern do
+    legacy_call = "Ledger" <> "."
+    Regex.compile!("(^|[^[:alnum:]_])" <> Regex.escape(legacy_call))
   end
 end

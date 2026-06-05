@@ -20,6 +20,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     Delivery,
     Message,
     SenderPolicies,
+    SenderPolicy,
     Session,
     WebhookAttempt,
     WebhookDelivery
@@ -85,6 +86,9 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
     carrier_counts()
     |> Map.put(:sessions, Repo.aggregate(Session, :count, :id))
   end
+
+  @spec sender_policy_count() :: non_neg_integer()
+  def sender_policy_count, do: Repo.aggregate(SenderPolicy, :count, :id)
 
   @spec prepare_due_webhook_delivery!(Plug.Conn.t(), String.t()) ::
           {Delivery.t(), Message.t(), Agent.t()}

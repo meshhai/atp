@@ -14,7 +14,7 @@ defmodule Atp.Transport.DurableLedger do
   """
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.{DeliveryClaim, Message}
+  alias Atp.Transport.{DeliveryClaim, Message, Session}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
   @type prepared_after_commit :: Idempotency.prepared_after_commit() | nil
@@ -28,7 +28,15 @@ defmodule Atp.Transport.DurableLedger do
   @type session_lifecycle_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type ack_result :: {:ok, pos_integer(), map()} | {:error, term()}
   @type polling_lease_result :: {:ok, pos_integer(), map()} | {:error, term()}
-  @type terminalization_reason :: :message_acked | :message_expired
+  @type read_result :: {:ok, map()} | {:error, :not_found}
+  @type open_session_fetch_result :: {:ok, Session.t()} | {:error, :not_found | :session_not_open}
+  @type runtime_session_fetch_result ::
+          {:ok, Session.t()} | {:error, :not_found | :session_not_active}
+  @type pending_opening_expiry_result ::
+          {:ok, Session.t()}
+          | {:error, :not_found | :opening_session_not_due | :session_not_pending}
+  @type sender_policy_result :: {:ok, pos_integer(), map()} | {:error, term()}
+  @type terminalization_reason :: :message_acked | :message_expired | :webhook_endpoint_inactive
   @type claim_result :: {:ok, DeliveryClaim.t() | Message.t()} | {:error, term()}
   @type due_claim_result :: {:ok, DeliveryClaim.t() | nil} | {:error, term()}
   @type finish_result :: {:ok, Message.t()} | {:error, term()}
@@ -99,6 +107,46 @@ defmodule Atp.Transport.DurableLedger do
               session_intake_result()
 
   @doc """
+  Reads a participant-visible session transcript from the durable carrier ledger.
+
+  Implementations must allow only session participants to read the session and
+  must return the same session and ordered message status shape exposed by the
+  public transport facade.
+  """
+  @callback get_session(Agent.t(), String.t()) :: read_result()
+
+  @doc """
+  Fetches one open session for live runtime startup.
+
+  Implementations must return the persisted session only when the session is
+  currently open. Pending and terminal sessions are not startable as open live
+  session processes through this helper.
+  """
+  @callback fetch_open_session(String.t()) :: open_session_fetch_result()
+
+  @doc """
+  Fetches one runtime-active session with its opening message preloaded.
+
+  Implementations must return pending and open sessions for live process
+  hydration, and reject terminal sessions as inactive.
+  """
+  @callback fetch_runtime_session(String.t()) :: runtime_session_fetch_result()
+
+  @doc """
+  Lists pending sessions that have opening messages and need live timer hydration.
+  """
+  @callback list_pending_session_ids() :: [String.t()]
+
+  @doc """
+  Expires a due pending opening session in the durable carrier ledger.
+
+  Implementations must atomically expire the opening message and fail the
+  pending session only when the opening message is due.
+  """
+  @callback expire_pending_opening_session(String.t(), DateTime.t()) ::
+              pending_opening_expiry_result()
+
+  @doc """
   Accepts a pending session opening in the durable carrier ledger.
 
   Implementations must allow only the opening session recipient to accept,
@@ -142,6 +190,32 @@ defmodule Atp.Transport.DurableLedger do
   """
   @callback ack_delivery(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
               ack_result()
+
+  @doc """
+  Finds the pending opening session associated with a recipient-owned delivery.
+
+  This helper lets the live runtime apply ACK side effects after the durable ACK
+  mutation without exposing delivery or message storage internals.
+  """
+  @callback opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
+
+  @doc """
+  Reads a participant-visible message status from the durable carrier ledger.
+
+  Implementations must allow only the sender or recipient to read the message
+  and must preserve the public message status response shape.
+  """
+  @callback get_message_status(Agent.t(), String.t()) :: read_result()
+
+  @doc """
+  Upserts a recipient-owned sender policy in the durable carrier ledger.
+
+  Implementations must require the authenticated recipient to own the target
+  agent id, apply idempotency for the recipient, route, key, and body, and
+  preserve the public sender policy response shape.
+  """
+  @callback upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+              sender_policy_result()
 
   @doc """
   Claims the next recipient-owned inbox polling delivery.
@@ -199,7 +273,8 @@ defmodule Atp.Transport.DurableLedger do
   Terminalizes a claimed webhook delivery without an outbound attempt.
 
   Implementations must validate claim ownership and only allow terminalization
-  for carrier-observed ACKed or expired messages.
+  for carrier-observed ACKed messages, expired messages, or stale webhook
+  deliveries whose recipient endpoint is no longer active.
   """
   @callback terminalize_claimed_webhook_delivery(
               DeliveryClaim.t(),
@@ -242,6 +317,32 @@ defmodule Atp.Transport.DurableLedger do
     adapter().send_session_message(sender, session_id, params, idempotency_key, route)
   end
 
+  @spec get_session(Agent.t(), String.t()) :: read_result()
+  def get_session(%Agent{} = agent, session_id) when is_binary(session_id) do
+    adapter().get_session(agent, session_id)
+  end
+
+  @spec fetch_open_session(String.t()) :: open_session_fetch_result()
+  def fetch_open_session(session_id) when is_binary(session_id) do
+    adapter().fetch_open_session(session_id)
+  end
+
+  @spec fetch_runtime_session(String.t()) :: runtime_session_fetch_result()
+  def fetch_runtime_session(session_id) when is_binary(session_id) do
+    adapter().fetch_runtime_session(session_id)
+  end
+
+  @spec list_pending_session_ids() :: [String.t()]
+  def list_pending_session_ids do
+    adapter().list_pending_session_ids()
+  end
+
+  @spec expire_pending_opening_session(String.t(), DateTime.t()) ::
+          pending_opening_expiry_result()
+  def expire_pending_opening_session(session_id, %DateTime{} = now) when is_binary(session_id) do
+    adapter().expire_pending_opening_session(session_id, now)
+  end
+
   @spec accept_session(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
           session_lifecycle_result()
   def accept_session(%Agent{} = recipient, session_id, params, idempotency_key, route)
@@ -261,6 +362,24 @@ defmodule Atp.Transport.DurableLedger do
   def ack_delivery(%Agent{} = recipient, delivery_id, params, idempotency_key, route)
       when is_binary(delivery_id) and is_map(params) and is_binary(route) do
     adapter().ack_delivery(recipient, delivery_id, params, idempotency_key, route)
+  end
+
+  @spec opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
+  def opening_session_id_for_delivery(%Agent{} = agent, delivery_id)
+      when is_binary(delivery_id) do
+    adapter().opening_session_id_for_delivery(agent, delivery_id)
+  end
+
+  @spec get_message_status(Agent.t(), String.t()) :: read_result()
+  def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
+    adapter().get_message_status(agent, message_id)
+  end
+
+  @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::
+          sender_policy_result()
+  def upsert_sender_policy(%Agent{} = recipient, agent_id, params, idempotency_key, route)
+      when is_binary(agent_id) and is_map(params) and is_binary(route) do
+    adapter().upsert_sender_policy(recipient, agent_id, params, idempotency_key, route)
   end
 
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) ::
@@ -305,7 +424,8 @@ defmodule Atp.Transport.DurableLedger do
           keyword()
         ) :: finish_result()
   def terminalize_claimed_webhook_delivery(%DeliveryClaim{} = claim, reason, opts \\ [])
-      when reason in [:message_acked, :message_expired] and is_list(opts) do
+      when reason in [:message_acked, :message_expired, :webhook_endpoint_inactive] and
+             is_list(opts) do
     adapter().terminalize_claimed_webhook_delivery(claim, reason, opts)
   end
 end
