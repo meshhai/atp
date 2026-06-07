@@ -248,6 +248,7 @@ defmodule Atp.ArchitectureTest do
       :postgrex,
       :req,
       :sobelow,
+      :telemetry,
       :tidewave
     ]
   end

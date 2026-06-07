@@ -8,6 +8,12 @@ defmodule Atp.WebhookDispatcherTest do
   alias Atp.Transport.{Delivery, Message, WebhookAttempt, WebhookDelivery, WebhookDispatcher}
   alias Ecto.Adapters.SQL.Sandbox
 
+  @dispatcher_scan_event [:atp, :transport, :webhook_dispatcher, :scan]
+  @dispatcher_claim_event [:atp, :transport, :webhook_dispatcher, :claim]
+  @dispatcher_attempt_start_event [:atp, :transport, :webhook_dispatcher, :attempt, :start]
+  @dispatcher_attempt_finish_event [:atp, :transport, :webhook_dispatcher, :attempt, :finish]
+  @dispatcher_task_exit_event [:atp, :transport, :webhook_dispatcher, :attempt, :exit]
+
   setup do
     old_config = Application.get_env(:atp, WebhookDispatcher)
 
@@ -305,6 +311,177 @@ defmodule Atp.WebhookDispatcherTest do
     assert_delivered_delivery!(second_delivery_id)
   end
 
+  test "dispatcher emits safe telemetry for scans claims and successful attempts", %{conn: conn} do
+    test_pid = self()
+    attach_dispatcher_telemetry!(test_pid)
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:telemetry_success_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_telemetry_success_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    [delivery_id] =
+      create_due_webhook_deliveries!(conn, 1, "telemetry-success-dispatcher",
+        text: "telemetry-hidden-body",
+        webhook_url: "https://recipient.example.test/atp/webhook?token=telemetry-hidden-url"
+      )
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 1,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_scan_event, scan_measurements,
+                    %{trigger: :timer} = scan_metadata},
+                   500
+
+    assert scan_measurements.in_flight == 0
+    assert scan_measurements.max_in_flight == 1
+    assert scan_measurements.available_capacity == 1
+    assert scan_metadata.batch_size == 1
+    assert_safe_telemetry!(scan_measurements, scan_metadata)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_claim_event, claim_measurements,
+                    %{delivery_id: ^delivery_id, result: :claimed} = claim_metadata},
+                   500
+
+    assert claim_metadata.message_id == message_id_for_delivery!(delivery_id)
+    assert claim_metadata.attempt_number == 1
+    assert claim_measurements.in_flight == 0
+    assert_safe_telemetry!(claim_measurements, claim_metadata)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_attempt_start_event,
+                    start_measurements,
+                    %{delivery_id: ^delivery_id, attempt_number: 1} = start_metadata},
+                   500
+
+    assert start_measurements.in_flight == 1
+    assert_safe_telemetry!(start_measurements, start_metadata)
+
+    assert_receive {:telemetry_success_webhook_started, ^delivery_id, worker}, 500
+    send(worker, :release_telemetry_success_webhook)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_attempt_finish_event,
+                    finish_measurements,
+                    %{
+                      delivery_id: ^delivery_id,
+                      attempt_number: 1,
+                      result: "delivered",
+                      message_status: "delivered"
+                    } = finish_metadata},
+                   500
+
+    assert finish_measurements.in_flight == 0
+    assert_safe_telemetry!(finish_measurements, finish_metadata)
+
+    assert_delivered_delivery!(delivery_id)
+  end
+
+  test "dispatcher emits safe telemetry for retries failures and task exits", %{conn: conn} do
+    test_pid = self()
+    attach_dispatcher_telemetry!(test_pid)
+
+    [retry_id, failed_id, crash_id] =
+      create_due_webhook_deliveries!(conn, 3, "telemetry-outcomes-dispatcher",
+        text: "telemetry-hidden-body",
+        webhook_url: "https://recipient.example.test/atp/webhook?token=telemetry-hidden-url"
+      )
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+      send(test_pid, {:telemetry_outcome_webhook_started, delivery_id})
+
+      cond do
+        delivery_id == retry_id ->
+          Plug.Conn.send_resp(request_conn, 500, "")
+
+        delivery_id == failed_id ->
+          Plug.Conn.send_resp(request_conn, 400, "")
+
+        delivery_id == crash_id ->
+          raise ~s(leak https://recipient.example.test/atp/webhook whsec_secret telemetry-hidden-body)
+      end
+    end)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 3,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+
+    capture_log(fn ->
+      send(dispatcher, :dispatch_due)
+
+      assert_receive {:telemetry_outcome_webhook_started, ^retry_id}, 500
+
+      assert_receive {:webhook_dispatcher_telemetry, @dispatcher_attempt_finish_event,
+                      retry_measurements,
+                      %{
+                        delivery_id: ^retry_id,
+                        result: "retry_scheduled",
+                        message_status: "queued"
+                      } = retry_metadata},
+                     500
+
+      assert_safe_telemetry!(retry_measurements, retry_metadata)
+      assert_retry_scheduled_delivery!(retry_id)
+
+      assert_receive {:telemetry_outcome_webhook_started, ^failed_id}, 500
+
+      assert_receive {:webhook_dispatcher_telemetry, @dispatcher_attempt_finish_event,
+                      failed_measurements,
+                      %{
+                        delivery_id: ^failed_id,
+                        result: "failed",
+                        message_status: "delivery_failed"
+                      } = failed_metadata},
+                     500
+
+      assert_safe_telemetry!(failed_measurements, failed_metadata)
+      assert_failed_delivery!(failed_id)
+
+      assert_receive {:telemetry_outcome_webhook_started, ^crash_id}, 500
+
+      assert_receive {:webhook_dispatcher_telemetry, @dispatcher_task_exit_event,
+                      exit_measurements,
+                      %{
+                        delivery_id: ^crash_id,
+                        result: "retry_scheduled",
+                        message_status: "queued",
+                        error_class: "internal_task_exit"
+                      } = exit_metadata},
+                     500
+
+      assert_safe_telemetry!(exit_measurements, exit_metadata)
+      assert_retry_scheduled_task_exit!(crash_id)
+    end)
+
+    assert Process.alive?(dispatcher)
+  end
+
   test "task crashes record sanitized retry attempts and dispatcher continues", %{conn: conn} do
     test_pid = self()
     [crashing_id, continuing_id] = create_due_webhook_deliveries!(conn, 2, "crash-dispatcher")
@@ -506,6 +683,30 @@ defmodule Atp.WebhookDispatcherTest do
     Req.Test.allow(WebhookDelivery, self(), dispatcher)
   end
 
+  defp attach_dispatcher_telemetry!(test_pid) do
+    handler_id = "webhook-dispatcher-test-#{System.unique_integer([:positive])}"
+
+    events = [
+      @dispatcher_scan_event,
+      @dispatcher_claim_event,
+      @dispatcher_attempt_start_event,
+      @dispatcher_attempt_finish_event,
+      @dispatcher_task_exit_event
+    ]
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        events,
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:webhook_dispatcher_telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
   defp wait_for_dispatcher_restart(name, previous_pid, attempts_left \\ 20)
 
   defp wait_for_dispatcher_restart(name, previous_pid, attempts_left) when attempts_left > 0 do
@@ -525,12 +726,15 @@ defmodule Atp.WebhookDispatcherTest do
     pid
   end
 
-  defp create_due_webhook_deliveries!(conn, count, key_prefix) do
+  defp create_due_webhook_deliveries!(conn, count, key_prefix, opts \\ []) do
     account = create_account!(conn)
     account_token = account["account_api_key"]["token"]
     sender = register_agent!(account_token, "#{key_prefix}-sender", %{})
     recipient = register_agent!(account_token, "#{key_prefix}-recipient", %{})
-    configure_webhook!(recipient, "#{key_prefix}-webhook")
+    webhook_url = Keyword.get(opts, :webhook_url, "https://recipient.example.test/atp/webhook")
+    text = Keyword.get(opts, :text, "dispatch")
+
+    configure_webhook!(recipient, "#{key_prefix}-webhook", webhook_url)
 
     for index <- 1..count do
       sent =
@@ -538,7 +742,7 @@ defmodule Atp.WebhookDispatcherTest do
           sender["agent_api_key"]["token"],
           "#{key_prefix}-send-#{index}",
           recipient["address"],
-          a2a_user_text("#{key_prefix}-message-#{index}", "dispatch #{index}")
+          a2a_user_text("#{key_prefix}-message-#{index}", "#{text} #{index}")
         )
 
       assert [%{"id" => delivery_id, "status" => "retry_scheduled", "attempt_count" => 0}] =
@@ -645,6 +849,12 @@ defmodule Atp.WebhookDispatcherTest do
     end)
   end
 
+  defp message_id_for_delivery!(delivery_id) do
+    delivery_id
+    |> then(&Repo.get!(Delivery, &1))
+    |> Map.fetch!(:message_id)
+  end
+
   defp force_max_attempts!(delivery_id, max_attempts) do
     delivery = Repo.get!(Delivery, delivery_id)
 
@@ -727,6 +937,57 @@ defmodule Atp.WebhookDispatcherTest do
     refute attempt.error =~ "whsec"
     refute attempt.error =~ "recipient.example.test"
     refute attempt.error =~ "body"
+  end
+
+  defp assert_retry_scheduled_delivery!(delivery_id, attempts_left \\ 20)
+
+  defp assert_retry_scheduled_delivery!(delivery_id, attempts_left) when attempts_left > 0 do
+    case Repo.get!(Delivery, delivery_id) do
+      %Delivery{status: "retry_scheduled", attempt_count: 1} = delivery ->
+        assert is_nil(delivery.claim_token)
+        assert is_nil(delivery.leased_until)
+        delivery
+
+      %Delivery{} ->
+        Process.sleep(10)
+        assert_retry_scheduled_delivery!(delivery_id, attempts_left - 1)
+    end
+  end
+
+  defp assert_retry_scheduled_delivery!(delivery_id, 0) do
+    assert %Delivery{status: "retry_scheduled", attempt_count: 1} =
+             Repo.get!(Delivery, delivery_id)
+  end
+
+  defp assert_failed_delivery!(delivery_id, attempts_left \\ 20)
+
+  defp assert_failed_delivery!(delivery_id, attempts_left) when attempts_left > 0 do
+    case Repo.get!(Delivery, delivery_id) do
+      %Delivery{status: "failed", attempt_count: 1} = delivery ->
+        assert is_nil(delivery.claim_token)
+        assert is_nil(delivery.leased_until)
+        delivery
+
+      %Delivery{} ->
+        Process.sleep(10)
+        assert_failed_delivery!(delivery_id, attempts_left - 1)
+    end
+  end
+
+  defp assert_failed_delivery!(delivery_id, 0) do
+    assert %Delivery{status: "failed", attempt_count: 1} =
+             Repo.get!(Delivery, delivery_id)
+  end
+
+  defp assert_safe_telemetry!(measurements, metadata) do
+    rendered = inspect({measurements, metadata})
+
+    refute rendered =~ "recipient.example.test"
+    refute rendered =~ "telemetry-hidden-url"
+    refute rendered =~ "telemetry-hidden-body"
+    refute rendered =~ "whsec"
+    refute rendered =~ "request"
+    refute rendered =~ "payload"
   end
 
   defp assert_delivered_delivery!(delivery_id, attempts_left \\ 20)
