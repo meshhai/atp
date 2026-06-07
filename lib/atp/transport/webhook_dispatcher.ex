@@ -9,6 +9,7 @@ defmodule Atp.Transport.WebhookDispatcher do
   @default_interval_ms 5_000
   @default_max_in_flight 10
   @default_task_supervisor __MODULE__.TaskSupervisor
+  @task_claim_key {__MODULE__, :delivery_claim}
   @telemetry_prefix [:atp, :transport, :webhook_dispatcher]
 
   @spec wakeup(GenServer.server() | nil) :: :ok
@@ -49,6 +50,20 @@ defmodule Atp.Transport.WebhookDispatcher do
   end
 
   def handle_info(:dispatch_due, state), do: {:noreply, state}
+
+  def handle_info({ref, {:task_exit, result}}, %{in_flight: in_flight} = state)
+      when is_map_key(in_flight, ref) do
+    %{claim: claim} = Map.fetch!(in_flight, ref)
+    Process.demonitor(ref, [:flush])
+
+    state =
+      state
+      |> complete_task(ref)
+      |> emit_task_exit(claim, result)
+      |> start_available_tasks()
+
+    {:noreply, state}
+  end
 
   def handle_info({ref, result}, %{in_flight: in_flight} = state)
       when is_map_key(in_flight, ref) do
@@ -119,7 +134,24 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp monitor_existing_tasks(task_supervisor) do
     task_supervisor
     |> task_supervisor_children()
-    |> Map.new(fn pid -> {Process.monitor(pid), %{pid: pid, claim: nil}} end)
+    |> Map.new(&monitor_existing_task/1)
+  end
+
+  defp monitor_existing_task(pid) do
+    {Process.monitor(pid), %{pid: pid, claim: task_delivery_claim(pid)}}
+  end
+
+  defp task_delivery_claim(pid) when is_pid(pid) do
+    case Process.info(pid, :dictionary) do
+      {:dictionary, dictionary} ->
+        case List.keyfind(dictionary, @task_claim_key, 0) do
+          {_key, %DeliveryClaim{} = claim} -> claim
+          _other -> nil
+        end
+
+      nil ->
+        nil
+    end
   end
 
   defp task_supervisor_children(task_supervisor) do
@@ -210,7 +242,7 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp start_task(state, %DeliveryClaim{} = claim) do
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-        WebhookDelivery.deliver_claim(claim)
+        deliver_claim_safely(claim)
       end)
 
     state = %{
@@ -220,6 +252,30 @@ defmodule Atp.Transport.WebhookDispatcher do
     }
 
     emit_attempt_start(state, claim)
+  end
+
+  defp deliver_claim_safely(%DeliveryClaim{} = claim) do
+    Process.put(@task_claim_key, claim)
+
+    try do
+      WebhookDelivery.deliver_claim(claim)
+    rescue
+      _exception ->
+        record_sanitized_task_exit(claim)
+    catch
+      _kind, _reason ->
+        record_sanitized_task_exit(claim)
+    end
+  end
+
+  defp record_sanitized_task_exit(%DeliveryClaim{} = claim) do
+    {:task_exit, WebhookDelivery.record_task_exit(claim)}
+  rescue
+    _exception ->
+      {:task_exit, {:error, :task_exit_record_failed}}
+  catch
+    _kind, _reason ->
+      {:task_exit, {:error, :task_exit_record_failed}}
   end
 
   defp record_task_exit(state, _ref, :normal), do: {state, {:ok, :normal}}
@@ -294,6 +350,8 @@ defmodule Atp.Transport.WebhookDispatcher do
   end
 
   defp emit_task_exit(state, nil, _result), do: state
+
+  defp emit_task_exit(state, _claim, {:ok, status}) when status in [:normal, :shutdown], do: state
 
   defp emit_task_exit(state, %DeliveryClaim{} = claim, result) do
     emit(
