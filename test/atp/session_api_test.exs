@@ -384,6 +384,19 @@ defmodule Atp.SessionAPITest do
       |> json_response(201)
 
     assert [delivery_status] = reply["message_status"]["deliveries"]
+    assert delivery_status["status"] == "retry_scheduled"
+    assert delivery_status["attempt_count"] == 0
+    assert delivery_status["attempts"] == []
+
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_status["id"])
+
+    sender_status =
+      build_conn()
+      |> authorize(initiator["agent_api_key"]["token"])
+      |> get("/api/messages/#{reply["message_status"]["message"]["id"]}")
+      |> json_response(200)
+
+    assert [delivery_status] = sender_status["deliveries"]
     assert [attempt] = delivery_status["attempts"]
     refute Map.has_key?(attempt, "request_url")
   end

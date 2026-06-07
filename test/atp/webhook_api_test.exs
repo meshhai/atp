@@ -118,6 +118,9 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("long-webhook-message", "persist the long webhook URL")
       )
 
+    assert %{"carrier_status" => "delivered"} =
+             deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
+
     recipient_status =
       build_conn()
       |> authorize(agent_token)
@@ -177,7 +180,7 @@ defmodule Atp.WebhookAPITest do
     assert error_code(other_agent_update) == "not_found"
   end
 
-  test "trusted messages to active webhook endpoints are signed and delivered", %{conn: conn} do
+  test "trusted messages to active webhook endpoints queue before signed delivery", %{conn: conn} do
     test_pid = self()
 
     Req.Test.stub(WebhookDelivery, fn request_conn ->
@@ -205,11 +208,22 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("signed-webhook-message", "deliver by webhook")
       )
 
-    assert sent["carrier_status"] == "delivered"
+    assert sent["carrier_status"] == "queued"
     assert is_nil(sent["ack_status"])
-    assert [sent_delivery] = sent["deliveries"]
-    assert [sent_attempt] = sent_delivery["attempts"]
-    refute Map.has_key?(sent_attempt, "request_url")
+
+    assert [
+             %{
+               "id" => delivery_id,
+               "mode" => "webhook",
+               "status" => "retry_scheduled",
+               "attempt_count" => 0,
+               "attempts" => []
+             }
+           ] = sent["deliveries"]
+
+    refute_receive {:webhook_request, _headers, _body}, 100
+
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
 
     assert_receive {:webhook_request, headers, raw_body}
 
@@ -241,7 +255,7 @@ defmodule Atp.WebhookAPITest do
 
     assert [
              %{
-               "id" => delivery_id,
+               "id" => ^delivery_id,
                "mode" => "webhook",
                "status" => "delivered",
                "attempt_count" => 1,
@@ -308,8 +322,34 @@ defmodule Atp.WebhookAPITest do
       |> post("/api/messages", params)
       |> json_response(201)
 
+    assert first["carrier_status"] == "queued"
+
+    assert [
+             %{
+               "id" => delivery_id,
+               "mode" => "webhook",
+               "status" => "retry_scheduled",
+               "attempt_count" => 0,
+               "attempts" => []
+             }
+           ] = first["deliveries"]
+
+    refute_receive {:webhook_request, _body}, 100
+
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
     assert_receive {:webhook_request, webhook_body}
     assert webhook_body["message"] == first["message"]
+
+    delivered_status =
+      build_conn()
+      |> authorize(sender["agent_api_key"]["token"])
+      |> get("/api/messages/#{first["message"]["id"]}")
+      |> json_response(200)
+
+    assert delivered_status["carrier_status"] == "delivered"
+
+    assert [%{"mode" => "webhook", "status" => "delivered", "attempt_count" => 1}] =
+             delivered_status["deliveries"]
 
     replay =
       build_conn()
@@ -319,11 +359,6 @@ defmodule Atp.WebhookAPITest do
       |> json_response(201)
 
     assert replay == first
-    assert first["carrier_status"] == "delivered"
-
-    assert [%{"mode" => "webhook", "status" => "delivered", "attempt_count" => 1}] =
-             first["deliveries"]
-
     refute_receive {:webhook_request, _body}, 100
   end
 
@@ -357,7 +392,12 @@ defmodule Atp.WebhookAPITest do
           a2a_user_text("#{host}-webhook", "do not deliver to private dns")
         )
 
-      assert sent["carrier_status"] == "delivery_failed"
+      assert sent["carrier_status"] == "queued"
+      refute_receive :unsafe_webhook_requested, 100
+
+      failed_status = deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
+
+      assert failed_status["carrier_status"] == "delivery_failed"
 
       assert [
                %{
@@ -371,7 +411,7 @@ defmodule Atp.WebhookAPITest do
                    }
                  ]
                }
-             ] = sent["deliveries"]
+             ] = failed_status["deliveries"]
     end
 
     refute_receive :unsafe_webhook_requested, 100
@@ -413,7 +453,10 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("safe-connect-webhook", "connect to validated IP")
       )
 
-    assert sent["carrier_status"] == "delivered"
+    assert sent["carrier_status"] == "queued"
+
+    assert %{"carrier_status" => "delivered"} =
+             deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
 
     assert_receive {:safe_webhook_request, "93.184.216.34", "/atp/webhook", "mode=safe", headers}
 
@@ -446,7 +489,10 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("redirect-webhook", "do not follow redirects")
       )
 
-    assert sent["carrier_status"] == "delivery_failed"
+    assert sent["carrier_status"] == "queued"
+    failed_status = deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
+
+    assert failed_status["carrier_status"] == "delivery_failed"
 
     assert [
              %{
@@ -456,7 +502,7 @@ defmodule Atp.WebhookAPITest do
                  %{"result" => "failed", "response_status" => 302, "error" => nil}
                ]
              }
-           ] = sent["deliveries"]
+           ] = failed_status["deliveries"]
 
     assert_receive {:redirect_webhook_requested, "93.184.216.34", "recipient.example.test"}
     refute_receive {:redirect_webhook_requested, _host, _host_header}, 100
@@ -590,7 +636,7 @@ defmodule Atp.WebhookAPITest do
     assert_delivered_delivery!(delivery_id)
   end
 
-  test "webhook requests are sent after message and delivery state is committed", %{conn: conn} do
+  test "webhook requests are sent by delivery workers after intake commits", %{conn: conn} do
     test_pid = self()
 
     Req.Test.stub(WebhookDelivery, fn request_conn ->
@@ -605,12 +651,18 @@ defmodule Atp.WebhookAPITest do
 
     configure_webhook!(recipient, "configure-commit-recipient-webhook")
 
-    send_message!(
-      sender["agent_api_key"]["token"],
-      "send-committed-webhook",
-      recipient["address"],
-      a2a_user_text("committed-webhook-message", "visible after commit")
-    )
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-committed-webhook",
+        recipient["address"],
+        a2a_user_text("committed-webhook-message", "visible after commit")
+      )
+
+    refute_receive {:webhook_in_transaction?, _in_transaction?}, 100
+
+    assert %{"carrier_status" => "delivered"} =
+             deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
 
     assert_receive {:webhook_in_transaction?, false}
   end
@@ -641,10 +693,21 @@ defmodule Atp.WebhookAPITest do
              %{
                "id" => delivery_id,
                "mode" => "webhook",
+               "status" => "retry_scheduled",
+               "attempt_count" => 0
+             }
+           ] = sent["deliveries"]
+
+    status = deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
+
+    assert [
+             %{
+               "id" => ^delivery_id,
+               "mode" => "webhook",
                "status" => "delivered",
                "leased_until" => nil
              }
-           ] = sent["deliveries"]
+           ] = status["deliveries"]
 
     rejected_extend =
       build_conn()
@@ -1012,11 +1075,14 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("accepted-retry-message", "polling ack should stop webhook retry")
       )
 
+    accepted_after_attempt =
+      deliver_webhook_and_fetch_status!(accepted, sender["agent_api_key"]["token"])
+
     assert_receive {:webhook_requested, accepted_message_id}
     assert accepted_message_id == accepted["message"]["id"]
 
     assert [%{"id" => accepted_webhook_delivery_id, "status" => "retry_scheduled"}] =
-             accepted["deliveries"]
+             accepted_after_attempt["deliveries"]
 
     accepted_polling_delivery =
       claim_inbox!(recipient["agent_api_key"]["token"], "claim-accepted-retry-message", %{
@@ -1052,11 +1118,14 @@ defmodule Atp.WebhookAPITest do
         a2a_user_text("completed-retry-message", "terminal polling ack should stop webhook retry")
       )
 
+    completed_after_attempt =
+      deliver_webhook_and_fetch_status!(completed, sender["agent_api_key"]["token"])
+
     assert_receive {:webhook_requested, completed_message_id}
     assert completed_message_id == completed["message"]["id"]
 
     assert [%{"id" => completed_webhook_delivery_id, "status" => "retry_scheduled"}] =
-             completed["deliveries"]
+             completed_after_attempt["deliveries"]
 
     completed_polling_delivery =
       claim_inbox!(recipient["agent_api_key"]["token"], "claim-completed-retry-message", %{
@@ -1255,12 +1324,25 @@ defmodule Atp.WebhookAPITest do
       "https://recipient.example.test#{path}"
     )
 
-    send_message!(
-      sender["agent_api_key"]["token"],
-      "send-webhook-#{key}",
-      recipient["address"],
-      payload
-    )
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-webhook-#{key}",
+        recipient["address"],
+        payload
+      )
+
+    deliver_webhook_and_fetch_status!(sent, sender["agent_api_key"]["token"])
+  end
+
+  defp deliver_webhook_and_fetch_status!(message_status, viewer_token) do
+    assert [%{"id" => delivery_id, "mode" => "webhook"}] = message_status["deliveries"]
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
+
+    build_conn()
+    |> authorize(viewer_token)
+    |> get("/api/messages/#{message_status["message"]["id"]}")
+    |> json_response(200)
   end
 
   defp assert_retry_scheduled(response, response_status, error_fragment, max_attempts) do

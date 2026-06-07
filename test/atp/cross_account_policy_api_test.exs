@@ -86,9 +86,16 @@ defmodule Atp.CrossAccountPolicyAPITest do
         a2a_user_text("allowed-cross-account", "trusted across accounts")
       )
 
-    assert sent["carrier_status"] == "delivered"
+    assert sent["carrier_status"] == "queued"
     assert sent["message"]["trust"] == "trusted"
 
+    assert [%{"id" => delivery_id, "status" => "retry_scheduled", "attempt_count" => 0}] =
+             sent["deliveries"]
+
+    refute_receive {:webhook_request, _body}, 100
+
+    assert {:ok, delivered_message} = WebhookDelivery.deliver_now(delivery_id)
+    assert delivered_message.carrier_status == "delivered"
     assert_receive {:webhook_request, body}
     assert body["message"] == sent["message"]
   end

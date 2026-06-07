@@ -2,7 +2,7 @@ defmodule Atp.Transport.SessionIntake do
   @moduledoc false
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.{DurableLedger, Message, Response, WebhookDelivery}
+  alias Atp.Transport.DurableLedger
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -16,22 +16,11 @@ defmodule Atp.Transport.SessionIntake do
     {:ok, status, body}
   end
 
-  def finish(%Agent{} = viewer, _status, _body, prepared) when is_map(prepared) do
-    Idempotency.complete_prepared_after_commit(prepared, fn status, body, commit_value ->
-      finish_prepared_webhook_delivery(viewer, status, body, commit_value)
-    end)
+  def finish(%Agent{}, _status, _body, prepared) when is_map(prepared) do
+    Idempotency.complete_prepared_after_commit(prepared, &complete_queued_intake/3)
   end
 
-  defp finish_prepared_webhook_delivery(
-         %Agent{} = viewer,
-         _status,
-         %{"session" => %{"id" => session_id} = session_body},
-         {session_id, delivery_id}
-       )
-       when is_binary(session_id) and is_binary(delivery_id) do
-    with {:ok, %Message{} = message} <- WebhookDelivery.deliver_now(delivery_id) do
-      {:ok, 201,
-       %{"session" => session_body, "message_status" => Response.message_status(message, viewer)}}
-    end
+  defp complete_queued_intake(status, body, _commit_value) do
+    {:ok, status, body}
   end
 end
