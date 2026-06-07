@@ -194,6 +194,140 @@ defmodule Atp.WebhookDispatcherTest do
     end
   end
 
+  test "shutdown waits for in-flight attempts without starting new claims", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:shutdown_wait_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_shutdown_wait_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    delivery_ids = create_due_webhook_deliveries!(conn, 2, "shutdown-wait-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 10,
+         max_in_flight: 1,
+         shutdown_wait_ms: 500,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    {started_id, worker} = assert_started_webhook(:shutdown_wait_webhook_started)
+    [unstarted_id] = delivery_ids -- [started_id]
+
+    stop_task =
+      Task.async(fn ->
+        result = GenServer.stop(dispatcher, :normal, 1_000)
+        send(test_pid, {:shutdown_wait_stop_returned, result})
+        result
+      end)
+
+    refute_receive {:shutdown_wait_stop_returned, _result}, 50
+
+    send(worker, :release_shutdown_wait_webhook)
+
+    assert :ok = Task.await(stop_task, 1_000)
+    assert_receive {:shutdown_wait_stop_returned, :ok}, 100
+    assert_delivered_delivery!(started_id)
+    refute_receive {:shutdown_wait_webhook_started, ^unstarted_id, _worker}, 100
+
+    assert %{
+             status: "retry_scheduled",
+             claim_token: nil,
+             leased_until: nil
+           } = Map.fetch!(delivery_records([unstarted_id]), unstarted_id)
+  end
+
+  test "shutdown timeout leaves unfinished leased work recoverable after lease expiry", %{
+    conn: conn
+  } do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:shutdown_expiry_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_shutdown_expiry_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    [delivery_id] = create_due_webhook_deliveries!(conn, 1, "shutdown-expiry-dispatcher")
+    task_supervisor = :atp_shutdown_expiry_webhook_task_supervisor_test
+    task_supervisor_id = :atp_shutdown_expiry_webhook_task_supervisor_child_test
+
+    start_supervised!({Task.Supervisor, name: task_supervisor}, id: task_supervisor_id)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 1,
+         max_in_flight: 1,
+         shutdown_wait_ms: 10,
+         interval_ms: 60_000,
+         task_supervisor: task_supervisor,
+         name: nil},
+        id: :atp_shutdown_expiry_first_dispatcher_test
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    assert_receive {:shutdown_expiry_webhook_started, ^delivery_id, first_worker}, 500
+
+    stop_task = Task.async(fn -> GenServer.stop(dispatcher, :normal, 1_000) end)
+    assert :ok = Task.await(stop_task, 1_000)
+
+    assert %{status: "leased", claim_token: claim_token, leased_until: %DateTime{}} =
+             Map.fetch!(delivery_records([delivery_id]), delivery_id)
+
+    assert is_binary(claim_token)
+
+    stop_supervised!(task_supervisor_id)
+    refute_process_alive!(first_worker)
+    expire_delivery_lease!(delivery_id)
+    start_supervised!({Task.Supervisor, name: task_supervisor}, id: task_supervisor_id)
+
+    restarted_dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 1,
+         max_in_flight: 1,
+         shutdown_wait_ms: 10,
+         interval_ms: 60_000,
+         task_supervisor: task_supervisor,
+         name: nil},
+        id: :atp_shutdown_expiry_second_dispatcher_test
+      )
+
+    allow_dispatcher(restarted_dispatcher)
+    send(restarted_dispatcher, :dispatch_due)
+
+    assert_receive {:shutdown_expiry_webhook_started, ^delivery_id, second_worker}, 500
+    send(second_worker, :release_shutdown_expiry_webhook)
+
+    assert_delivered_delivery!(delivery_id)
+  end
+
   test "restart counts existing attempt tasks against max_in_flight", %{conn: conn} do
     test_pid = self()
 
@@ -783,6 +917,21 @@ defmodule Atp.WebhookDispatcherTest do
     pid
   end
 
+  defp refute_process_alive!(pid, attempts_left \\ 20)
+
+  defp refute_process_alive!(pid, attempts_left) when attempts_left > 0 do
+    if Process.alive?(pid) do
+      Process.sleep(10)
+      refute_process_alive!(pid, attempts_left - 1)
+    else
+      :ok
+    end
+  end
+
+  defp refute_process_alive!(pid, 0) do
+    refute Process.alive?(pid)
+  end
+
   defp assert_dispatcher_idle!(dispatcher, attempts_left \\ 20)
 
   defp assert_dispatcher_idle!(dispatcher, attempts_left) when attempts_left > 0 do
@@ -935,6 +1084,14 @@ defmodule Atp.WebhookDispatcherTest do
 
     delivery
     |> Ecto.Changeset.change(max_attempts: max_attempts)
+    |> Repo.update!()
+  end
+
+  defp expire_delivery_lease!(delivery_id) do
+    delivery = Repo.get!(Delivery, delivery_id)
+
+    delivery
+    |> Ecto.Changeset.change(leased_until: DateTime.add(DateTime.utc_now(), -1, :second))
     |> Repo.update!()
   end
 

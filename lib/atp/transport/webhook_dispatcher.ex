@@ -8,6 +8,7 @@ defmodule Atp.Transport.WebhookDispatcher do
   @default_batch_size 50
   @default_interval_ms 5_000
   @default_max_in_flight 10
+  @default_shutdown_wait_ms 1_000
   @default_task_supervisor __MODULE__.TaskSupervisor
   @task_claim_key {__MODULE__, :delivery_claim}
   @telemetry_prefix [:atp, :transport, :webhook_dispatcher]
@@ -27,6 +28,8 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     task_supervisor = option(opts, :task_supervisor, @default_task_supervisor)
 
     state = %{
@@ -35,6 +38,8 @@ defmodule Atp.Transport.WebhookDispatcher do
       batch_size: positive_integer_option(opts, :batch_size, @default_batch_size),
       interval_ms: positive_integer_option(opts, :interval_ms, @default_interval_ms),
       max_in_flight: positive_integer_option(opts, :max_in_flight, @default_max_in_flight),
+      shutdown_wait_ms:
+        non_negative_integer_option(opts, :shutdown_wait_ms, @default_shutdown_wait_ms),
       task_supervisor: task_supervisor,
       timer_ref: nil,
       in_flight: monitor_existing_tasks(task_supervisor),
@@ -101,6 +106,15 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   def handle_cast(:dispatch_wakeup, state), do: {:noreply, state}
 
+  @impl true
+  def terminate(_reason, state) do
+    state
+    |> cancel_timer()
+    |> wait_for_in_flight()
+
+    :ok
+  end
+
   defp genserver_opts(opts) do
     case Keyword.fetch(opts, :name) do
       {:ok, nil} -> []
@@ -117,6 +131,13 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp positive_integer_option(opts, key, default) do
     case option(opts, key, default) do
       value when is_integer(value) and value > 0 -> value
+      _value -> default
+    end
+  end
+
+  defp non_negative_integer_option(opts, key, default) do
+    case option(opts, key, default) do
+      value when is_integer(value) and value >= 0 -> value
       _value -> default
     end
   end
@@ -294,6 +315,57 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   defp complete_task(state, ref) do
     %{state | in_flight: Map.delete(state.in_flight, ref)}
+  end
+
+  defp wait_for_in_flight(%{shutdown_wait_ms: 0}), do: :ok
+
+  defp wait_for_in_flight(state) do
+    deadline_ms = System.monotonic_time(:millisecond) + state.shutdown_wait_ms
+    wait_for_in_flight_until(state, deadline_ms)
+  end
+
+  defp wait_for_in_flight_until(%{in_flight: in_flight}, _deadline_ms)
+       when map_size(in_flight) == 0 do
+    :ok
+  end
+
+  defp wait_for_in_flight_until(%{in_flight: in_flight} = state, deadline_ms) do
+    timeout_ms = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    if timeout_ms == 0 do
+      :ok
+    else
+      receive do
+        {ref, {:task_exit, result}} when is_map_key(in_flight, ref) ->
+          %{claim: claim} = Map.fetch!(in_flight, ref)
+          Process.demonitor(ref, [:flush])
+
+          state
+          |> complete_task(ref)
+          |> emit_task_exit(claim, result)
+          |> wait_for_in_flight_until(deadline_ms)
+
+        {ref, result} when is_map_key(in_flight, ref) ->
+          %{claim: claim} = Map.fetch!(in_flight, ref)
+          Process.demonitor(ref, [:flush])
+
+          state
+          |> complete_task(ref)
+          |> emit_attempt_finish(claim, result)
+          |> wait_for_in_flight_until(deadline_ms)
+
+        {:DOWN, ref, :process, _pid, reason} when is_map_key(in_flight, ref) ->
+          %{claim: claim} = Map.fetch!(in_flight, ref)
+          {state, result} = record_task_exit(state, ref, reason)
+
+          state
+          |> complete_task(ref)
+          |> emit_task_exit(claim, result)
+          |> wait_for_in_flight_until(deadline_ms)
+      after
+        timeout_ms -> :ok
+      end
+    end
   end
 
   defp schedule(state, interval_ms) do
