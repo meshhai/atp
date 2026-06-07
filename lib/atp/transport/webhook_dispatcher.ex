@@ -25,15 +25,17 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   @impl true
   def init(opts) do
+    task_supervisor = option(opts, :task_supervisor, @default_task_supervisor)
+
     state = %{
       enabled?: option(opts, :enabled, true),
       dispatch_on_start?: option(opts, :dispatch_on_start?, true),
       batch_size: positive_integer_option(opts, :batch_size, @default_batch_size),
       interval_ms: positive_integer_option(opts, :interval_ms, @default_interval_ms),
       max_in_flight: positive_integer_option(opts, :max_in_flight, @default_max_in_flight),
-      task_supervisor: option(opts, :task_supervisor, @default_task_supervisor),
+      task_supervisor: task_supervisor,
       timer_ref: nil,
-      in_flight: %{},
+      in_flight: monitor_existing_tasks(task_supervisor),
       pending_dispatches: 0
     }
 
@@ -104,6 +106,18 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   defp configured_name do
     config_option(:name, __MODULE__)
+  end
+
+  defp monitor_existing_tasks(task_supervisor) do
+    task_supervisor
+    |> task_supervisor_children()
+    |> Map.new(fn pid -> {Process.monitor(pid), pid} end)
+  end
+
+  defp task_supervisor_children(task_supervisor) do
+    Task.Supervisor.children(task_supervisor)
+  catch
+    :exit, _reason -> []
   end
 
   defp dispatcher_pid(nil), do: nil

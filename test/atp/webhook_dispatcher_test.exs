@@ -187,6 +187,69 @@ defmodule Atp.WebhookDispatcherTest do
     end
   end
 
+  test "restart counts existing attempt tasks against max_in_flight", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:restart_bound_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_restart_bound_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    delivery_ids = create_due_webhook_deliveries!(conn, 3, "restart-bound-dispatcher")
+    task_supervisor = :atp_restart_bound_webhook_task_supervisor_test
+    dispatcher_name = :atp_restart_bound_webhook_dispatcher_test
+
+    start_supervised!({Task.Supervisor, name: task_supervisor})
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 10,
+         max_in_flight: 2,
+         interval_ms: 60_000,
+         task_supervisor: task_supervisor,
+         name: dispatcher_name}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    first_started = assert_started_webhook(:restart_bound_webhook_started)
+    second_started = assert_started_webhook(:restart_bound_webhook_started)
+    started_ids = Enum.map([first_started, second_started], &elem(&1, 0))
+    [unstarted_id] = delivery_ids -- started_ids
+
+    Process.exit(dispatcher, :kill)
+
+    restarted_dispatcher = wait_for_dispatcher_restart(dispatcher_name, dispatcher)
+    allow_dispatcher(restarted_dispatcher)
+    send(restarted_dispatcher, :dispatch_due)
+
+    refute_receive {:restart_bound_webhook_started, _, _}, 100
+
+    {_first_id, first_worker} = first_started
+    send(first_worker, :release_restart_bound_webhook)
+
+    {third_started_id, third_worker} = assert_started_webhook(:restart_bound_webhook_started)
+    assert third_started_id == unstarted_id
+
+    {_second_id, second_worker} = second_started
+    send(second_worker, :release_restart_bound_webhook)
+    send(third_worker, :release_restart_bound_webhook)
+
+    for delivery_id <- delivery_ids do
+      assert_delivered_delivery!(delivery_id)
+    end
+  end
+
   test "batch_size caps one scan even when worker capacity is available", %{conn: conn} do
     test_pid = self()
 
@@ -306,6 +369,25 @@ defmodule Atp.WebhookDispatcherTest do
   defp allow_dispatcher(dispatcher) when is_pid(dispatcher) do
     Sandbox.allow(Repo, self(), dispatcher)
     Req.Test.allow(WebhookDelivery, self(), dispatcher)
+  end
+
+  defp wait_for_dispatcher_restart(name, previous_pid, attempts_left \\ 20)
+
+  defp wait_for_dispatcher_restart(name, previous_pid, attempts_left) when attempts_left > 0 do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != previous_pid ->
+        pid
+
+      _other ->
+        Process.sleep(10)
+        wait_for_dispatcher_restart(name, previous_pid, attempts_left - 1)
+    end
+  end
+
+  defp wait_for_dispatcher_restart(name, previous_pid, 0) do
+    pid = Process.whereis(name)
+    assert is_pid(pid) and pid != previous_pid
+    pid
   end
 
   defp create_due_webhook_deliveries!(conn, count, key_prefix) do
