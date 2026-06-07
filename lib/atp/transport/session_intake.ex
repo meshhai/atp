@@ -2,7 +2,7 @@ defmodule Atp.Transport.SessionIntake do
   @moduledoc false
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.DurableLedger
+  alias Atp.Transport.{DurableLedger, WebhookDispatcher}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -18,6 +18,12 @@ defmodule Atp.Transport.SessionIntake do
 
   def finish(%Agent{}, _status, _body, prepared) when is_map(prepared) do
     Idempotency.complete_prepared_after_commit(prepared, &complete_queued_intake/3)
+  end
+
+  defp complete_queued_intake(status, body, {_session_id, webhook_delivery_id})
+       when is_binary(webhook_delivery_id) do
+    WebhookDispatcher.wakeup()
+    {:ok, status, body}
   end
 
   defp complete_queued_intake(status, body, _commit_value) do

@@ -2,7 +2,7 @@ defmodule Atp.Transport do
   @moduledoc "Public ATP carrier facade for messages, sessions, polling leases, and status reads."
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.{DurableLedger, Runtime}
+  alias Atp.Transport.{DurableLedger, Runtime, WebhookDispatcher}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -19,6 +19,12 @@ defmodule Atp.Transport do
 
   defp finish_direct_message_intake(%Agent{}, _status, _body, prepared) do
     Idempotency.complete_prepared_after_commit(prepared, &complete_queued_intake/3)
+  end
+
+  defp complete_queued_intake(status, body, webhook_delivery_id)
+       when is_binary(webhook_delivery_id) do
+    WebhookDispatcher.wakeup()
+    {:ok, status, body}
   end
 
   defp complete_queued_intake(status, body, _commit_value) do
