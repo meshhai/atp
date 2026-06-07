@@ -1422,7 +1422,25 @@ defmodule Atp.WebhookAPITest do
     delivery_id
   end
 
-  defp assert_delivered_delivery!(delivery_id) do
+  defp assert_delivered_delivery!(delivery_id, attempts_left \\ 20)
+
+  defp assert_delivered_delivery!(delivery_id, attempts_left) when attempts_left > 0 do
+    delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
+
+    case delivery do
+      %Atp.Transport.Delivery{status: "delivered"} ->
+        assert is_nil(delivery.claim_token)
+        assert is_nil(delivery.claimed_at)
+        assert is_nil(delivery.leased_until)
+        assert delivery.attempt_count == 1
+
+      %Atp.Transport.Delivery{} ->
+        Process.sleep(10)
+        assert_delivered_delivery!(delivery_id, attempts_left - 1)
+    end
+  end
+
+  defp assert_delivered_delivery!(delivery_id, 0) do
     delivery = Atp.Repo.get!(Atp.Transport.Delivery, delivery_id)
 
     assert delivery.status == "delivered"

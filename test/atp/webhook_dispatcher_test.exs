@@ -1,6 +1,8 @@
 defmodule Atp.WebhookDispatcherTest do
   use Atp.ConnCase, async: false
 
+  import Ecto.Query
+
   alias Atp.Repo
   alias Atp.Transport.{Delivery, WebhookDelivery, WebhookDispatcher}
   alias Ecto.Adapters.SQL.Sandbox
@@ -116,6 +118,129 @@ defmodule Atp.WebhookDispatcherTest do
     assert_delivered_delivery!(delivery_id)
   end
 
+  test "max_in_flight limits concurrent attempts and leaves excess work unleased", %{
+    conn: conn
+  } do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:limited_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_limited_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    delivery_ids = create_due_webhook_deliveries!(conn, 3, "limited-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 10,
+         max_in_flight: 2,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    first_started = assert_started_webhook(:limited_webhook_started)
+    second_started = assert_started_webhook(:limited_webhook_started)
+    started_ids = Enum.map([first_started, second_started], &elem(&1, 0))
+    [unstarted_id] = delivery_ids -- started_ids
+
+    refute_receive {:limited_webhook_started, _, _}, 100
+
+    records = delivery_records(delivery_ids)
+
+    for delivery_id <- started_ids do
+      assert %{status: "leased", claim_token: claim_token, leased_until: %DateTime{}} =
+               Map.fetch!(records, delivery_id)
+
+      assert is_binary(claim_token)
+    end
+
+    assert %{
+             status: "retry_scheduled",
+             claim_token: nil,
+             leased_until: nil
+           } = Map.fetch!(records, unstarted_id)
+
+    {_first_id, first_worker} = first_started
+    send(first_worker, :release_limited_webhook)
+
+    {third_started_id, third_worker} = assert_started_webhook(:limited_webhook_started)
+    assert third_started_id == unstarted_id
+
+    {_second_id, second_worker} = second_started
+    send(second_worker, :release_limited_webhook)
+    send(third_worker, :release_limited_webhook)
+
+    for delivery_id <- delivery_ids do
+      assert_delivered_delivery!(delivery_id)
+    end
+  end
+
+  test "batch_size caps one scan even when worker capacity is available", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:batch_capped_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_batch_capped_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    delivery_ids = create_due_webhook_deliveries!(conn, 3, "batch-capped-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 1,
+         max_in_flight: 3,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    {first_id, first_worker} = assert_started_webhook(:batch_capped_webhook_started)
+    refute_receive {:batch_capped_webhook_started, _, _}, 100
+
+    records = delivery_records(delivery_ids)
+
+    assert %{status: "leased", claim_token: claim_token} = Map.fetch!(records, first_id)
+    assert is_binary(claim_token)
+
+    for delivery_id <- delivery_ids -- [first_id] do
+      assert %{status: "retry_scheduled", claim_token: nil, leased_until: nil} =
+               Map.fetch!(records, delivery_id)
+    end
+
+    send(first_worker, :release_batch_capped_webhook)
+    assert_delivered_delivery!(first_id)
+    refute_receive {:batch_capped_webhook_started, _, _}, 100
+
+    send(dispatcher, :dispatch_due)
+    {second_id, second_worker} = assert_started_webhook(:batch_capped_webhook_started)
+    assert second_id in (delivery_ids -- [first_id])
+    send(second_worker, :release_batch_capped_webhook)
+    assert_delivered_delivery!(second_id)
+  end
+
   test "periodic scan drains durable webhook work when no wakeup is delivered", %{conn: conn} do
     test_pid = self()
 
@@ -181,6 +306,53 @@ defmodule Atp.WebhookDispatcherTest do
   defp allow_dispatcher(dispatcher) when is_pid(dispatcher) do
     Sandbox.allow(Repo, self(), dispatcher)
     Req.Test.allow(WebhookDelivery, self(), dispatcher)
+  end
+
+  defp create_due_webhook_deliveries!(conn, count, key_prefix) do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "#{key_prefix}-sender", %{})
+    recipient = register_agent!(account_token, "#{key_prefix}-recipient", %{})
+    configure_webhook!(recipient, "#{key_prefix}-webhook")
+
+    for index <- 1..count do
+      sent =
+        send_message!(
+          sender["agent_api_key"]["token"],
+          "#{key_prefix}-send-#{index}",
+          recipient["address"],
+          a2a_user_text("#{key_prefix}-message-#{index}", "dispatch #{index}")
+        )
+
+      assert [%{"id" => delivery_id, "status" => "retry_scheduled", "attempt_count" => 0}] =
+               sent["deliveries"]
+
+      delivery_id
+    end
+  end
+
+  defp assert_started_webhook(tag) when is_atom(tag) do
+    receive do
+      {^tag, delivery_id, worker_pid} when is_binary(delivery_id) and is_pid(worker_pid) ->
+        {delivery_id, worker_pid}
+    after
+      500 -> flunk("expected #{inspect(tag)}")
+    end
+  end
+
+  defp delivery_records(delivery_ids) do
+    Delivery
+    |> where([delivery], delivery.id in ^delivery_ids)
+    |> select([delivery], {
+      delivery.id,
+      delivery.status,
+      delivery.claim_token,
+      delivery.leased_until
+    })
+    |> Repo.all()
+    |> Map.new(fn {id, status, claim_token, leased_until} ->
+      {id, %{status: status, claim_token: claim_token, leased_until: leased_until}}
+    end)
   end
 
   defp assert_delivered_delivery!(delivery_id, attempts_left \\ 20)

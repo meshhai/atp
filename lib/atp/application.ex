@@ -8,6 +8,7 @@ defmodule Atp.Application do
     children = [
       Atp.Repo,
       Atp.Transport.Runtime.Supervisor,
+      {Task.Supervisor, name: Atp.Transport.WebhookDispatcher.TaskSupervisor},
       Atp.Transport.WebhookDispatcher,
       AtpWeb.Endpoint
     ]
