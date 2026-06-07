@@ -2,9 +2,10 @@ defmodule Atp.WebhookDispatcherTest do
   use Atp.ConnCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, WebhookDelivery, WebhookDispatcher}
+  alias Atp.Transport.{Delivery, Message, WebhookAttempt, WebhookDelivery, WebhookDispatcher}
   alias Ecto.Adapters.SQL.Sandbox
 
   setup do
@@ -250,6 +251,86 @@ defmodule Atp.WebhookDispatcherTest do
     end
   end
 
+  test "task crashes record sanitized retry attempts and dispatcher continues", %{conn: conn} do
+    test_pid = self()
+    [crashing_id, continuing_id] = create_due_webhook_deliveries!(conn, 2, "crash-dispatcher")
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+      send(test_pid, {:crash_record_webhook_started, delivery_id})
+
+      if delivery_id == crashing_id do
+        raise ~s(leak https://recipient.example.test/atp/webhook whsec_secret {"body":"hidden"})
+      else
+        Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 2,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+
+    capture_log(fn ->
+      send(dispatcher, :dispatch_due)
+
+      assert_receive {:crash_record_webhook_started, ^crashing_id}, 500
+      assert_retry_scheduled_task_exit!(crashing_id)
+
+      assert_receive {:crash_record_webhook_started, ^continuing_id}, 500
+      assert_delivered_delivery!(continuing_id)
+    end)
+
+    assert %{in_flight: in_flight} = :sys.get_state(dispatcher)
+    assert map_size(in_flight) == 0
+    assert Process.alive?(dispatcher)
+  end
+
+  test "task crashes respect max attempts through durable finish path", %{conn: conn} do
+    test_pid = self()
+    [delivery_id] = create_due_webhook_deliveries!(conn, 1, "crash-final-dispatcher")
+    force_max_attempts!(delivery_id, 1)
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      send(test_pid, {:final_crash_webhook_started, headers["atp-delivery-id"]})
+      raise "internal crash with whsec_secret and request body"
+    end)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 1,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+
+    capture_log(fn ->
+      send(dispatcher, :dispatch_due)
+
+      assert_receive {:final_crash_webhook_started, ^delivery_id}, 500
+      assert_failed_task_exit!(delivery_id)
+    end)
+
+    assert %{in_flight: in_flight} = :sys.get_state(dispatcher)
+    assert map_size(in_flight) == 0
+    assert Process.alive?(dispatcher)
+  end
+
   test "batch_size caps one scan even when worker capacity is available", %{conn: conn} do
     test_pid = self()
 
@@ -435,6 +516,90 @@ defmodule Atp.WebhookDispatcherTest do
     |> Map.new(fn {id, status, claim_token, leased_until} ->
       {id, %{status: status, claim_token: claim_token, leased_until: leased_until}}
     end)
+  end
+
+  defp force_max_attempts!(delivery_id, max_attempts) do
+    delivery = Repo.get!(Delivery, delivery_id)
+
+    delivery
+    |> Ecto.Changeset.change(max_attempts: max_attempts)
+    |> Repo.update!()
+  end
+
+  defp assert_retry_scheduled_task_exit!(delivery_id, attempts_left \\ 20)
+
+  defp assert_retry_scheduled_task_exit!(delivery_id, attempts_left) when attempts_left > 0 do
+    case {Repo.get!(Delivery, delivery_id), Repo.get_by(WebhookAttempt, delivery_id: delivery_id)} do
+      {%Delivery{status: "retry_scheduled", attempt_count: 1} = delivery,
+       %WebhookAttempt{result: "retry_scheduled"} = attempt} ->
+        assert_sanitized_task_exit_attempt!(delivery, attempt)
+        assert %DateTime{} = delivery.next_attempt_at
+        assert %DateTime{} = attempt.next_attempt_at
+        assert is_nil(delivery.claim_token)
+        assert is_nil(delivery.leased_until)
+        delivery
+
+      {%Delivery{}, _attempt} ->
+        Process.sleep(10)
+        assert_retry_scheduled_task_exit!(delivery_id, attempts_left - 1)
+    end
+  end
+
+  defp assert_retry_scheduled_task_exit!(delivery_id, 0) do
+    assert %Delivery{status: "retry_scheduled", attempt_count: 1} =
+             delivery =
+             Repo.get!(Delivery, delivery_id)
+
+    assert %WebhookAttempt{result: "retry_scheduled"} =
+             attempt =
+             Repo.get_by!(WebhookAttempt, delivery_id: delivery_id)
+
+    assert_sanitized_task_exit_attempt!(delivery, attempt)
+  end
+
+  defp assert_failed_task_exit!(delivery_id, attempts_left \\ 20)
+
+  defp assert_failed_task_exit!(delivery_id, attempts_left) when attempts_left > 0 do
+    case {Repo.get!(Delivery, delivery_id), Repo.get_by(WebhookAttempt, delivery_id: delivery_id)} do
+      {%Delivery{status: "failed", attempt_count: 1} = delivery,
+       %WebhookAttempt{result: "failed"} = attempt} ->
+        assert_sanitized_task_exit_attempt!(delivery, attempt)
+        assert is_nil(delivery.next_attempt_at)
+        assert is_nil(attempt.next_attempt_at)
+        assert is_nil(delivery.claim_token)
+        assert is_nil(delivery.leased_until)
+
+        assert %Message{carrier_status: "delivery_failed"} =
+                 Repo.get!(Message, delivery.message_id)
+
+        delivery
+
+      {%Delivery{}, _attempt} ->
+        Process.sleep(10)
+        assert_failed_task_exit!(delivery_id, attempts_left - 1)
+    end
+  end
+
+  defp assert_failed_task_exit!(delivery_id, 0) do
+    assert %Delivery{status: "failed", attempt_count: 1} =
+             delivery =
+             Repo.get!(Delivery, delivery_id)
+
+    assert %WebhookAttempt{result: "failed"} =
+             attempt =
+             Repo.get_by!(WebhookAttempt, delivery_id: delivery_id)
+
+    assert_sanitized_task_exit_attempt!(delivery, attempt)
+  end
+
+  defp assert_sanitized_task_exit_attempt!(%Delivery{} = delivery, %WebhookAttempt{} = attempt) do
+    assert delivery.last_error == "internal_task_exit"
+    assert attempt.error == "internal_task_exit"
+    assert attempt.attempt_number == 1
+    assert is_nil(attempt.response_status)
+    refute attempt.error =~ "whsec"
+    refute attempt.error =~ "recipient.example.test"
+    refute attempt.error =~ "body"
   end
 
   defp assert_delivered_delivery!(delivery_id, attempts_left \\ 20)

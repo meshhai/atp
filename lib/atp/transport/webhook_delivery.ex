@@ -24,6 +24,7 @@ defmodule Atp.Transport.WebhookDelivery do
   @retry_delays_seconds [0, 30, 120, 300, 900, 3_600, 21_600, 86_400]
   @max_retry_delay_seconds 86_400
   @dispatch_lease_seconds 60
+  @internal_task_exit_error "internal_task_exit"
   @timeout_ms 10_000
 
   @type delivery_result :: {:ok, Message.t()} | {:error, term()}
@@ -99,6 +100,32 @@ defmodule Atp.Transport.WebhookDelivery do
       true ->
         attempt_delivery(claim, recipient, now)
     end
+  end
+
+  @doc false
+  @spec record_task_exit(DeliveryClaim.t()) :: delivery_result()
+  def record_task_exit(
+        %DeliveryClaim{
+          delivery: %Delivery{} = delivery,
+          message: %Message{} = message,
+          recipient_agent: %Agent{} = recipient,
+          attempt_number: attempt_number
+        } = claim
+      ) do
+    now = DateTime.utc_now(:microsecond)
+    max_attempts = delivery.max_attempts || max_attempts(recipient)
+
+    result =
+      retry_or_fail(
+        now,
+        message,
+        attempt_number,
+        max_attempts,
+        nil,
+        @internal_task_exit_error
+      )
+
+    DurableLedger.finish_claimed_webhook_delivery(claim, result, now: now)
   end
 
   defp deliver_due_claims(limit, lease_seconds) when is_integer(limit) and limit > 0 do

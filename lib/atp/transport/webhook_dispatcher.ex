@@ -61,10 +61,11 @@ defmodule Atp.Transport.WebhookDispatcher do
     {:noreply, state}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{in_flight: in_flight} = state)
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{in_flight: in_flight} = state)
       when is_map_key(in_flight, ref) do
     state =
       state
+      |> record_task_exit(ref, reason)
       |> complete_task(ref)
       |> start_available_tasks()
 
@@ -111,7 +112,7 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp monitor_existing_tasks(task_supervisor) do
     task_supervisor
     |> task_supervisor_children()
-    |> Map.new(fn pid -> {Process.monitor(pid), pid} end)
+    |> Map.new(fn pid -> {Process.monitor(pid), %{pid: pid, claim: nil}} end)
   end
 
   defp task_supervisor_children(task_supervisor) do
@@ -195,9 +196,24 @@ defmodule Atp.Transport.WebhookDispatcher do
 
     %{
       state
-      | in_flight: Map.put(state.in_flight, task.ref, task.pid),
+      | in_flight: Map.put(state.in_flight, task.ref, %{pid: task.pid, claim: claim}),
         pending_dispatches: state.pending_dispatches - 1
     }
+  end
+
+  defp record_task_exit(state, _ref, :normal), do: state
+  defp record_task_exit(state, _ref, :shutdown), do: state
+  defp record_task_exit(state, _ref, {:shutdown, _reason}), do: state
+
+  defp record_task_exit(%{in_flight: in_flight} = state, ref, _reason) do
+    case Map.fetch!(in_flight, ref) do
+      %{claim: %DeliveryClaim{} = claim} ->
+        _result = WebhookDelivery.record_task_exit(claim)
+        state
+
+      %{claim: nil} ->
+        state
+    end
   end
 
   defp complete_task(state, ref) do
