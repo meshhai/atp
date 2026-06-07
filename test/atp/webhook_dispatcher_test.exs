@@ -251,6 +251,60 @@ defmodule Atp.WebhookDispatcherTest do
     end
   end
 
+  test "session webhook ordering continues within scan budget after prior attempt finishes", %{
+    conn: conn
+  } do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      {:ok, raw_body, request_conn} = Plug.Conn.read_body(request_conn)
+      headers = Map.new(request_conn.req_headers)
+      sequence = raw_body |> Jason.decode!() |> get_in(["message", "session_sequence"])
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:session_ordered_webhook_started, sequence, delivery_id, self()})
+
+      if sequence == 2 do
+        receive do
+          :release_session_ordered_webhook -> :ok
+        end
+      end
+
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    %{deliveries: %{2 => first_delivery_id, 3 => second_delivery_id}} =
+      create_due_session_webhook_deliveries!(conn, "ordered-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 10,
+         max_in_flight: 2,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    assert_receive {:session_ordered_webhook_started, 2, ^first_delivery_id, first_worker}, 500
+    refute_receive {:session_ordered_webhook_started, 3, ^second_delivery_id, _worker}, 100
+
+    assert %Delivery{status: "retry_scheduled", claim_token: nil, leased_until: nil} =
+             Repo.get!(Delivery, second_delivery_id)
+
+    send(first_worker, :release_session_ordered_webhook)
+
+    assert_receive {:session_ordered_webhook_started, 3, ^second_delivery_id, _second_worker},
+                   500
+
+    assert_delivered_delivery!(first_delivery_id)
+    assert_delivered_delivery!(second_delivery_id)
+  end
+
   test "task crashes record sanitized retry attempts and dispatcher continues", %{conn: conn} do
     test_pid = self()
     [crashing_id, continuing_id] = create_due_webhook_deliveries!(conn, 2, "crash-dispatcher")
@@ -492,6 +546,79 @@ defmodule Atp.WebhookDispatcherTest do
 
       delivery_id
     end
+  end
+
+  defp create_due_session_webhook_deliveries!(conn, key_prefix) do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    initiator = register_agent!(account_token, "#{key_prefix}-initiator", %{})
+    recipient = register_agent!(account_token, "#{key_prefix}-recipient", %{})
+
+    opened =
+      open_session!(
+        initiator["agent_api_key"]["token"],
+        "#{key_prefix}-open",
+        recipient["address"],
+        a2a_user_text("#{key_prefix}-opening", "open ordered session")
+      )
+
+    opening_delivery =
+      claim_inbox!(recipient["agent_api_key"]["token"], "#{key_prefix}-claim-opening", %{
+        "lease_seconds" => 60
+      })
+
+    ack_delivery!(
+      recipient["agent_api_key"]["token"],
+      opening_delivery["id"],
+      "#{key_prefix}-accept-opening",
+      %{"status" => "accepted"}
+    )
+
+    configure_webhook!(recipient, "#{key_prefix}-webhook")
+
+    session_id = opened["session"]["id"]
+    initiator_token = initiator["agent_api_key"]["token"]
+
+    first =
+      send_session_message!(
+        initiator_token,
+        session_id,
+        "#{key_prefix}-send-1",
+        a2a_user_text("#{key_prefix}-message-1", "first ordered webhook")
+      )
+
+    second =
+      send_session_message!(
+        initiator_token,
+        session_id,
+        "#{key_prefix}-send-2",
+        a2a_user_text("#{key_prefix}-message-2", "second ordered webhook")
+      )
+
+    %{
+      session_id: session_id,
+      deliveries: %{
+        2 => session_webhook_delivery_id!(first, 2),
+        3 => session_webhook_delivery_id!(second, 3)
+      }
+    }
+  end
+
+  defp send_session_message!(initiator_token, session_id, key, payload) do
+    build_conn()
+    |> authorize(initiator_token)
+    |> idempotency_key(key)
+    |> post("/api/sessions/#{session_id}/messages", %{"payload" => payload})
+    |> json_response(201)
+  end
+
+  defp session_webhook_delivery_id!(reply, sequence) do
+    assert get_in(reply, ["message_status", "message", "session_sequence"]) == sequence
+
+    assert [%{"id" => delivery_id, "status" => "retry_scheduled", "attempt_count" => 0}] =
+             reply["message_status"]["deliveries"]
+
+    delivery_id
   end
 
   defp assert_started_webhook(tag) when is_atom(tag) do

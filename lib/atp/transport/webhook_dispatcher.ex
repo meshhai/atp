@@ -176,7 +176,7 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp start_tasks(count, state) do
     case DurableLedger.claim_due_webhook_delivery() do
       {:ok, nil} ->
-        %{state | pending_dispatches: 0}
+        clear_pending_when_idle(state)
 
       {:ok, %DeliveryClaim{} = claim} ->
         state
@@ -187,6 +187,12 @@ defmodule Atp.Transport.WebhookDispatcher do
         %{state | pending_dispatches: 0}
     end
   end
+
+  defp clear_pending_when_idle(%{in_flight: in_flight} = state) when map_size(in_flight) > 0 do
+    state
+  end
+
+  defp clear_pending_when_idle(state), do: %{state | pending_dispatches: 0}
 
   defp start_task(state, %DeliveryClaim{} = claim) do
     task =
