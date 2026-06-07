@@ -15,10 +15,18 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   @spec wakeup(GenServer.server() | nil) :: :ok
   def wakeup(server \\ configured_name()) do
-    case dispatcher_pid(server) do
-      nil -> :ok
-      pid -> GenServer.cast(pid, :dispatch_wakeup)
-    end
+    wakeup_dispatcher(server)
+  end
+
+  @doc false
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    %{
+      id: Keyword.get(opts, :id, __MODULE__),
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :transient,
+      type: :worker
+    }
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -88,7 +96,7 @@ defmodule Atp.Transport.WebhookDispatcher do
       when is_map_key(in_flight, ref) do
     %{claim: claim} = Map.fetch!(in_flight, ref)
 
-    {state, result} = record_task_exit(state, ref, reason)
+    {state, result} = record_running_task_exit(state, ref, reason)
 
     state =
       state
@@ -181,17 +189,13 @@ defmodule Atp.Transport.WebhookDispatcher do
     :exit, _reason -> []
   end
 
-  defp dispatcher_pid(nil), do: nil
+  defp wakeup_dispatcher(nil), do: :ok
 
-  defp dispatcher_pid(pid) when is_pid(pid) do
-    if Process.alive?(pid), do: pid
+  defp wakeup_dispatcher(server) do
+    GenServer.cast(server, :dispatch_wakeup)
+  catch
+    :exit, _reason -> :ok
   end
-
-  defp dispatcher_pid(name) when is_atom(name) do
-    Process.whereis(name)
-  end
-
-  defp dispatcher_pid(_server), do: nil
 
   defp schedule_initial_dispatch(%{enabled?: false} = state), do: state
 
@@ -299,11 +303,15 @@ defmodule Atp.Transport.WebhookDispatcher do
       {:task_exit, {:error, :task_exit_record_failed}}
   end
 
-  defp record_task_exit(state, _ref, :normal), do: {state, {:ok, :normal}}
-  defp record_task_exit(state, _ref, :shutdown), do: {state, {:ok, :shutdown}}
-  defp record_task_exit(state, _ref, {:shutdown, _reason}), do: {state, {:ok, :shutdown}}
+  defp record_running_task_exit(state, _ref, :normal), do: {state, {:ok, :normal}}
+  defp record_running_task_exit(state, ref, _reason), do: record_durable_task_exit(state, ref)
 
-  defp record_task_exit(%{in_flight: in_flight} = state, ref, _reason) do
+  defp record_shutdown_task_exit(state, _ref, :normal), do: {state, {:ok, :normal}}
+  defp record_shutdown_task_exit(state, _ref, :shutdown), do: {state, {:ok, :shutdown}}
+  defp record_shutdown_task_exit(state, _ref, {:shutdown, _reason}), do: {state, {:ok, :shutdown}}
+  defp record_shutdown_task_exit(state, ref, _reason), do: record_durable_task_exit(state, ref)
+
+  defp record_durable_task_exit(%{in_flight: in_flight} = state, ref) do
     case Map.fetch!(in_flight, ref) do
       %{claim: %DeliveryClaim{} = claim} ->
         {state, WebhookDelivery.record_task_exit(claim)}
@@ -356,7 +364,7 @@ defmodule Atp.Transport.WebhookDispatcher do
 
         {:DOWN, ref, :process, _pid, reason} when is_map_key(in_flight, ref) ->
           %{claim: claim} = Map.fetch!(in_flight, ref)
-          {state, result} = record_task_exit(state, ref, reason)
+          {state, result} = record_shutdown_task_exit(state, ref, reason)
 
           state
           |> complete_task(ref)

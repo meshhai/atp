@@ -444,6 +444,51 @@ defmodule Atp.WebhookDispatcherTest do
     assert Process.alive?(restarted_dispatcher)
   end
 
+  test "externally stopped workers record durable task-exit attempts while dispatcher runs", %{
+    conn: conn
+  } do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      delivery_id = headers["atp-delivery-id"]
+
+      send(test_pid, {:external_stop_webhook_started, delivery_id, self()})
+
+      receive do
+        :release_external_stop_webhook -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    delivery_ids = create_due_webhook_deliveries!(conn, 2, "external-stop-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 2,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    {first_id, first_worker} = assert_started_webhook(:external_stop_webhook_started)
+    Process.exit(first_worker, :shutdown)
+    assert_retry_scheduled_task_exit!(first_id)
+
+    {second_id, second_worker} = assert_started_webhook(:external_stop_webhook_started)
+    Process.exit(second_worker, {:shutdown, :external_stop})
+    assert_retry_scheduled_task_exit!(second_id)
+
+    assert Enum.sort([first_id, second_id]) == Enum.sort(delivery_ids)
+    assert_dispatcher_idle!(dispatcher)
+    assert Process.alive?(dispatcher)
+  end
+
   test "session webhook ordering continues within scan budget after prior attempt finishes", %{
     conn: conn
   } do
@@ -845,6 +890,48 @@ defmodule Atp.WebhookDispatcherTest do
     assert_delivered_delivery!(delivery_id)
   end
 
+  test "configured via dispatcher name receives wakeups", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      send(test_pid, {:via_wakeup_webhook_request, headers["atp-delivery-id"]})
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    [delivery_id] = create_due_webhook_deliveries!(conn, 1, "via-wakeup-dispatcher")
+    registry = :atp_via_wakeup_registry_test
+    start_supervised!({Registry, keys: :unique, name: registry})
+    dispatcher_name = {:via, Registry, {registry, :dispatcher}}
+    dispatcher = start_wakeup_dispatcher!(dispatcher_name)
+
+    allow_dispatcher(dispatcher)
+    assert :ok = WebhookDispatcher.wakeup()
+
+    assert_receive {:via_wakeup_webhook_request, ^delivery_id}, 500
+    assert_delivered_delivery!(delivery_id)
+  end
+
+  test "configured global dispatcher name receives wakeups", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      send(test_pid, {:global_wakeup_webhook_request, headers["atp-delivery-id"]})
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    [delivery_id] = create_due_webhook_deliveries!(conn, 1, "global-wakeup-dispatcher")
+    global_key = {:atp_global_wakeup_dispatcher_test, System.unique_integer([:positive])}
+    dispatcher = start_wakeup_dispatcher!({:global, global_key})
+
+    allow_dispatcher(dispatcher)
+    assert :ok = WebhookDispatcher.wakeup()
+
+    assert_receive {:global_wakeup_webhook_request, ^delivery_id}, 500
+    assert_delivered_delivery!(delivery_id)
+  end
+
   test "disabled webhook dispatcher ignores wakeups" do
     name = :atp_disabled_wakeup_dispatcher_test
     dispatcher = start_supervised!({WebhookDispatcher, enabled: false, name: name})
@@ -853,7 +940,7 @@ defmodule Atp.WebhookDispatcherTest do
     assert %{enabled?: false} = :sys.get_state(dispatcher)
   end
 
-  defp start_wakeup_dispatcher!(name) when is_atom(name) do
+  defp start_wakeup_dispatcher!(name) do
     WebhookDispatcher
     |> dispatcher_config()
     |> Keyword.put(:name, name)
