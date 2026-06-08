@@ -268,10 +268,13 @@ defmodule Atp.WebhookDispatcherTest do
     end)
 
     [delivery_id] = create_due_webhook_deliveries!(conn, 1, "shutdown-expiry-dispatcher")
-    task_supervisor = :atp_shutdown_expiry_webhook_task_supervisor_test
-    task_supervisor_id = :atp_shutdown_expiry_webhook_task_supervisor_child_test
+    attempt_supervisor = :atp_shutdown_expiry_webhook_attempt_supervisor_test
+    attempt_supervisor_id = :atp_shutdown_expiry_webhook_attempt_supervisor_child_test
 
-    start_supervised!({Task.Supervisor, name: task_supervisor}, id: task_supervisor_id)
+    start_supervised!(
+      {DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one},
+      id: attempt_supervisor_id
+    )
 
     dispatcher =
       start_supervised!(
@@ -282,7 +285,7 @@ defmodule Atp.WebhookDispatcherTest do
          max_in_flight: 1,
          shutdown_wait_ms: 10,
          interval_ms: 60_000,
-         task_supervisor: task_supervisor,
+         attempt_supervisor: attempt_supervisor,
          name: nil},
         id: :atp_shutdown_expiry_first_dispatcher_test
       )
@@ -300,10 +303,14 @@ defmodule Atp.WebhookDispatcherTest do
 
     assert is_binary(claim_token)
 
-    stop_supervised!(task_supervisor_id)
+    stop_supervised!(attempt_supervisor_id)
     refute_process_alive!(first_worker)
     expire_delivery_lease!(delivery_id)
-    start_supervised!({Task.Supervisor, name: task_supervisor}, id: task_supervisor_id)
+
+    start_supervised!(
+      {DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one},
+      id: attempt_supervisor_id
+    )
 
     restarted_dispatcher =
       start_supervised!(
@@ -314,7 +321,7 @@ defmodule Atp.WebhookDispatcherTest do
          max_in_flight: 1,
          shutdown_wait_ms: 10,
          interval_ms: 60_000,
-         task_supervisor: task_supervisor,
+         attempt_supervisor: attempt_supervisor,
          name: nil},
         id: :atp_shutdown_expiry_second_dispatcher_test
       )
@@ -343,10 +350,10 @@ defmodule Atp.WebhookDispatcherTest do
     end)
 
     delivery_ids = create_due_webhook_deliveries!(conn, 3, "restart-bound-dispatcher")
-    task_supervisor = :atp_restart_bound_webhook_task_supervisor_test
+    attempt_supervisor = :atp_restart_bound_webhook_attempt_supervisor_test
     dispatcher_name = :atp_restart_bound_webhook_dispatcher_test
 
-    start_supervised!({Task.Supervisor, name: task_supervisor})
+    start_supervised!({DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one})
 
     dispatcher =
       start_supervised!(
@@ -356,7 +363,7 @@ defmodule Atp.WebhookDispatcherTest do
          batch_size: 10,
          max_in_flight: 2,
          interval_ms: 60_000,
-         task_supervisor: task_supervisor,
+         attempt_supervisor: attempt_supervisor,
          name: dispatcher_name}
       )
 
@@ -406,10 +413,10 @@ defmodule Atp.WebhookDispatcherTest do
     end)
 
     [delivery_id] = create_due_webhook_deliveries!(conn, 1, "restart-exit-dispatcher")
-    task_supervisor = :atp_restart_exit_webhook_task_supervisor_test
+    attempt_supervisor = :atp_restart_exit_webhook_attempt_supervisor_test
     dispatcher_name = :atp_restart_exit_webhook_dispatcher_test
 
-    start_supervised!({Task.Supervisor, name: task_supervisor})
+    start_supervised!({DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one})
 
     dispatcher =
       start_supervised!(
@@ -419,7 +426,7 @@ defmodule Atp.WebhookDispatcherTest do
          batch_size: 1,
          max_in_flight: 1,
          interval_ms: 60_000,
-         task_supervisor: task_supervisor,
+         attempt_supervisor: attempt_supervisor,
          name: dispatcher_name}
       )
 

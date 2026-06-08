@@ -4,13 +4,13 @@ defmodule Atp.Transport.WebhookDispatcher do
   use GenServer
 
   alias Atp.Transport.{DeliveryClaim, DurableLedger, Message, WebhookDelivery}
+  alias Atp.Transport.WebhookDispatcher.AttemptWorker
 
   @default_batch_size 50
   @default_interval_ms 5_000
   @default_max_in_flight 10
   @default_shutdown_wait_ms 1_000
-  @default_task_supervisor __MODULE__.TaskSupervisor
-  @task_claim_key {__MODULE__, :delivery_claim}
+  @default_attempt_supervisor __MODULE__.AttemptSupervisor
   @telemetry_prefix [:atp, :transport, :webhook_dispatcher]
 
   @spec wakeup(GenServer.server() | nil) :: :ok
@@ -38,7 +38,7 @@ defmodule Atp.Transport.WebhookDispatcher do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
-    task_supervisor = option(opts, :task_supervisor, @default_task_supervisor)
+    attempt_supervisor = option(opts, :attempt_supervisor, @default_attempt_supervisor)
 
     state = %{
       enabled?: option(opts, :enabled, true),
@@ -48,9 +48,9 @@ defmodule Atp.Transport.WebhookDispatcher do
       max_in_flight: positive_integer_option(opts, :max_in_flight, @default_max_in_flight),
       shutdown_wait_ms:
         non_negative_integer_option(opts, :shutdown_wait_ms, @default_shutdown_wait_ms),
-      task_supervisor: task_supervisor,
+      attempt_supervisor: attempt_supervisor,
       timer_ref: nil,
-      in_flight: monitor_existing_tasks(task_supervisor),
+      in_flight: monitor_existing_attempts(attempt_supervisor),
       pending_dispatches: 0
     }
 
@@ -64,32 +64,42 @@ defmodule Atp.Transport.WebhookDispatcher do
 
   def handle_info(:dispatch_due, state), do: {:noreply, state}
 
-  def handle_info({ref, {:task_exit, result}}, %{in_flight: in_flight} = state)
-      when is_map_key(in_flight, ref) do
-    %{claim: claim} = Map.fetch!(in_flight, ref)
-    Process.demonitor(ref, [:flush])
+  def handle_info({pid, {:task_exit, result}}, state) when is_pid(pid) do
+    case in_flight_ref_for_pid(state.in_flight, pid) do
+      nil ->
+        {:noreply, state}
 
-    state =
-      state
-      |> complete_task(ref)
-      |> emit_task_exit(claim, result)
-      |> start_available_tasks()
+      ref ->
+        %{claim: claim} = Map.fetch!(state.in_flight, ref)
+        Process.demonitor(ref, [:flush])
 
-    {:noreply, state}
+        state =
+          state
+          |> complete_task(ref)
+          |> emit_task_exit(claim, result)
+          |> start_available_tasks()
+
+        {:noreply, state}
+    end
   end
 
-  def handle_info({ref, result}, %{in_flight: in_flight} = state)
-      when is_map_key(in_flight, ref) do
-    %{claim: claim} = Map.fetch!(in_flight, ref)
-    Process.demonitor(ref, [:flush])
+  def handle_info({pid, result}, state) when is_pid(pid) do
+    case in_flight_ref_for_pid(state.in_flight, pid) do
+      nil ->
+        {:noreply, state}
 
-    state =
-      state
-      |> complete_task(ref)
-      |> emit_attempt_finish(claim, result)
-      |> start_available_tasks()
+      ref ->
+        %{claim: claim} = Map.fetch!(state.in_flight, ref)
+        Process.demonitor(ref, [:flush])
 
-    {:noreply, state}
+        state =
+          state
+          |> complete_task(ref)
+          |> emit_attempt_finish(claim, result)
+          |> start_available_tasks()
+
+        {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{in_flight: in_flight} = state)
@@ -160,31 +170,30 @@ defmodule Atp.Transport.WebhookDispatcher do
     config_option(:name, __MODULE__)
   end
 
-  defp monitor_existing_tasks(task_supervisor) do
-    task_supervisor
-    |> task_supervisor_children()
-    |> Map.new(&monitor_existing_task/1)
+  defp monitor_existing_attempts(attempt_supervisor) do
+    attempt_supervisor
+    |> attempt_supervisor_children()
+    |> Enum.flat_map(&monitor_existing_attempt/1)
+    |> Map.new()
   end
 
-  defp monitor_existing_task(pid) do
-    {Process.monitor(pid), %{pid: pid, claim: task_delivery_claim(pid)}}
-  end
-
-  defp task_delivery_claim(pid) when is_pid(pid) do
-    case Process.info(pid, :dictionary) do
-      {:dictionary, dictionary} ->
-        case List.keyfind(dictionary, @task_claim_key, 0) do
-          {_key, %DeliveryClaim{} = claim} -> claim
-          _other -> nil
-        end
+  defp monitor_existing_attempt(pid) do
+    case AttemptWorker.claim(pid) do
+      %DeliveryClaim{} = claim ->
+        [{Process.monitor(pid), %{pid: pid, claim: claim}}]
 
       nil ->
-        nil
+        []
     end
   end
 
-  defp task_supervisor_children(task_supervisor) do
-    Task.Supervisor.children(task_supervisor)
+  defp attempt_supervisor_children(attempt_supervisor) do
+    attempt_supervisor
+    |> DynamicSupervisor.which_children()
+    |> Enum.flat_map(fn
+      {_id, pid, :worker, _modules} when is_pid(pid) -> [pid]
+      _child -> []
+    end)
   catch
     :exit, _reason -> []
   end
@@ -265,42 +274,42 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp clear_pending_when_idle(state), do: %{state | pending_dispatches: 0}
 
   defp start_task(state, %DeliveryClaim{} = claim) do
-    task =
-      Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-        deliver_claim_safely(claim)
-      end)
-
-    state = %{
-      state
-      | in_flight: Map.put(state.in_flight, task.ref, %{pid: task.pid, claim: claim}),
-        pending_dispatches: state.pending_dispatches - 1
+    child_spec = %{
+      id: {AttemptWorker, claim.delivery.id, claim.claim_token},
+      start:
+        {AttemptWorker, :start_link,
+         [[claim: claim, dispatcher: self(), callers: [self() | Process.get(:"$callers", [])]]]},
+      restart: :temporary
     }
 
-    emit_attempt_start(state, claim)
-  end
+    case DynamicSupervisor.start_child(state.attempt_supervisor, child_spec) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
 
-  defp deliver_claim_safely(%DeliveryClaim{} = claim) do
-    Process.put(@task_claim_key, claim)
+        state = %{
+          state
+          | in_flight: Map.put(state.in_flight, ref, %{pid: pid, claim: claim}),
+            pending_dispatches: state.pending_dispatches - 1
+        }
 
-    try do
-      WebhookDelivery.deliver_claim(claim)
-    rescue
-      _exception ->
-        record_sanitized_task_exit(claim)
-    catch
-      _kind, _reason ->
-        record_sanitized_task_exit(claim)
+        emit_attempt_start(state, claim)
+
+      {:ok, pid, _info} ->
+        ref = Process.monitor(pid)
+
+        state = %{
+          state
+          | in_flight: Map.put(state.in_flight, ref, %{pid: pid, claim: claim}),
+            pending_dispatches: state.pending_dispatches - 1
+        }
+
+        emit_attempt_start(state, claim)
+
+      {:error, reason} ->
+        state
+        |> emit_claim(:error, nil, reason)
+        |> Map.put(:pending_dispatches, 0)
     end
-  end
-
-  defp record_sanitized_task_exit(%DeliveryClaim{} = claim) do
-    {:task_exit, WebhookDelivery.record_task_exit(claim)}
-  rescue
-    _exception ->
-      {:task_exit, {:error, :task_exit_record_failed}}
-  catch
-    _kind, _reason ->
-      {:task_exit, {:error, :task_exit_record_failed}}
   end
 
   defp record_running_task_exit(state, _ref, :normal), do: {state, {:ok, :normal}}
@@ -312,17 +321,20 @@ defmodule Atp.Transport.WebhookDispatcher do
   defp record_shutdown_task_exit(state, ref, _reason), do: record_durable_task_exit(state, ref)
 
   defp record_durable_task_exit(%{in_flight: in_flight} = state, ref) do
-    case Map.fetch!(in_flight, ref) do
-      %{claim: %DeliveryClaim{} = claim} ->
-        {state, WebhookDelivery.record_task_exit(claim)}
+    %{claim: %DeliveryClaim{} = claim} = Map.fetch!(in_flight, ref)
 
-      %{claim: nil} ->
-        {state, {:error, :unknown_claim}}
-    end
+    {state, WebhookDelivery.record_task_exit(claim)}
   end
 
   defp complete_task(state, ref) do
     %{state | in_flight: Map.delete(state.in_flight, ref)}
+  end
+
+  defp in_flight_ref_for_pid(in_flight, pid) do
+    Enum.find_value(in_flight, fn
+      {ref, %{pid: ^pid}} -> ref
+      _entry -> nil
+    end)
   end
 
   defp wait_for_in_flight(%{shutdown_wait_ms: 0}), do: :ok
@@ -344,23 +356,35 @@ defmodule Atp.Transport.WebhookDispatcher do
       :ok
     else
       receive do
-        {ref, {:task_exit, result}} when is_map_key(in_flight, ref) ->
-          %{claim: claim} = Map.fetch!(in_flight, ref)
-          Process.demonitor(ref, [:flush])
+        {pid, {:task_exit, result}} when is_pid(pid) ->
+          case in_flight_ref_for_pid(in_flight, pid) do
+            nil ->
+              wait_for_in_flight_until(state, deadline_ms)
 
-          state
-          |> complete_task(ref)
-          |> emit_task_exit(claim, result)
-          |> wait_for_in_flight_until(deadline_ms)
+            ref ->
+              %{claim: claim} = Map.fetch!(in_flight, ref)
+              Process.demonitor(ref, [:flush])
 
-        {ref, result} when is_map_key(in_flight, ref) ->
-          %{claim: claim} = Map.fetch!(in_flight, ref)
-          Process.demonitor(ref, [:flush])
+              state
+              |> complete_task(ref)
+              |> emit_task_exit(claim, result)
+              |> wait_for_in_flight_until(deadline_ms)
+          end
 
-          state
-          |> complete_task(ref)
-          |> emit_attempt_finish(claim, result)
-          |> wait_for_in_flight_until(deadline_ms)
+        {pid, result} when is_pid(pid) ->
+          case in_flight_ref_for_pid(in_flight, pid) do
+            nil ->
+              wait_for_in_flight_until(state, deadline_ms)
+
+            ref ->
+              %{claim: claim} = Map.fetch!(in_flight, ref)
+              Process.demonitor(ref, [:flush])
+
+              state
+              |> complete_task(ref)
+              |> emit_attempt_finish(claim, result)
+              |> wait_for_in_flight_until(deadline_ms)
+          end
 
         {:DOWN, ref, :process, _pid, reason} when is_map_key(in_flight, ref) ->
           %{claim: claim} = Map.fetch!(in_flight, ref)
