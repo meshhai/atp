@@ -1,7 +1,7 @@
 defmodule Atp.Transport.Response do
   @moduledoc false
 
-  alias Atp.Identity.Agent
+  alias Atp.Identity.{Account, Agent}
 
   alias Atp.Transport.{
     Ack,
@@ -13,6 +13,7 @@ defmodule Atp.Transport.Response do
   }
 
   @type response_map :: %{String.t() => term()}
+  @type message_status_viewer :: Agent.t() | Account.t()
 
   @spec session_message(Session.t(), Message.t(), Agent.t()) :: response_map()
   def session_message(%Session{} = session, %Message{} = message, %Agent{} = viewer) do
@@ -48,8 +49,8 @@ defmodule Atp.Transport.Response do
     }
   end
 
-  @spec message_status(Message.t(), Agent.t()) :: response_map()
-  def message_status(%Message{} = message, %Agent{} = viewer) do
+  @spec message_status(Message.t(), message_status_viewer()) :: response_map()
+  def message_status(%Message{} = message, viewer) do
     %{
       "message" => MessageEnvelope.to_map(message),
       "carrier_status" => message.carrier_status,
@@ -85,6 +86,10 @@ defmodule Atp.Transport.Response do
 
   defp expose_request_url?(%Message{} = message, %Agent{} = viewer) do
     message.recipient_agent_id == viewer.id
+  end
+
+  defp expose_request_url?(%Message{} = message, %Account{} = viewer) do
+    message.recipient_account_id == viewer.id
   end
 
   defp delivery_statuses(%Message{deliveries: deliveries}, expose_request_url?)

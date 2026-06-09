@@ -8,7 +8,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
   import Ecto.Query
 
-  alias Atp.Identity.{Agent, ID, Idempotency}
+  alias Atp.Identity.{Account, Agent, ID, Idempotency}
   alias Atp.Repo
 
   alias Atp.Transport.{
@@ -228,7 +228,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   @impl DurableLedger
-  @spec get_message_status(Agent.t(), String.t()) :: DurableLedger.read_result()
+  @spec get_message_status(Agent.t() | Account.t(), String.t()) :: DurableLedger.read_result()
   def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
     case Repo.get(Message, message_id) do
       %Message{} = message when message.sender_agent_id == agent.id ->
@@ -236,6 +236,19 @@ defmodule Atp.Transport.DurableLedger.Postgres do
 
       %Message{} = message when message.recipient_agent_id == agent.id ->
         {:ok, message_status_response(message, agent)}
+
+      _other ->
+        {:error, :not_found}
+    end
+  end
+
+  def get_message_status(%Account{} = account, message_id) when is_binary(message_id) do
+    case Repo.get(Message, message_id) do
+      %Message{} = message when message.sender_account_id == account.id ->
+        {:ok, message_status_response(message, account)}
+
+      %Message{} = message when message.recipient_account_id == account.id ->
+        {:ok, message_status_response(message, account)}
 
       _other ->
         {:error, :not_found}
@@ -361,7 +374,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     Response.session_transcript(session, messages, viewer)
   end
 
-  defp message_status_response(%Message{} = message, %Agent{} = viewer) do
+  defp message_status_response(%Message{} = message, viewer) do
     message
     |> preload_message_status()
     |> Response.message_status(viewer)

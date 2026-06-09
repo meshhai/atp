@@ -1,7 +1,7 @@
 defmodule Atp.DurableLedgerTest do
   use ExUnit.Case, async: false
 
-  alias Atp.Identity.Agent
+  alias Atp.Identity.{Account, Agent}
   alias Atp.Transport
   alias Atp.Transport.{Delivery, DeliveryClaim, Message, Session}
   alias Atp.Transport.DurableLedger
@@ -469,10 +469,17 @@ defmodule Atp.DurableLedgerTest do
       status: "active"
     }
 
+    account = %Account{id: "acc_public_read", name: "Public Read", plan: "free"}
+
     assert {:ok, %{"message" => %{"id" => "msg_configured"}}} =
              DurableLedger.get_message_status(agent, "msg_configured")
 
     assert_received {:get_message_status, ^agent, "msg_configured"}
+
+    assert {:ok, %{"message" => %{"id" => "msg_account_configured"}}} =
+             DurableLedger.get_message_status(account, "msg_account_configured")
+
+    assert_received {:get_message_status, ^account, "msg_account_configured"}
 
     assert {:ok, %{"session" => %{"id" => "ses_configured", "status" => "pending"}}} =
              DurableLedger.get_session(agent, "ses_configured")
@@ -549,10 +556,17 @@ defmodule Atp.DurableLedgerTest do
       status: "active"
     }
 
+    account = %Account{id: "acc_transport_public", name: "Transport Public", plan: "free"}
+
     assert {:ok, %{"message" => %{"id" => "msg_transport_public"}}} =
              Transport.get_message_status(agent, "msg_transport_public")
 
     assert_received {:get_message_status, ^agent, "msg_transport_public"}
+
+    assert {:ok, %{"message" => %{"id" => "msg_transport_account"}}} =
+             Transport.get_message_status({:account, account}, "msg_transport_account")
+
+    assert_received {:get_message_status, ^account, "msg_transport_account"}
 
     assert {:ok, %{"session" => %{"id" => "ses_transport_public", "status" => "pending"}}} =
              Transport.get_session(agent, "ses_transport_public")
@@ -991,8 +1005,8 @@ defmodule Atp.DurableLedgerTest do
     message_status_doc = callback_doc(docs, :get_message_status, 2)
 
     assert message_status_doc =~ "message status"
-    assert message_status_doc =~ "sender or recipient"
-    assert message_status_doc =~ "public message status response shape"
+    assert message_status_doc =~ "sender, recipient, or an account"
+    assert message_status_doc =~ "status response shape"
     refute message_status_doc =~ ~r/\b(SQL|Ecto|table|row|lock)\b/i
 
     session_read_doc = callback_doc(docs, :get_session, 2)

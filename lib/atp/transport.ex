@@ -1,7 +1,8 @@
 defmodule Atp.Transport do
   @moduledoc "Public ATP carrier facade for messages, sessions, polling leases, and status reads."
 
-  alias Atp.Identity.{Agent, Idempotency}
+  alias Atp.Identity
+  alias Atp.Identity.{Account, Agent, Idempotency}
   alias Atp.Transport.{DurableLedger, Runtime, WebhookDispatcher}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
@@ -50,8 +51,21 @@ defmodule Atp.Transport do
   @spec get_session(Agent.t(), String.t()) :: {:ok, map()} | {:error, :not_found}
   defdelegate get_session(agent, session_id), to: Runtime
 
-  @spec get_message_status(Agent.t(), String.t()) :: {:ok, map()} | {:error, :not_found}
-  defdelegate get_message_status(agent, message_id), to: DurableLedger
+  @type message_status_viewer :: Identity.principal() | Agent.t() | Account.t()
+
+  @spec get_message_status(message_status_viewer(), String.t()) ::
+          {:ok, map()} | {:error, :not_found}
+  def get_message_status({:agent, %Agent{} = agent}, message_id),
+    do: get_message_status(agent, message_id)
+
+  def get_message_status({:account, %Account{} = account}, message_id),
+    do: get_message_status(account, message_id)
+
+  def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id),
+    do: DurableLedger.get_message_status(agent, message_id)
+
+  def get_message_status(%Account{} = account, message_id) when is_binary(message_id),
+    do: DurableLedger.get_message_status(account, message_id)
 
   @spec claim_inbox(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
   defdelegate claim_inbox(agent, params, idempotency_key, route), to: DurableLedger

@@ -15,6 +15,10 @@ defmodule AtpWeb.Router do
     plug(AtpWeb.Plugs.RequireAgent)
   end
 
+  pipeline :principal_auth do
+    plug(AtpWeb.Plugs.Authenticate)
+  end
+
   scope "/api", AtpWeb do
     pipe_through(:api)
 
@@ -30,10 +34,15 @@ defmodule AtpWeb.Router do
   end
 
   scope "/api", AtpWeb do
+    pipe_through([:api, :principal_auth])
+
+    get("/messages/:id", MessageController, :show)
+  end
+
+  scope "/api", AtpWeb do
     pipe_through([:api, :agent_auth])
 
     post("/messages", MessageController, :create)
-    get("/messages/:id", MessageController, :show)
     post("/sessions", SessionController, :create)
     get("/sessions/:id", SessionController, :show)
     post("/sessions/:id/accept", SessionController, :accept)
