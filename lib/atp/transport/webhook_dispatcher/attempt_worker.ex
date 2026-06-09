@@ -47,15 +47,13 @@ defmodule Atp.Transport.WebhookDispatcher.AttemptWorker do
   end
 
   defp deliver_claim_safely(%DeliveryClaim{} = claim) do
-    try do
-      WebhookDelivery.deliver_claim(claim)
-    rescue
-      _exception ->
-        record_sanitized_task_exit(claim)
-    catch
-      _kind, _reason ->
-        record_sanitized_task_exit(claim)
-    end
+    WebhookDelivery.deliver_claim(claim)
+  rescue
+    _exception ->
+      record_sanitized_task_exit(claim)
+  catch
+    _kind, _reason ->
+      record_sanitized_task_exit(claim)
   end
 
   defp record_sanitized_task_exit(%DeliveryClaim{} = claim) do
