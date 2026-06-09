@@ -316,8 +316,16 @@ defmodule Atp.Transport.WebhookDelivery do
   end
 
   defp classify_result({:error, reason}, now, message, attempt_number, max_attempts) do
-    retry_or_fail(now, message, attempt_number, max_attempts, nil, Exception.message(reason))
+    retry_or_fail(now, message, attempt_number, max_attempts, nil, sanitized_error(reason))
   end
+
+  defp sanitized_error(%Req.TransportError{reason: reason}), do: transport_error_class(reason)
+  defp sanitized_error(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp sanitized_error(_reason), do: "internal_error"
+
+  defp transport_error_class({:bad_alpn_protocol, _protocol}), do: "bad_alpn_protocol"
+  defp transport_error_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp transport_error_class(_reason), do: "transport_error"
 
   defp retry_or_fail(now, message, attempt_number, max_attempts, response_status, error) do
     next_attempt_number = attempt_number + 1

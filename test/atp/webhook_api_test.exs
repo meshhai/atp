@@ -966,6 +966,177 @@ defmodule Atp.WebhookAPITest do
     assert_webhook_attempt_visibility_shape!(delivered_attempt)
   end
 
+  test "webhook attempt visibility is sanitized by viewer ownership", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      {:ok, raw_body, request_conn} = Plug.Conn.read_body(request_conn)
+      headers = Map.new(request_conn.req_headers)
+
+      send(
+        test_pid,
+        {:sanitized_attempt_request, headers, raw_body}
+      )
+
+      Req.Test.transport_error(
+        request_conn,
+        {:bad_alpn_protocol, "whsec_leaked_protocol_value"}
+      )
+    end)
+
+    sender_account = create_account!(conn, %{"name" => "Attempt Visibility Sender"})
+    sender_account_token = sender_account["account_api_key"]["token"]
+    sender = register_agent!(sender_account_token, "register-attempt-visibility-sender", %{})
+
+    recipient_account =
+      create_account!(build_conn(), %{"name" => "Attempt Visibility Recipient"})
+
+    recipient_account_token = recipient_account["account_api_key"]["token"]
+
+    recipient =
+      register_agent!(
+        recipient_account_token,
+        "register-attempt-visibility-recipient",
+        %{}
+      )
+
+    webhook_url = "https://recipient.example.test/attempt-visibility"
+
+    configured =
+      configure_webhook!(
+        recipient,
+        "configure-attempt-visibility-recipient",
+        webhook_url
+      )
+
+    webhook_secret = configured["webhook_endpoint"]["endpoint_secret"]
+
+    build_conn()
+    |> authorize(recipient["agent_api_key"]["token"])
+    |> idempotency_key("allow-attempt-visibility-sender")
+    |> put("/api/agents/#{recipient["id"]}/sender_policies", %{
+      "effect" => "allow",
+      "sender_agent_id" => sender["id"]
+    })
+    |> json_response(200)
+
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-attempt-visibility",
+        recipient["address"],
+        a2a_user_text("attempt-visibility-message", "attempt history visibility")
+      )
+
+    assert [%{"id" => delivery_id}] = sent["deliveries"]
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
+
+    assert_received {:sanitized_attempt_request, headers, raw_body}
+    signature = headers["atp-signature"]
+    message_id = sent["message"]["id"]
+
+    sender_status = fetch_message_status_by_token!(sender["agent_api_key"]["token"], message_id)
+    sender_account_status = fetch_message_status_by_token!(sender_account_token, message_id)
+
+    recipient_status =
+      fetch_message_status_by_token!(recipient["agent_api_key"]["token"], message_id)
+
+    recipient_account_status = fetch_message_status_by_token!(recipient_account_token, message_id)
+
+    hidden_values = [
+      webhook_url,
+      webhook_secret,
+      signature,
+      raw_body,
+      "whsec_leaked_protocol_value"
+    ]
+
+    sender_attempt = assert_non_recipient_attempt_visibility!(sender_status, hidden_values)
+
+    sender_account_attempt =
+      assert_non_recipient_attempt_visibility!(sender_account_status, hidden_values)
+
+    recipient_hidden_values = [webhook_secret, signature, raw_body, "whsec_leaked_protocol_value"]
+
+    recipient_attempt =
+      assert_recipient_attempt_visibility!(recipient_status, webhook_url, recipient_hidden_values)
+
+    recipient_account_attempt =
+      assert_recipient_attempt_visibility!(
+        recipient_account_status,
+        webhook_url,
+        recipient_hidden_values
+      )
+
+    for attempt <- [
+          sender_attempt,
+          sender_account_attempt,
+          recipient_attempt,
+          recipient_account_attempt
+        ] do
+      assert attempt["attempt_number"] == 1
+      assert attempt["result"] == "retry_scheduled"
+      assert attempt["response_status"] == nil
+      assert attempt["error"] == "bad_alpn_protocol"
+      assert_iso8601_timestamp!(attempt["next_attempt_at"])
+      assert_iso8601_timestamp!(attempt["created_at"])
+    end
+  end
+
+  test "message status exposes internal task exits as sanitized webhook attempts", %{conn: conn} do
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-task-exit-sender", %{})
+    recipient = register_agent!(account_token, "register-task-exit-recipient", %{})
+    webhook_url = "https://recipient.example.test/task-exit"
+
+    configure_webhook!(recipient, "configure-task-exit-recipient", webhook_url)
+
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-task-exit",
+        recipient["address"],
+        a2a_user_text("task-exit-message", "task exit visibility")
+      )
+
+    assert [%{"id" => delivery_id}] = sent["deliveries"]
+    assert {:ok, claim} = DurableLedger.claim_webhook_delivery(delivery_id, lease_seconds: 120)
+    assert {:ok, _message} = WebhookDelivery.record_task_exit(claim)
+
+    sender_status =
+      fetch_message_status_by_token!(sender["agent_api_key"]["token"], sent["message"]["id"])
+
+    assert [
+             %{
+               "status" => "retry_scheduled",
+               "last_error" => "internal_task_exit",
+               "attempts" => [sender_attempt]
+             }
+           ] = sender_status["deliveries"]
+
+    assert_webhook_attempt_visibility_shape!(sender_attempt)
+    refute Map.has_key?(sender_attempt, "request_url")
+    assert sender_attempt["attempt_number"] == 1
+    assert sender_attempt["result"] == "retry_scheduled"
+    assert sender_attempt["response_status"] == nil
+    assert sender_attempt["error"] == "internal_task_exit"
+
+    recipient_status =
+      fetch_message_status_by_token!(recipient["agent_api_key"]["token"], sent["message"]["id"])
+
+    assert [
+             %{
+               "last_error" => "internal_task_exit",
+               "attempts" => [recipient_attempt]
+             }
+           ] = recipient_status["deliveries"]
+
+    assert_webhook_attempt_recipient_visibility_shape!(recipient_attempt)
+    assert recipient_attempt["request_url"] == webhook_url
+    assert recipient_attempt["error"] == "internal_task_exit"
+  end
+
   test "webhook signature verification uses deterministic timestamped HMAC fixtures" do
     timestamp = "1700000000"
     body = ~s({"message":"hello"})
@@ -1547,8 +1718,12 @@ defmodule Atp.WebhookAPITest do
   end
 
   defp fetch_message_status!(agent, message_id) do
+    fetch_message_status_by_token!(agent["agent_api_key"]["token"], message_id)
+  end
+
+  defp fetch_message_status_by_token!(token, message_id) do
     build_conn()
-    |> authorize(agent["agent_api_key"]["token"])
+    |> authorize(token)
     |> get("/api/messages/#{message_id}")
     |> json_response(200)
   end
@@ -1579,6 +1754,57 @@ defmodule Atp.WebhookAPITest do
              response_status
              result
            )
+  end
+
+  defp assert_webhook_attempt_recipient_visibility_shape!(attempt) do
+    assert Enum.sort(Map.keys(attempt)) == ~w(
+             attempt_number
+             created_at
+             error
+             id
+             next_attempt_at
+             request_url
+             response_status
+             result
+           )
+  end
+
+  defp assert_non_recipient_attempt_visibility!(status, hidden_values) do
+    attempt = only_webhook_attempt!(status)
+
+    assert_webhook_attempt_visibility_shape!(attempt)
+    refute Map.has_key?(attempt, "request_url")
+    assert_no_webhook_attempt_leaks!(attempt, hidden_values)
+
+    attempt
+  end
+
+  defp assert_recipient_attempt_visibility!(status, request_url, hidden_values) do
+    attempt = only_webhook_attempt!(status)
+
+    assert_webhook_attempt_recipient_visibility_shape!(attempt)
+    assert attempt["request_url"] == request_url
+    assert_no_webhook_attempt_leaks!(Map.delete(attempt, "request_url"), hidden_values)
+
+    attempt
+  end
+
+  defp only_webhook_attempt!(status) do
+    assert [%{"mode" => "webhook", "attempts" => [attempt]}] = status["deliveries"]
+
+    attempt
+  end
+
+  defp assert_no_webhook_attempt_leaks!(attempt, hidden_values) do
+    for key <- ~w(headers request_body body payload signature atp_signature webhook_secret) do
+      refute Map.has_key?(attempt, key)
+    end
+
+    rendered = inspect(attempt)
+
+    for value <- hidden_values, is_binary(value) and value != "" do
+      refute rendered =~ value
+    end
   end
 
   defp assert_iso8601_timestamp!(timestamp) when is_binary(timestamp) do
