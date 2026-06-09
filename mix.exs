@@ -62,6 +62,7 @@ defmodule Atp.MixProject do
       {:postgrex, ">= 0.22.2"},
       {:req, "~> 0.5"},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
+      {:telemetry, "~> 1.0"},
       {:tidewave, "~> 0.5", only: :dev}
     ]
   end

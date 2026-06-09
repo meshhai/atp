@@ -1292,7 +1292,7 @@ defmodule Atp.SessionRuntimeTest do
     assert %SessionState{session_id: ^session_id, last_sequence: 2} = :sys.get_state(pid)
   end
 
-  test "session webhook dispatch happens outside the session server call path", %{
+  test "session webhook intake queues before delivery reads committed session state", %{
     conn: conn
   } do
     %{initiator: initiator, recipient: recipient, session: session} =
@@ -1331,12 +1331,20 @@ defmodule Atp.SessionRuntimeTest do
       })
       |> json_response(201)
 
-    assert_receive {:session_webhook_read, false, 2}, 500
     assert reply["session"]["last_sequence"] == 2
-    assert reply["message_status"]["carrier_status"] == "delivered"
+    assert reply["message_status"]["carrier_status"] == "queued"
+    assert [delivery] = reply["message_status"]["deliveries"]
+    assert delivery["status"] == "retry_scheduled"
+    assert delivery["attempt_count"] == 0
+    assert delivery["attempts"] == []
+
+    refute_receive {:session_webhook_read, _in_transaction?, _last_sequence}, 100
+
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery["id"])
+    assert_receive {:session_webhook_read, false, 2}, 500
   end
 
-  test "concurrent trusted session webhook dispatch preserves session sequence order", %{
+  test "concurrent trusted session webhook intake queues without inline dispatch", %{
     conn: conn
   } do
     %{initiator: initiator, recipient: recipient, session: session} =
@@ -1375,10 +1383,7 @@ defmodule Atp.SessionRuntimeTest do
         "first ordered webhook"
       )
 
-    Req.Test.allow(WebhookDelivery, self(), first_task.pid)
     send(first_task.pid, :send_session_message)
-
-    assert_receive {:session_webhook_started, 2}, 500
 
     second_task =
       session_message_task(
@@ -1388,18 +1393,24 @@ defmodule Atp.SessionRuntimeTest do
         "second ordered webhook"
       )
 
-    Req.Test.allow(WebhookDelivery, self(), second_task.pid)
     send(second_task.pid, :send_session_message)
-
-    refute_receive {:session_webhook_started, 3}, 100
-    send(first_task.pid, :release_first_session_webhook)
-    assert_receive {:session_webhook_started, 3}, 500
 
     first_reply = Task.await(first_task, 5_000)
     second_reply = Task.await(second_task, 5_000)
 
-    assert get_in(first_reply, ["message_status", "message", "session_sequence"]) == 2
-    assert get_in(second_reply, ["message_status", "message", "session_sequence"]) == 3
+    refute_receive {:session_webhook_started, _sequence}, 100
+
+    assert [2, 3] =
+             [first_reply, second_reply]
+             |> Enum.map(&get_in(&1, ["message_status", "message", "session_sequence"]))
+             |> Enum.sort()
+
+    for reply <- [first_reply, second_reply] do
+      assert reply["message_status"]["carrier_status"] == "queued"
+
+      assert [%{"status" => "retry_scheduled", "attempt_count" => 0, "attempts" => []}] =
+               reply["message_status"]["deliveries"]
+    end
   end
 
   test "webhook dispatcher does not bypass session sequence order while earlier webhook is in progress",
@@ -1420,8 +1431,9 @@ defmodule Atp.SessionRuntimeTest do
     Req.Test.stub(WebhookDelivery, fn request_conn ->
       {:ok, raw_body, read_conn} = Plug.Conn.read_body(request_conn)
       sequence = raw_body |> Jason.decode!() |> get_in(["message", "session_sequence"])
+      headers = Map.new(request_conn.req_headers)
 
-      send(test_pid, {:dispatcher_order_webhook_started, sequence})
+      send(test_pid, {:dispatcher_order_webhook_started, sequence, headers["atp-delivery-id"]})
 
       if sequence == 2 do
         receive do
@@ -1442,10 +1454,26 @@ defmodule Atp.SessionRuntimeTest do
         "first dispatcher ordered webhook"
       )
 
-    Req.Test.allow(WebhookDelivery, self(), first_task.pid)
     send(first_task.pid, :send_session_message)
 
-    assert_receive {:dispatcher_order_webhook_started, 2}, 500
+    first_reply = Task.await(first_task, 5_000)
+    assert get_in(first_reply, ["message_status", "message", "session_sequence"]) == 2
+
+    assert [%{"id" => first_delivery_id, "status" => "retry_scheduled"}] =
+             first_reply["message_status"]["deliveries"]
+
+    first_delivery_task =
+      Task.async(fn ->
+        receive do
+          :deliver -> WebhookDelivery.deliver_now(first_delivery_id)
+        end
+      end)
+
+    Sandbox.allow(Atp.Repo, self(), first_delivery_task.pid)
+    Req.Test.allow(WebhookDelivery, self(), first_delivery_task.pid)
+    send(first_delivery_task.pid, :deliver)
+
+    assert_receive {:dispatcher_order_webhook_started, 2, ^first_delivery_id}, 500
 
     second_task =
       session_message_task(
@@ -1455,8 +1483,8 @@ defmodule Atp.SessionRuntimeTest do
         "second dispatcher ordered webhook"
       )
 
-    Req.Test.allow(WebhookDelivery, self(), second_task.pid)
     send(second_task.pid, :send_session_message)
+    second_reply = Task.await(second_task, 5_000)
 
     assert %Delivery{status: "retry_scheduled"} =
              assert_session_webhook_delivery!(session_id, 3)
@@ -1472,13 +1500,16 @@ defmodule Atp.SessionRuntimeTest do
     send(dispatcher, :dispatch_due)
     _state = :sys.get_state(dispatcher)
 
-    refute_receive {:dispatcher_order_webhook_started, 3}, 100
+    refute_receive {:dispatcher_order_webhook_started, 3, _delivery_id}, 100
 
-    send(first_task.pid, :release_first_dispatcher_order_webhook)
-    assert_receive {:dispatcher_order_webhook_started, 3}, 500
+    send(first_delivery_task.pid, :release_first_dispatcher_order_webhook)
+    assert {:ok, _message} = Task.await(first_delivery_task, 5_000)
 
-    first_reply = Task.await(first_task, 5_000)
-    second_reply = Task.await(second_task, 5_000)
+    send(dispatcher, :dispatch_due)
+    _state = :sys.get_state(dispatcher)
+
+    assert_receive {:dispatcher_order_webhook_started, 3, second_delivery_id}, 500
+    assert_delivered_delivery!(second_delivery_id)
 
     assert get_in(first_reply, ["message_status", "message", "session_sequence"]) == 2
     assert get_in(second_reply, ["message_status", "message", "session_sequence"]) == 3
@@ -2187,6 +2218,23 @@ defmodule Atp.SessionRuntimeTest do
           end
         end
     end
+  end
+
+  defp assert_delivered_delivery!(delivery_id, attempts_left \\ 20)
+
+  defp assert_delivered_delivery!(delivery_id, attempts_left) when attempts_left > 0 do
+    case Repo.get!(Delivery, delivery_id) do
+      %Delivery{status: "delivered"} = delivery ->
+        delivery
+
+      %Delivery{} ->
+        Process.sleep(10)
+        assert_delivered_delivery!(delivery_id, attempts_left - 1)
+    end
+  end
+
+  defp assert_delivered_delivery!(delivery_id, 0) do
+    assert %Delivery{status: "delivered"} = Repo.get!(Delivery, delivery_id)
   end
 
   defp session_webhook_delivery(session_id, session_sequence) do

@@ -8,6 +8,8 @@ defmodule Atp.Application do
     children = [
       Atp.Repo,
       Atp.Transport.Runtime.Supervisor,
+      {DynamicSupervisor,
+       name: Atp.Transport.WebhookDispatcher.AttemptSupervisor, strategy: :one_for_one},
       Atp.Transport.WebhookDispatcher,
       AtpWeb.Endpoint
     ]

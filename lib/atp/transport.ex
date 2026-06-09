@@ -2,7 +2,7 @@ defmodule Atp.Transport do
   @moduledoc "Public ATP carrier facade for messages, sessions, polling leases, and status reads."
 
   alias Atp.Identity.{Agent, Idempotency}
-  alias Atp.Transport.{DurableLedger, Response, Runtime, WebhookDelivery}
+  alias Atp.Transport.{DurableLedger, Runtime, WebhookDispatcher}
 
   @type api_result :: {:ok, pos_integer(), map()} | {:error, term()}
 
@@ -17,20 +17,18 @@ defmodule Atp.Transport do
 
   defp finish_direct_message_intake(%Agent{}, status, body, nil), do: {:ok, status, body}
 
-  defp finish_direct_message_intake(%Agent{} = sender, _status, _body, prepared) do
-    Idempotency.complete_prepared_after_commit(prepared, fn status, body, webhook_delivery_id ->
-      finish_prepared_direct_webhook_delivery(sender, status, body, webhook_delivery_id)
-    end)
+  defp finish_direct_message_intake(%Agent{}, _status, _body, prepared) do
+    Idempotency.complete_prepared_after_commit(prepared, &complete_queued_intake/3)
   end
 
-  defp finish_prepared_direct_webhook_delivery(%Agent{}, status, body, nil) do
+  defp complete_queued_intake(status, body, webhook_delivery_id)
+       when is_binary(webhook_delivery_id) do
+    WebhookDispatcher.wakeup()
     {:ok, status, body}
   end
 
-  defp finish_prepared_direct_webhook_delivery(%Agent{} = viewer, _status, _body, delivery_id) do
-    with {:ok, message} <- WebhookDelivery.deliver_now(delivery_id) do
-      {:ok, 201, Response.message_status(message, viewer)}
-    end
+  defp complete_queued_intake(status, body, _commit_value) do
+    {:ok, status, body}
   end
 
   @spec open_session(Agent.t(), map(), String.t() | nil, String.t()) :: api_result()
