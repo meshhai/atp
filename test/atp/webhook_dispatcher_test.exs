@@ -194,6 +194,34 @@ defmodule Atp.WebhookDispatcherTest do
     end
   end
 
+  test "worker start failures record claimed attempt and stop the scan", %{conn: conn} do
+    [first_id, second_id] = create_due_webhook_deliveries!(conn, 2, "start-failure-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 2,
+         max_in_flight: 2,
+         interval_ms: 60_000,
+         attempt_supervisor: :atp_missing_attempt_supervisor_test,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+
+    assert_retry_scheduled_task_exit!(first_id)
+    assert_dispatcher_idle!(dispatcher)
+
+    assert %{
+             status: "retry_scheduled",
+             claim_token: nil,
+             leased_until: nil
+           } = Map.fetch!(delivery_records([second_id]), second_id)
+  end
+
   test "shutdown waits for in-flight attempts without starting new claims", %{conn: conn} do
     test_pid = self()
 

@@ -255,10 +255,12 @@ defmodule Atp.Transport.WebhookDispatcher do
         |> clear_pending_when_idle()
 
       {:ok, %DeliveryClaim{} = claim} ->
-        state
-        |> emit_claim(:claimed, claim)
-        |> start_task(claim)
-        |> then(&start_tasks(count - 1, &1))
+        state = emit_claim(state, :claimed, claim)
+
+        case start_task(state, claim) do
+          {:cont, state} -> start_tasks(count - 1, state)
+          {:halt, state} -> state
+        end
 
       {:error, reason} ->
         state
@@ -282,7 +284,7 @@ defmodule Atp.Transport.WebhookDispatcher do
       restart: :temporary
     }
 
-    case DynamicSupervisor.start_child(state.attempt_supervisor, child_spec) do
+    case start_attempt_child(state.attempt_supervisor, child_spec) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
@@ -292,7 +294,7 @@ defmodule Atp.Transport.WebhookDispatcher do
             pending_dispatches: state.pending_dispatches - 1
         }
 
-        emit_attempt_start(state, claim)
+        {:cont, emit_attempt_start(state, claim)}
 
       {:ok, pid, _info} ->
         ref = Process.monitor(pid)
@@ -303,13 +305,25 @@ defmodule Atp.Transport.WebhookDispatcher do
             pending_dispatches: state.pending_dispatches - 1
         }
 
-        emit_attempt_start(state, claim)
+        {:cont, emit_attempt_start(state, claim)}
 
       {:error, reason} ->
-        state
-        |> emit_claim(:error, nil, reason)
-        |> Map.put(:pending_dispatches, 0)
+        result = WebhookDelivery.record_task_exit(claim)
+
+        state =
+          state
+          |> emit_claim(:error, nil, reason)
+          |> emit_task_exit(claim, result)
+          |> Map.put(:pending_dispatches, 0)
+
+        {:halt, state}
     end
+  end
+
+  defp start_attempt_child(attempt_supervisor, child_spec) do
+    DynamicSupervisor.start_child(attempt_supervisor, child_spec)
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp record_running_task_exit(state, _ref, :normal), do: {state, {:ok, :normal}}

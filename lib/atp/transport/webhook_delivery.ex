@@ -79,6 +79,7 @@ defmodule Atp.Transport.WebhookDelivery do
         } = claim
       ) do
     now = DateTime.utc_now(:microsecond)
+    current_recipient = current_recipient_agent(recipient)
 
     cond do
       delivery.status in ["delivered", "failed"] ->
@@ -90,15 +91,19 @@ defmodule Atp.Transport.WebhookDelivery do
       DateTime.compare(message.expires_at, now) != :gt ->
         DurableLedger.terminalize_claimed_webhook_delivery(claim, :message_expired, now: now)
 
-      not active_webhook_endpoint?(recipient) ->
+      not active_webhook_endpoint?(current_recipient) ->
         DurableLedger.terminalize_claimed_webhook_delivery(
-          claim,
+          refresh_claim_recipient(claim, current_recipient),
           :webhook_endpoint_inactive,
           now: now
         )
 
       true ->
-        attempt_delivery(claim, recipient, now)
+        attempt_delivery(
+          refresh_claim_recipient(claim, current_recipient),
+          current_recipient,
+          now
+        )
     end
   end
 
@@ -161,6 +166,17 @@ defmodule Atp.Transport.WebhookDelivery do
   end
 
   defp active_webhook_endpoint?(%Agent{}), do: false
+
+  defp current_recipient_agent(%Agent{id: recipient_id} = recipient) do
+    case Repo.get(Agent, recipient_id) do
+      %Agent{} = current -> current
+      nil -> %Agent{recipient | webhook_active: false, webhook_url: nil, webhook_secret: nil}
+    end
+  end
+
+  defp refresh_claim_recipient(%DeliveryClaim{} = claim, %Agent{} = recipient) do
+    %DeliveryClaim{claim | recipient_agent: recipient}
+  end
 
   defp attempt_delivery(
          %DeliveryClaim{delivery: delivery, message: message, attempt_number: attempt_number} =

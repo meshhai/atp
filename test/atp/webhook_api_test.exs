@@ -3,6 +3,7 @@ defmodule Atp.WebhookAPITest do
 
   alias Atp.Transport.{
     Delivery,
+    DurableLedger,
     WebhookAttempt,
     WebhookDelivery,
     WebhookDispatcher,
@@ -577,6 +578,46 @@ defmodule Atp.WebhookAPITest do
     assert persisted_delivery.last_error == "webhook_endpoint_inactive"
 
     refute Atp.Repo.get_by(WebhookAttempt, delivery_id: delivery.id)
+  end
+
+  test "claimed webhook delivery reloads endpoint state before posting", %{conn: conn} do
+    test_pid = self()
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      send(test_pid, :stale_claim_webhook_posted)
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-stale-claim-sender", %{})
+    recipient = register_agent!(account_token, "register-stale-claim-recipient", %{})
+    configure_webhook!(recipient, "configure-stale-claim-recipient")
+
+    delivery_id =
+      prepare_unsent_webhook_delivery!(
+        sender,
+        recipient,
+        "stale-claim",
+        a2a_user_text("stale-claim", "endpoint removed after claim")
+      )
+
+    assert {:ok, claim} = DurableLedger.claim_webhook_delivery(delivery_id)
+    assert claim.recipient_agent.webhook_active == true
+
+    claim.recipient_agent
+    |> Ecto.Changeset.change(webhook_active: false, webhook_url: nil, webhook_secret: nil)
+    |> Atp.Repo.update!()
+
+    assert {:ok, failed_message} = WebhookDelivery.deliver_claim(claim)
+    assert failed_message.carrier_status == "delivery_failed"
+
+    refute_receive :stale_claim_webhook_posted, 100
+
+    persisted_delivery = Atp.Repo.get!(Delivery, delivery_id)
+    assert persisted_delivery.status == "failed"
+    assert persisted_delivery.last_error == "webhook_endpoint_inactive"
+    refute Atp.Repo.get_by(WebhookAttempt, delivery_id: delivery_id)
   end
 
   test "direct webhook delivery leases before posting so retry dispatch cannot duplicate it", %{
