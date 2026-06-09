@@ -806,6 +806,166 @@ defmodule Atp.WebhookAPITest do
     assert error_code(ack) == "delivery_not_delivered"
   end
 
+  test "message status exposes participant-visible webhook delivery states", %{conn: conn} do
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      case request_conn.request_path do
+        "/visibility-retry" -> Plug.Conn.send_resp(request_conn, 503, "")
+        "/visibility-delivered" -> Plug.Conn.send_resp(request_conn, 204, "")
+      end
+    end)
+
+    account = create_account!(conn)
+    account_token = account["account_api_key"]["token"]
+    sender = register_agent!(account_token, "register-visibility-sender", %{})
+    recipient = register_agent!(account_token, "register-visibility-recipient", %{})
+
+    outsider_account = create_account!(build_conn(), %{"name" => "Visibility Outsider"})
+    outsider_token = outsider_account["account_api_key"]["token"]
+    outsider = register_agent!(outsider_token, "register-visibility-outsider", %{})
+
+    configure_webhook!(
+      recipient,
+      "configure-visibility-recipient",
+      "https://recipient.example.test/visibility-retry"
+    )
+
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-visibility-retry",
+        recipient["address"],
+        a2a_user_text("visibility-retry-message", "retry visibility")
+      )
+
+    message_id = sent["message"]["id"]
+
+    assert sent["carrier_status"] == "queued"
+    assert [queued_delivery] = sent["deliveries"]
+    assert_delivery_visibility_shape!(queued_delivery)
+    assert queued_delivery["status"] == "retry_scheduled"
+    assert queued_delivery["attempt_count"] == 0
+    assert is_nil(queued_delivery["claimed_at"])
+    assert queued_delivery["attempts"] == []
+
+    delivery_id = queued_delivery["id"]
+    sender_queued_status = fetch_message_status!(sender, message_id)
+    recipient_queued_status = fetch_message_status!(recipient, message_id)
+
+    assert sender_queued_status["deliveries"] == sent["deliveries"]
+    assert recipient_queued_status["message"] == sent["message"]
+    assert [%{"id" => ^delivery_id}] = recipient_queued_status["deliveries"]
+
+    hidden =
+      build_conn()
+      |> authorize(outsider["agent_api_key"]["token"])
+      |> get("/api/messages/#{message_id}")
+      |> json_response(404)
+
+    assert error_code(hidden) == "not_found"
+
+    assert {:ok, claim} = DurableLedger.claim_webhook_delivery(delivery_id, lease_seconds: 120)
+
+    leased_status = fetch_message_status!(sender, message_id)
+
+    assert [
+             %{
+               "id" => ^delivery_id,
+               "status" => "leased",
+               "attempt_count" => 0,
+               "attempts" => []
+             } = leased_delivery
+           ] = leased_status["deliveries"]
+
+    assert_delivery_visibility_shape!(leased_delivery)
+    assert_iso8601_timestamp!(leased_delivery["claimed_at"])
+    assert_iso8601_timestamp!(leased_delivery["leased_until"])
+    assert is_nil(leased_delivery["next_attempt_at"])
+
+    assert {:ok, _message} = WebhookDelivery.deliver_claim(claim)
+
+    retry_status = fetch_message_status!(sender, message_id)
+
+    assert retry_status["carrier_status"] == "queued"
+
+    assert [
+             %{
+               "id" => ^delivery_id,
+               "status" => "retry_scheduled",
+               "attempt_count" => 1,
+               "attempts" => [retry_attempt]
+             } = retry_delivery
+           ] = retry_status["deliveries"]
+
+    assert_delivery_visibility_shape!(retry_delivery)
+    assert is_nil(retry_delivery["claimed_at"])
+    assert is_nil(retry_delivery["leased_until"])
+    assert_iso8601_timestamp!(retry_delivery["next_attempt_at"])
+    assert retry_attempt["attempt_number"] == 1
+    assert retry_attempt["response_status"] == 503
+    assert retry_attempt["result"] == "retry_scheduled"
+    assert_webhook_attempt_visibility_shape!(retry_attempt)
+
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivery_id)
+
+    failed_status = fetch_message_status!(sender, message_id)
+
+    assert failed_status["carrier_status"] == "delivery_failed"
+
+    assert [
+             %{
+               "id" => ^delivery_id,
+               "status" => "failed",
+               "attempt_count" => 3,
+               "next_attempt_at" => nil,
+               "attempts" => failed_attempts
+             } = failed_delivery
+           ] = failed_status["deliveries"]
+
+    assert_delivery_visibility_shape!(failed_delivery)
+    assert Enum.map(failed_attempts, & &1["attempt_number"]) == [1, 2, 3]
+    assert %{"result" => "failed", "response_status" => 503} = List.last(failed_attempts)
+
+    configure_webhook!(
+      recipient,
+      "configure-visibility-delivered-recipient",
+      "https://recipient.example.test/visibility-delivered"
+    )
+
+    delivered_sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-visibility-delivered",
+        recipient["address"],
+        a2a_user_text("visibility-delivered-message", "delivered visibility")
+      )
+
+    assert [%{"id" => delivered_delivery_id}] = delivered_sent["deliveries"]
+    assert {:ok, _message} = WebhookDelivery.deliver_now(delivered_delivery_id)
+
+    delivered_status = fetch_message_status!(sender, delivered_sent["message"]["id"])
+
+    assert delivered_status["carrier_status"] == "delivered"
+
+    assert [
+             %{
+               "id" => ^delivered_delivery_id,
+               "status" => "delivered",
+               "attempt_count" => 1,
+               "claimed_at" => nil,
+               "leased_until" => nil,
+               "next_attempt_at" => nil,
+               "last_error" => nil,
+               "attempts" => [delivered_attempt]
+             } = delivered_delivery
+           ] = delivered_status["deliveries"]
+
+    assert_delivery_visibility_shape!(delivered_delivery)
+    assert_iso8601_timestamp!(delivered_delivery["delivered_at"])
+    assert %{"result" => "delivered", "response_status" => 204} = delivered_attempt
+    assert_webhook_attempt_visibility_shape!(delivered_attempt)
+  end
+
   test "webhook signature verification uses deterministic timestamped HMAC fixtures" do
     timestamp = "1700000000"
     body = ~s({"message":"hello"})
@@ -1384,6 +1544,45 @@ defmodule Atp.WebhookAPITest do
     |> authorize(viewer_token)
     |> get("/api/messages/#{message_status["message"]["id"]}")
     |> json_response(200)
+  end
+
+  defp fetch_message_status!(agent, message_id) do
+    build_conn()
+    |> authorize(agent["agent_api_key"]["token"])
+    |> get("/api/messages/#{message_id}")
+    |> json_response(200)
+  end
+
+  defp assert_delivery_visibility_shape!(delivery) do
+    assert Enum.sort(Map.keys(delivery)) == ~w(
+             attempt_count
+             attempts
+             claimed_at
+             delivered_at
+             id
+             last_error
+             leased_until
+             max_attempts
+             mode
+             next_attempt_at
+             status
+           )
+  end
+
+  defp assert_webhook_attempt_visibility_shape!(attempt) do
+    assert Enum.sort(Map.keys(attempt)) == ~w(
+             attempt_number
+             created_at
+             error
+             id
+             next_attempt_at
+             response_status
+             result
+           )
+  end
+
+  defp assert_iso8601_timestamp!(timestamp) when is_binary(timestamp) do
+    assert {:ok, _datetime, 0} = DateTime.from_iso8601(timestamp)
   end
 
   defp assert_retry_scheduled(response, response_status, error_fragment, max_attempts) do

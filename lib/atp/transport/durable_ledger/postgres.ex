@@ -232,10 +232,10 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
     case Repo.get(Message, message_id) do
       %Message{} = message when message.sender_agent_id == agent.id ->
-        {:ok, Response.message_status(message, agent)}
+        {:ok, message_status_response(message, agent)}
 
       %Message{} = message when message.recipient_agent_id == agent.id ->
-        {:ok, Response.message_status(message, agent)}
+        {:ok, message_status_response(message, agent)}
 
       _other ->
         {:error, :not_found}
@@ -294,7 +294,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
          {:ok, message} <- insert_direct_message(sender, recipient, trust, blocked?, payload),
          {:ok, webhook_delivery_id} <-
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
-      {:ok, 201, Response.message_status(message, sender), webhook_delivery_id}
+      {:ok, 201, message_status_response(message, sender), webhook_delivery_id}
     end
   end
 
@@ -312,7 +312,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
            insert_opening_session_message(initiator, recipient, trust, blocked?, payload),
          {:ok, webhook_delivery_id} <-
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
-      body = Response.session_message(session, message, initiator)
+      body = session_message_response(session, message, initiator)
       prepared_session_intake_response(body, session, webhook_delivery_id)
     end
   end
@@ -333,7 +333,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
            insert_next_session_message(sender, recipient, session, trust, blocked?, payload),
          {:ok, webhook_delivery_id} <-
            prepare_deliverable_webhook_delivery(message, recipient, blocked?) do
-      body = Response.session_message(updated_session, message, sender)
+      body = session_message_response(updated_session, message, sender)
       prepared_session_intake_response(body, updated_session, webhook_delivery_id)
     end
   end
@@ -356,8 +356,27 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       |> where([message], message.session_id == ^session.id)
       |> order_by([message], asc: message.session_sequence, asc: message.inserted_at)
       |> Repo.all()
+      |> preload_message_statuses()
 
     Response.session_transcript(session, messages, viewer)
+  end
+
+  defp message_status_response(%Message{} = message, %Agent{} = viewer) do
+    message
+    |> preload_message_status()
+    |> Response.message_status(viewer)
+  end
+
+  defp session_message_response(%Session{} = session, %Message{} = message, %Agent{} = viewer) do
+    Response.session_message(session, preload_message_status(message), viewer)
+  end
+
+  defp preload_message_status(%Message{} = message) do
+    Repo.preload(message, [deliveries: :webhook_attempts], force: true)
+  end
+
+  defp preload_message_statuses(messages) when is_list(messages) do
+    Repo.preload(messages, [deliveries: :webhook_attempts], force: true)
   end
 
   defp claim_next_polling_message(%Agent{} = recipient, lease_seconds) do
@@ -1026,7 +1045,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp ack_response(:delivery, %Agent{} = agent, %Ack{} = ack, %Message{} = message, _session) do
-    {:ok, 201, Response.ack(agent, ack, message)}
+    {:ok, 201, Response.ack(agent, ack, preload_message_status(message))}
   end
 
   defp ack_response(
@@ -1038,7 +1057,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
        ) do
     body =
       agent
-      |> Response.ack(ack, message)
+      |> Response.ack(ack, preload_message_status(message))
       |> Map.put("session", Response.session(session))
 
     {:ok, 201, body}

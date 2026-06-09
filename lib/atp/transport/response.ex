@@ -1,10 +1,7 @@
 defmodule Atp.Transport.Response do
   @moduledoc false
 
-  import Ecto.Query
-
   alias Atp.Identity.Agent
-  alias Atp.Repo
 
   alias Atp.Transport.{
     Ack,
@@ -90,20 +87,21 @@ defmodule Atp.Transport.Response do
     message.recipient_agent_id == viewer.id
   end
 
-  defp delivery_statuses(%Message{} = message, expose_request_url?) do
-    Delivery
-    |> where([delivery], delivery.message_id == ^message.id)
-    |> order_by([delivery], asc: delivery.inserted_at)
-    |> preload(:webhook_attempts)
-    |> Repo.all()
+  defp delivery_statuses(%Message{deliveries: deliveries}, expose_request_url?)
+       when is_list(deliveries) do
+    deliveries
+    |> Enum.sort_by(&delivery_sort_key/1)
     |> Enum.map(&delivery_status(&1, expose_request_url?))
   end
+
+  defp delivery_statuses(%Message{}, _expose_request_url?), do: []
 
   defp delivery_status(%Delivery{} = delivery, expose_request_url?) do
     %{
       "id" => delivery.id,
       "mode" => delivery.mode,
       "status" => delivery.status,
+      "claimed_at" => timestamp(delivery.claimed_at),
       "leased_until" => timestamp(delivery.leased_until),
       "attempt_count" => delivery.attempt_count,
       "max_attempts" => delivery.max_attempts,
@@ -113,6 +111,12 @@ defmodule Atp.Transport.Response do
       "attempts" => webhook_attempts(delivery.webhook_attempts, expose_request_url?)
     }
   end
+
+  defp delivery_sort_key(%Delivery{inserted_at: %DateTime{} = inserted_at, id: id}) do
+    {DateTime.to_unix(inserted_at, :microsecond), id}
+  end
+
+  defp delivery_sort_key(%Delivery{id: id}), do: {0, id}
 
   defp webhook_attempts(attempts, expose_request_url?) when is_list(attempts) do
     attempts
