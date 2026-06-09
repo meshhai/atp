@@ -1,34 +1,33 @@
 defmodule Atp.Transport.Response do
   @moduledoc false
 
-  alias Atp.Identity.{Account, Agent}
+  alias Atp.Identity.Agent
 
   alias Atp.Transport.{
     Ack,
     Delivery,
     Message,
     MessageEnvelope,
+    MessageStatus,
     Session,
     WebhookAttempt
   }
 
   @type response_map :: %{String.t() => term()}
-  @type message_status_viewer :: Agent.t() | Account.t()
 
-  @spec session_message(Session.t(), Message.t(), Agent.t()) :: response_map()
-  def session_message(%Session{} = session, %Message{} = message, %Agent{} = viewer) do
+  @spec session_message(Session.t(), MessageStatus.t()) :: response_map()
+  def session_message(%Session{} = session, %MessageStatus{} = message_status) do
     %{
       "session" => session(session),
-      "message_status" => message_status(message, viewer)
+      "message_status" => message_status(message_status)
     }
   end
 
-  @spec session_transcript(Session.t(), [Message.t()], Agent.t()) :: response_map()
-  def session_transcript(%Session{} = session, messages, %Agent{} = viewer)
-      when is_list(messages) do
+  @spec session_transcript(Session.t(), [MessageStatus.t()]) :: response_map()
+  def session_transcript(%Session{} = session, message_statuses) when is_list(message_statuses) do
     %{
       "session" => session(session),
-      "messages" => Enum.map(messages, &message_status(&1, viewer))
+      "messages" => Enum.map(message_statuses, &message_status/1)
     }
   end
 
@@ -49,14 +48,16 @@ defmodule Atp.Transport.Response do
     }
   end
 
-  @spec message_status(Message.t(), message_status_viewer()) :: response_map()
-  def message_status(%Message{} = message, viewer) do
+  @spec message_status(MessageStatus.t()) :: response_map()
+  def message_status(%MessageStatus{} = message_status) do
+    message = message_status.message
+
     %{
       "message" => MessageEnvelope.to_map(message),
       "carrier_status" => message.carrier_status,
       "ack_status" => message.current_ack_status,
       "terminal_at" => timestamp(message.terminal_at),
-      "deliveries" => delivery_statuses(message, expose_request_url?(message, viewer))
+      "deliveries" => delivery_statuses(message_status)
     }
   end
 
@@ -69,8 +70,8 @@ defmodule Atp.Transport.Response do
     }
   end
 
-  @spec ack(Agent.t(), Ack.t(), Message.t()) :: response_map()
-  def ack(%Agent{} = viewer, %Ack{} = ack, %Message{} = message) do
+  @spec ack(Agent.t(), Ack.t(), MessageStatus.t()) :: response_map()
+  def ack(%Agent{}, %Ack{} = ack, %MessageStatus{} = message_status) do
     %{
       "ack" => %{
         "id" => ack.id,
@@ -80,26 +81,15 @@ defmodule Atp.Transport.Response do
         "payload" => ack.payload,
         "created_at" => timestamp(ack.inserted_at)
       },
-      "message_status" => message_status(message, viewer)
+      "message_status" => message_status(message_status)
     }
   end
 
-  defp expose_request_url?(%Message{} = message, %Agent{} = viewer) do
-    message.recipient_agent_id == viewer.id
-  end
-
-  defp expose_request_url?(%Message{} = message, %Account{} = viewer) do
-    message.recipient_account_id == viewer.id
-  end
-
-  defp delivery_statuses(%Message{deliveries: deliveries}, expose_request_url?)
-       when is_list(deliveries) do
-    deliveries
+  defp delivery_statuses(%MessageStatus{} = message_status) do
+    message_status.deliveries
     |> Enum.sort_by(&delivery_sort_key/1)
-    |> Enum.map(&delivery_status(&1, expose_request_url?))
+    |> Enum.map(&delivery_status(&1, message_status.expose_webhook_request_url?))
   end
-
-  defp delivery_statuses(%Message{}, _expose_request_url?), do: []
 
   defp delivery_status(%Delivery{} = delivery, expose_request_url?) do
     %{

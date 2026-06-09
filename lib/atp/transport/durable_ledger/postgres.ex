@@ -17,6 +17,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
     DeliveryClaim,
     DurableLedger,
     Message,
+    MessageStatus,
     Payload,
     Response,
     SenderPolicies,
@@ -369,19 +370,30 @@ defmodule Atp.Transport.DurableLedger.Postgres do
       |> where([message], message.session_id == ^session.id)
       |> order_by([message], asc: message.session_sequence, asc: message.inserted_at)
       |> Repo.all()
-      |> preload_message_statuses()
 
-    Response.session_transcript(session, messages, viewer)
+    Response.session_transcript(session, message_statuses(messages, viewer))
   end
 
   defp message_status_response(%Message{} = message, viewer) do
     message
-    |> preload_message_status()
-    |> Response.message_status(viewer)
+    |> message_status(viewer)
+    |> Response.message_status()
   end
 
   defp session_message_response(%Session{} = session, %Message{} = message, %Agent{} = viewer) do
-    Response.session_message(session, preload_message_status(message), viewer)
+    Response.session_message(session, message_status(message, viewer))
+  end
+
+  defp message_status(%Message{} = message, viewer) do
+    message
+    |> preload_message_status()
+    |> MessageStatus.from_preloaded_message(viewer)
+  end
+
+  defp message_statuses(messages, viewer) when is_list(messages) do
+    messages
+    |> preload_message_statuses()
+    |> Enum.map(&MessageStatus.from_preloaded_message(&1, viewer))
   end
 
   defp preload_message_status(%Message{} = message) do
@@ -1058,7 +1070,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
   end
 
   defp ack_response(:delivery, %Agent{} = agent, %Ack{} = ack, %Message{} = message, _session) do
-    {:ok, 201, Response.ack(agent, ack, preload_message_status(message))}
+    {:ok, 201, Response.ack(agent, ack, message_status(message, agent))}
   end
 
   defp ack_response(
@@ -1070,7 +1082,7 @@ defmodule Atp.Transport.DurableLedger.Postgres do
        ) do
     body =
       agent
-      |> Response.ack(ack, preload_message_status(message))
+      |> Response.ack(ack, message_status(message, agent))
       |> Map.put("session", Response.session(session))
 
     {:ok, 201, body}
