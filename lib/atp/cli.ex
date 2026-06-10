@@ -856,7 +856,7 @@ defmodule Atp.CLI do
   end
 
   @session_table_default_widths %{seq: 3, time: 4, sender: 6, recipient: 9, delivery: 9, ack: 9}
-  @session_table_max_widths %{seq: 6, time: 30, sender: 24, recipient: 24, delivery: 12, ack: 12}
+  @session_table_max_widths %{seq: 6, time: 30, sender: 24, recipient: 24, delivery: 16, ack: 12}
   @session_message_width 120
 
   defp session_table_header(widths) do
@@ -1018,18 +1018,22 @@ defmodule Atp.CLI do
     {transcript_delivery_status(message_status), transcript_ack_status(message_status)}
   end
 
-  defp transcript_delivery_status(%{"carrier_status" => status})
+  defp transcript_delivery_status(%{"deliveries" => deliveries} = message_status)
+       when is_list(deliveries) do
+    Enum.find_value(deliveries, fn
+      %{"status" => status} when is_binary(status) and status != "" -> status
+      _delivery -> nil
+    end) || transcript_carrier_status(message_status) || "-"
+  end
+
+  defp transcript_delivery_status(message_status),
+    do: transcript_carrier_status(message_status) || "-"
+
+  defp transcript_carrier_status(%{"carrier_status" => status})
        when is_binary(status) and status != "",
        do: status
 
-  defp transcript_delivery_status(%{"deliveries" => deliveries}) when is_list(deliveries) do
-    Enum.find_value(deliveries, "-", fn
-      %{"status" => status} when is_binary(status) and status != "" -> status
-      _delivery -> nil
-    end)
-  end
-
-  defp transcript_delivery_status(_message_status), do: "-"
+  defp transcript_carrier_status(_message_status), do: nil
 
   defp transcript_ack_status(%{"ack_status" => status}) when is_binary(status) and status != "",
     do: status

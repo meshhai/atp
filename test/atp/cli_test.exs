@@ -991,6 +991,43 @@ defmodule Atp.CLITest do
     assert [_, _] = Regex.scan(~r/opening turn/, watch_output)
   end
 
+  test "session transcript prefers delivery row status over carrier status", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_retrying",
+            carrier_status: "queued",
+            deliveries: [%{"id" => "dlv_retrying", "status" => "retry_scheduled"}],
+            text: "retrying turn"
+          )
+        ])
+      )
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "show", "ses_cli"]) == 0
+      end)
+
+    assert output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+retry_scheduled\s+-\s+retrying turn/
+
+    refute output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+queued\s+-\s+retrying turn/
+  end
+
   test "session show and watch accept explicit agent identity overrides", %{atp_home: atp_home} do
     seed_initialized_state!(atp_home)
     seed_agent!(atp_home, "codex-atp")
@@ -1171,6 +1208,7 @@ defmodule Atp.CLITest do
     created_at = Keyword.fetch!(opts, :created_at)
     carrier_status = Keyword.fetch!(opts, :carrier_status)
     ack_status = Keyword.get(opts, :ack_status)
+    deliveries = Keyword.get(opts, :deliveries, [])
     text = Keyword.fetch!(opts, :text)
 
     %{
@@ -1188,7 +1226,8 @@ defmodule Atp.CLITest do
         }
       },
       "carrier_status" => carrier_status,
-      "ack_status" => ack_status
+      "ack_status" => ack_status,
+      "deliveries" => deliveries
     }
   end
 
