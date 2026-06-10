@@ -1020,10 +1020,7 @@ defmodule Atp.CLI do
 
   defp transcript_delivery_status(%{"deliveries" => deliveries} = message_status)
        when is_list(deliveries) do
-    Enum.find_value(deliveries, fn
-      %{"status" => status} when is_binary(status) and status != "" -> status
-      _delivery -> nil
-    end) || transcript_carrier_status(message_status) || "-"
+    effective_delivery_status(deliveries) || transcript_carrier_status(message_status) || "-"
   end
 
   defp transcript_delivery_status(message_status),
@@ -1034,6 +1031,16 @@ defmodule Atp.CLI do
        do: status
 
   defp transcript_carrier_status(_message_status), do: nil
+
+  defp effective_delivery_status(deliveries) do
+    statuses =
+      Enum.flat_map(deliveries, fn
+        %{"status" => status} when is_binary(status) and status != "" -> [status]
+        _delivery -> []
+      end)
+
+    Enum.find(~w(delivered leased retry_scheduled failed), &(&1 in statuses))
+  end
 
   defp transcript_ack_status(%{"ack_status" => status}) when is_binary(status) and status != "",
     do: status

@@ -1028,6 +1028,46 @@ defmodule Atp.CLITest do
              ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+queued\s+-\s+retrying turn/
   end
 
+  test "session transcript derives effective delivery status across deliveries", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_delivered_after_retry",
+            carrier_status: "delivered",
+            deliveries: [
+              %{"id" => "dlv_webhook_retry", "mode" => "webhook", "status" => "retry_scheduled"},
+              %{"id" => "dlv_polling_delivered", "mode" => "polling", "status" => "delivered"}
+            ],
+            text: "delivered after retry"
+          )
+        ])
+      )
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "show", "ses_cli"]) == 0
+      end)
+
+    assert output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+delivered\s+-\s+delivered after retry/
+
+    refute output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+retry_scheduled\s+-\s+delivered after retry/
+  end
+
   test "session show and watch accept explicit agent identity overrides", %{atp_home: atp_home} do
     seed_initialized_state!(atp_home)
     seed_agent!(atp_home, "codex-atp")
