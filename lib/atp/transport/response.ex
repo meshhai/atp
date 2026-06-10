@@ -14,6 +14,19 @@ defmodule Atp.Transport.Response do
   }
 
   @type response_map :: %{String.t() => term()}
+  @public_error_classes ~w(
+    bad_alpn_protocol
+    closed
+    internal_error
+    internal_task_exit
+    message_acked
+    message_expired
+    nxdomain
+    timeout
+    transport_error
+    unsafe_webhook_url
+    webhook_endpoint_inactive
+  )
 
   @spec session_message(Session.t(), MessageStatus.t()) :: response_map()
   def session_message(%Session{} = session, %MessageStatus{} = message_status) do
@@ -102,7 +115,7 @@ defmodule Atp.Transport.Response do
       "max_attempts" => delivery.max_attempts,
       "next_attempt_at" => timestamp(delivery.next_attempt_at),
       "delivered_at" => timestamp(delivery.delivered_at),
-      "last_error" => delivery.last_error,
+      "last_error" => public_error_class(delivery.last_error),
       "attempts" => webhook_attempts(delivery.webhook_attempts, expose_request_url?)
     }
   end
@@ -124,7 +137,7 @@ defmodule Atp.Transport.Response do
       "id" => attempt.id,
       "attempt_number" => attempt.attempt_number,
       "response_status" => attempt.response_status,
-      "error" => attempt.error,
+      "error" => public_error_class(attempt.error),
       "result" => attempt.result,
       "next_attempt_at" => timestamp(attempt.next_attempt_at),
       "created_at" => timestamp(attempt.inserted_at)
@@ -136,6 +149,10 @@ defmodule Atp.Transport.Response do
       response
     end
   end
+
+  defp public_error_class(nil), do: nil
+  defp public_error_class(error) when error in @public_error_classes, do: error
+  defp public_error_class(_error), do: "internal_error"
 
   defp timestamp(nil), do: nil
   defp timestamp(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)

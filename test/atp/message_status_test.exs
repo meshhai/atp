@@ -7,7 +7,8 @@ defmodule Atp.MessageStatusTest do
     Delivery,
     Message,
     MessageStatus,
-    Response
+    Response,
+    WebhookAttempt
   }
 
   test "message status read model requires preloaded deliveries" do
@@ -64,6 +65,48 @@ defmodule Atp.MessageStatusTest do
                "attempts" => []
              }
            ] = response["deliveries"]
+  end
+
+  test "response sanitizes legacy persisted delivery and attempt errors" do
+    now = DateTime.utc_now(:microsecond)
+
+    attempt = %WebhookAttempt{
+      id: "wha_legacy_raw",
+      attempt_number: 1,
+      request_url: "https://recipient.example.test/hooks",
+      response_status: nil,
+      error: "connection failed for https://secret.example.test?token=whsec_raw_secret",
+      result: "retry_scheduled",
+      next_attempt_at: DateTime.add(now, 60, :second),
+      inserted_at: now
+    }
+
+    delivery = %Delivery{
+      id: "dlv_legacy_raw",
+      mode: "webhook",
+      status: "retry_scheduled",
+      attempt_count: 1,
+      max_attempts: 3,
+      next_attempt_at: DateTime.add(now, 60, :second),
+      last_error: "raw exception containing whsec_raw_secret and request body",
+      webhook_attempts: [attempt]
+    }
+
+    message = %Message{message(now) | deliveries: [delivery]}
+    viewer = %Agent{id: message.sender_agent_id, account_id: message.sender_account_id}
+
+    response =
+      message
+      |> MessageStatus.from_preloaded_message(viewer)
+      |> Response.message_status()
+
+    assert [%{"last_error" => "internal_error", "attempts" => [rendered_attempt]}] =
+             response["deliveries"]
+
+    assert rendered_attempt["error"] == "internal_error"
+    refute inspect(response) =~ "whsec_raw_secret"
+    refute inspect(response) =~ "secret.example.test"
+    refute inspect(response) =~ "request body"
   end
 
   defp message(now \\ DateTime.utc_now(:microsecond)) do
