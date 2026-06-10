@@ -61,6 +61,14 @@ defmodule Atp.CLI do
   defp dispatch(["send", "--as", alias, recipient, text]),
     do: send_message(recipient, text, alias)
 
+  defp dispatch(["message", "status", message_id]), do: message_status(message_id, nil)
+
+  defp dispatch(["message", "status", message_id, "--as", alias]),
+    do: message_status(message_id, alias)
+
+  defp dispatch(["message", "status", "--as", alias, message_id]),
+    do: message_status(message_id, alias)
+
   defp dispatch(["inbox"]), do: claim_inbox(nil)
   defp dispatch(["inbox", "--as", alias]), do: claim_inbox(alias)
   defp dispatch(["--as", alias, "inbox"]), do: claim_inbox(alias)
@@ -231,6 +239,18 @@ defmodule Atp.CLI do
              agent_headers(sender_token, "cli-send")
            ) do
       {:ok, send_output(sender_alias, sender_metadata, recipient, body)}
+    end
+  end
+
+  defp message_status(message_id, alias_override) do
+    with {:ok, config, token} <- session_read_context(alias_override),
+         {:ok, body} <-
+           get(
+             config.server_url,
+             "/api/messages/#{message_id}",
+             authorization_headers(token)
+           ) do
+      {:ok, message_status_output(config, body)}
     end
   end
 
@@ -473,6 +493,7 @@ defmodule Atp.CLI do
       atp use <alias>
       atp whoami
       atp send <alias-or-address> "<text>" [--as <alias>]
+      atp message status <message-id> [--as <alias>]
       atp inbox [--as <alias>]
       atp ack <delivery-id> --completed "<text>" [--as <alias>]
       atp session open <alias-or-address> "<text>" [--as <alias>]
@@ -612,6 +633,136 @@ defmodule Atp.CLI do
   end
 
   defp first_delivery_id(_body), do: nil
+
+  defp message_status_output(config, body) do
+    message = Map.get(body, "message", %{})
+
+    [
+      "Message status.",
+      "Message: #{status_field(message["id"])}",
+      "Sender: #{status_address(config, message["from"])}",
+      "Recipient: #{status_address(config, message["to"])}",
+      "Created: #{status_field(message["created_at"])}",
+      "Carrier status: #{status_field(body["carrier_status"])}",
+      "ACK status: #{status_field(body["ack_status"])}",
+      "Terminal: #{status_field(body["terminal_at"])}",
+      "",
+      message_deliveries_output(Map.get(body, "deliveries", []))
+    ]
+    |> Enum.join("\n")
+    |> Kernel.<>("\n")
+  end
+
+  defp message_deliveries_output(deliveries) when is_list(deliveries) do
+    case deliveries do
+      [] ->
+        "Deliveries: none"
+
+      deliveries ->
+        deliveries
+        |> Enum.map(&delivery_status_output/1)
+        |> then(&Enum.join(["Deliveries:" | &1], "\n"))
+    end
+  end
+
+  defp message_deliveries_output(_deliveries), do: "Deliveries: none"
+
+  defp delivery_status_output(delivery) when is_map(delivery) do
+    [
+      "- Delivery: #{status_field(delivery["id"])}",
+      "  Mode: #{status_field(delivery["mode"])}",
+      "  Status: #{status_field(delivery["status"])}",
+      "  Attempt count: #{delivery_attempt_count(delivery)}",
+      "  Claimed: #{status_field(delivery["claimed_at"])}",
+      "  Lease until: #{status_field(delivery["leased_until"])}",
+      "  Next retry: #{status_field(delivery["next_attempt_at"])}",
+      "  Delivered: #{status_field(delivery["delivered_at"])}"
+    ]
+    |> maybe_append_last_error(delivery)
+    |> Kernel.++(webhook_attempt_lines(Map.get(delivery, "attempts", [])))
+    |> Enum.join("\n")
+  end
+
+  defp delivery_status_output(_delivery), do: "- Delivery: -"
+
+  defp delivery_attempt_count(%{"attempt_count" => count, "max_attempts" => max_attempts})
+       when not is_nil(max_attempts) do
+    "#{status_field(count)}/#{status_field(max_attempts)}"
+  end
+
+  defp delivery_attempt_count(%{"attempt_count" => count}), do: status_field(count)
+  defp delivery_attempt_count(_delivery), do: "-"
+
+  defp maybe_append_last_error(lines, %{"last_error" => error}) do
+    case status_error_field(error) do
+      "-" -> lines
+      error -> lines ++ ["  Last error: #{error}"]
+    end
+  end
+
+  defp maybe_append_last_error(lines, _delivery), do: lines
+
+  defp webhook_attempt_lines(attempts) when is_list(attempts) do
+    case attempts do
+      [] ->
+        ["  Webhook attempts: none"]
+
+      attempts ->
+        ["  Webhook attempts:" | Enum.flat_map(attempts, &webhook_attempt_output/1)]
+    end
+  end
+
+  defp webhook_attempt_lines(_attempts), do: ["  Webhook attempts: none"]
+
+  defp webhook_attempt_output(attempt) when is_map(attempt) do
+    [
+      "  - Attempt ##{status_field(attempt["attempt_number"])}: #{status_field(attempt["result"])}",
+      "    Response: #{status_field(attempt["response_status"])}",
+      "    Error: #{status_error_field(attempt["error"])}",
+      "    Retry: #{status_field(attempt["next_attempt_at"])}",
+      "    Created: #{status_field(attempt["created_at"])}"
+    ]
+  end
+
+  defp webhook_attempt_output(_attempt), do: ["  - Attempt #-: -"]
+
+  defp status_address(config, address) when is_binary(address),
+    do: format_address(config, address)
+
+  defp status_address(_config, _address), do: "-"
+
+  defp status_field(nil), do: "-"
+
+  defp status_field(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[\t\r\n]+/, " ")
+    |> String.trim()
+    |> blank_status_field()
+  end
+
+  defp status_field(value), do: value |> to_string() |> status_field()
+
+  defp status_error_field(value) do
+    value
+    |> status_field()
+    |> redact_status_error()
+  end
+
+  defp blank_status_field(""), do: "-"
+  defp blank_status_field(value), do: value
+
+  defp redact_status_error("-"), do: "-"
+
+  defp redact_status_error(value) do
+    if Regex.match?(
+         ~r/(token|secret|signature|authorization|bearer|whsec_|raw body|request body)/i,
+         value
+       ) do
+      "internal_error"
+    else
+      value
+    end
+  end
 
   defp claimed_delivery(%{"delivery" => nil}), do: nil
   defp claimed_delivery(%{"delivery" => delivery}) when is_map(delivery), do: delivery

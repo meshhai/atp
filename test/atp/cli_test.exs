@@ -417,6 +417,190 @@ defmodule Atp.CLITest do
     assert output =~ "Delivery: none yet (polling recipient should run `atp inbox`)"
   end
 
+  test "message status uses the active alias and renders delivery attempts safely", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/messages/msg_cli_status"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(conn, %{
+        "message" => %{
+          "id" => "msg_cli_status",
+          "from" => "atp://agent/agt_codex_atp",
+          "to" => "atp://agent/agt_claude_123",
+          "created_at" => "2026-05-27T12:10:00Z",
+          "payload" => %{
+            "messageId" => "a2a-msg-cli-status",
+            "role" => "ROLE_USER",
+            "parts" => [
+              %{"text" => "raw payload text containing whsec_payload_secret and sig_body"}
+            ]
+          }
+        },
+        "carrier_status" => "delivered",
+        "ack_status" => "completed",
+        "terminal_at" => "2026-05-27T12:12:00Z",
+        "deliveries" => [
+          %{
+            "id" => "dlv_polling_status",
+            "mode" => "polling",
+            "status" => "leased",
+            "claimed_at" => "2026-05-27T12:10:10Z",
+            "leased_until" => "2026-05-27T12:11:10Z",
+            "attempt_count" => 0,
+            "max_attempts" => nil,
+            "next_attempt_at" => nil,
+            "delivered_at" => nil,
+            "last_error" => nil,
+            "attempts" => []
+          },
+          %{
+            "id" => "dlv_webhook_status",
+            "mode" => "webhook",
+            "status" => "retry_scheduled",
+            "claimed_at" => nil,
+            "leased_until" => nil,
+            "attempt_count" => 1,
+            "max_attempts" => 3,
+            "next_attempt_at" => "2026-05-27T12:15:00Z",
+            "delivered_at" => nil,
+            "last_error" => "transport_error",
+            "webhook_secret" => "whsec_delivery_secret",
+            "attempts" => [
+              %{
+                "id" => "wha_status_1",
+                "attempt_number" => 1,
+                "result" => "retry_scheduled",
+                "response_status" => 503,
+                "error" => "timeout",
+                "next_attempt_at" => "2026-05-27T12:15:00Z",
+                "created_at" => "2026-05-27T12:10:30Z",
+                "request_url" => "https://recipient.example.test/hook?secret=whsec_attempt_url",
+                "signature" => "sig_attempt_header",
+                "raw_body" => "raw body containing whsec_attempt_body"
+              }
+            ]
+          }
+        ]
+      })
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["message", "status", "msg_cli_status"]) == 0
+      end)
+
+    assert output =~ "Message status."
+    assert output =~ "Message: msg_cli_status"
+    assert output =~ "Sender: codex-atp (atp://agent/agt_codex_atp)"
+    assert output =~ "Recipient: claude-123 (atp://agent/agt_claude_123)"
+    assert output =~ "Created: 2026-05-27T12:10:00Z"
+    assert output =~ "Carrier status: delivered"
+    assert output =~ "ACK status: completed"
+    assert output =~ "Terminal: 2026-05-27T12:12:00Z"
+    assert output =~ "Delivery: dlv_polling_status"
+    assert output =~ "Mode: polling"
+    assert output =~ "Attempt count: 0"
+    assert output =~ "Claimed: 2026-05-27T12:10:10Z"
+    assert output =~ "Lease until: 2026-05-27T12:11:10Z"
+    assert output =~ "Delivery: dlv_webhook_status"
+    assert output =~ "Mode: webhook"
+    assert output =~ "Attempt count: 1/3"
+    assert output =~ "Next retry: 2026-05-27T12:15:00Z"
+    assert output =~ "Last error: transport_error"
+    assert output =~ "Attempt #1: retry_scheduled"
+    assert output =~ "Response: 503"
+    assert output =~ "Error: timeout"
+    assert output =~ "Retry: 2026-05-27T12:15:00Z"
+    assert output =~ "Created: 2026-05-27T12:10:30Z"
+
+    refute output =~ "raw payload text"
+    refute output =~ "whsec_"
+    refute output =~ "sig_"
+    refute output =~ "raw body"
+    refute output =~ "recipient.example.test"
+  end
+
+  test "message status accepts an explicit agent identity override", %{atp_home: atp_home} do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/messages/msg_override_status"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+
+      Req.Test.json(conn, %{
+        "message" => %{
+          "id" => "msg_override_status",
+          "from" => "atp://agent/agt_claude_123",
+          "to" => "atp://agent/agt_codex_atp",
+          "created_at" => "2026-05-27T12:20:00Z"
+        },
+        "carrier_status" => "queued",
+        "ack_status" => nil,
+        "terminal_at" => nil,
+        "deliveries" => []
+      })
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run([
+                 "message",
+                 "status",
+                 "msg_override_status",
+                 "--as",
+                 "claude-123"
+               ]) == 0
+      end)
+
+    assert output =~ "Message: msg_override_status"
+    assert output =~ "Sender: claude-123 (atp://agent/agt_claude_123)"
+    assert output =~ "Recipient: codex-atp (atp://agent/agt_codex_atp)"
+    assert output =~ "ACK status: -"
+    assert output =~ "Deliveries: none"
+  end
+
+  test "message status reports missing messages as server not found errors", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/messages/msg_missing"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      conn
+      |> put_status(404)
+      |> Req.Test.json(%{
+        "error" => %{
+          "code" => "not_found",
+          "message" => "The requested resource could not be found."
+        }
+      })
+    end)
+
+    stderr =
+      capture_io(:stderr, fn ->
+        assert Atp.CLI.run(["message", "status", "msg_missing"]) == 1
+      end)
+
+    assert stderr =~ "server returned 404 not_found: The requested resource could not be found."
+  end
+
   test "session commands open, accept, reject, and send using local aliases", %{
     atp_home: atp_home
   } do
