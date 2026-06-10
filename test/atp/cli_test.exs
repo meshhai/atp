@@ -822,7 +822,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     show_output =
@@ -836,10 +841,10 @@ defmodule Atp.CLITest do
     assert show_output =~ "Recipient: claude-123 (atp://agent/agt_claude_123)"
 
     assert show_output =~
-             "Seq  Time                  Sender      Recipient   Status    Message"
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
 
     assert show_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
 
     Application.put_env(:atp, Atp.CLI,
       req_options: [plug: {Req.Test, __MODULE__}],
@@ -852,7 +857,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     Req.Test.expect(__MODULE__, fn conn ->
@@ -867,11 +877,31 @@ defmodule Atp.CLITest do
           session_message(
             2,
             "msg_reply",
-            "atp://agent/agt_claude_123",
-            "atp://agent/agt_codex_atp",
-            "2026-05-27T12:01:00Z",
-            nil,
-            "reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient status and message columns aligned in the terminal"
+            from: "atp://agent/agt_claude_123",
+            to: "atp://agent/agt_codex_atp",
+            created_at: "2026-05-27T12:01:00Z",
+            carrier_status: "queued",
+            text:
+              "reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient delivery ack and message columns aligned in the terminal"
+          ),
+          session_message(
+            3,
+            "msg_delivered",
+            from: "atp://agent/agt_codex_atp",
+            to: "atp://agent/agt_claude_123",
+            created_at: "2026-05-27T12:02:00Z",
+            carrier_status: "delivered",
+            text: "delivered turn waiting on ACK"
+          ),
+          session_message(
+            4,
+            "msg_completed",
+            from: "atp://agent/agt_claude_123",
+            to: "atp://agent/agt_codex_atp",
+            created_at: "2026-05-27T12:03:00Z",
+            carrier_status: "delivered",
+            ack_status: "completed",
+            text: "completed turn"
           )
         ])
       )
@@ -883,16 +913,21 @@ defmodule Atp.CLITest do
       end)
 
     assert watch_output =~
-             "Seq  Time                  Sender      Recipient   Status    Message"
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
 
     assert watch_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
 
     assert watch_output =~
-             "2    2026-05-27T12:01:00Z  claude-123  codex-atp   queued    reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient status and"
+             "2    2026-05-27T12:01:00Z  claude-123  codex-atp   queued     -          reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient delivery"
+
+    assert watch_output =~ ~r/\n {70,}and message columns aligned in the terminal/
 
     assert watch_output =~
-             "                                                             message columns aligned in the terminal"
+             "3    2026-05-27T12:02:00Z  codex-atp   claude-123  delivered  -          delivered turn waiting on ACK"
+
+    assert watch_output =~
+             "4    2026-05-27T12:03:00Z  claude-123  codex-atp   delivered  completed  completed turn"
 
     assert [_header] = Regex.scan(~r/Seq  Time/, watch_output)
     assert [] = Regex.scan(~r/msg_opening/, watch_output)
@@ -909,7 +944,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     show_output =
@@ -920,7 +960,7 @@ defmodule Atp.CLITest do
     assert show_output =~ "Session: ses_cli"
 
     assert show_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
 
     Application.put_env(:atp, Atp.CLI,
       req_options: [plug: {Req.Test, __MODULE__}],
@@ -933,7 +973,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     watch_output =
@@ -942,10 +987,10 @@ defmodule Atp.CLITest do
       end)
 
     assert watch_output =~
-             "Seq  Time                  Sender      Recipient   Status    Message"
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
 
     assert watch_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
   end
 
   defp seed_initialized_state!(atp_home) do
@@ -1020,31 +1065,56 @@ defmodule Atp.CLITest do
     }
   end
 
-  defp session_message(1, message_id) do
-    session_message(
+  defp session_message(sequence, message_id, opts \\ [])
+
+  defp session_message(1, message_id, opts) do
+    build_session_message(
       1,
       message_id,
-      "atp://agent/agt_codex_atp",
-      "atp://agent/agt_claude_123",
-      "2026-05-27T12:00:00Z",
-      "accepted",
-      "opening turn"
+      Keyword.merge(
+        [
+          from: "atp://agent/agt_codex_atp",
+          to: "atp://agent/agt_claude_123",
+          created_at: "2026-05-27T12:00:00Z",
+          carrier_status: "queued",
+          ack_status: nil,
+          text: "opening turn"
+        ],
+        opts
+      )
     )
   end
 
-  defp session_message(2, message_id) do
-    session_message(
+  defp session_message(2, message_id, opts) do
+    build_session_message(
       2,
       message_id,
-      "atp://agent/agt_claude_123",
-      "atp://agent/agt_codex_atp",
-      "2026-05-27T12:01:00Z",
-      nil,
-      "reply turn"
+      Keyword.merge(
+        [
+          from: "atp://agent/agt_claude_123",
+          to: "atp://agent/agt_codex_atp",
+          created_at: "2026-05-27T12:01:00Z",
+          carrier_status: "queued",
+          ack_status: nil,
+          text: "reply turn"
+        ],
+        opts
+      )
     )
   end
 
-  defp session_message(sequence, message_id, from, to, created_at, ack_status, text) do
+  defp session_message(sequence, message_id, opts) do
+    build_session_message(sequence, message_id, opts)
+  end
+
+  defp build_session_message(sequence, message_id, opts) do
+    from = Keyword.fetch!(opts, :from)
+    to = Keyword.fetch!(opts, :to)
+    created_at = Keyword.fetch!(opts, :created_at)
+    carrier_status = Keyword.fetch!(opts, :carrier_status)
+    ack_status = Keyword.get(opts, :ack_status)
+    text = Keyword.fetch!(opts, :text)
+
     %{
       "message" => %{
         "id" => message_id,
@@ -1059,7 +1129,7 @@ defmodule Atp.CLITest do
           "parts" => [%{"text" => text}]
         }
       },
-      "carrier_status" => "queued",
+      "carrier_status" => carrier_status,
       "ack_status" => ack_status
     }
   end

@@ -855,8 +855,8 @@ defmodule Atp.CLI do
     session_table_header(widths) <> format_session_rows(config, messages, widths)
   end
 
-  @session_table_default_widths %{seq: 3, time: 4, sender: 6, recipient: 9, status: 6}
-  @session_table_max_widths %{seq: 6, time: 30, sender: 24, recipient: 24, status: 12}
+  @session_table_default_widths %{seq: 3, time: 4, sender: 6, recipient: 9, delivery: 9, ack: 9}
+  @session_table_max_widths %{seq: 6, time: 30, sender: 24, recipient: 24, delivery: 12, ack: 12}
   @session_message_width 120
 
   defp session_table_header(widths) do
@@ -865,7 +865,8 @@ defmodule Atp.CLI do
       pad_table_cell("Time", :time, widths),
       pad_table_cell("Sender", :sender, widths),
       pad_table_cell("Recipient", :recipient, widths),
-      pad_table_cell("Status", :status, widths),
+      pad_table_cell("Delivery", :delivery, widths),
+      pad_table_cell("ACK", :ack, widths),
       "Message"
     ]
     |> Enum.join("  ")
@@ -889,7 +890,8 @@ defmodule Atp.CLI do
         |> widen_table_column(:time, message["created_at"])
         |> widen_table_column(:sender, table_address(config, message["from"]))
         |> widen_table_column(:recipient, table_address(config, message["to"]))
-        |> widen_table_column(:status, transcript_status(message_status))
+        |> widen_table_column(:delivery, transcript_delivery_status(message_status))
+        |> widen_table_column(:ack, transcript_ack_status(message_status))
       end)
     end)
   end
@@ -912,7 +914,8 @@ defmodule Atp.CLI do
         pad_table_cell(message["created_at"], :time, widths),
         pad_table_cell(table_address(config, message["from"]), :sender, widths),
         pad_table_cell(table_address(config, message["to"]), :recipient, widths),
-        pad_table_cell(transcript_status(message_status), :status, widths),
+        pad_table_cell(transcript_delivery_status(message_status), :delivery, widths),
+        pad_table_cell(transcript_ack_status(message_status), :ack, widths),
         first_message_line
       ]
       |> Enum.join("  ")
@@ -1007,13 +1010,23 @@ defmodule Atp.CLI do
     message["session_sequence"] || message["id"] || message_status
   end
 
-  defp transcript_status(%{"ack_status" => status}) when is_binary(status) and status != "",
+  defp transcript_delivery_status(%{"carrier_status" => status})
+       when is_binary(status) and status != "",
+       do: status
+
+  defp transcript_delivery_status(%{"deliveries" => deliveries}) when is_list(deliveries) do
+    Enum.find_value(deliveries, "-", fn
+      %{"status" => status} when is_binary(status) and status != "" -> status
+      _delivery -> nil
+    end)
+  end
+
+  defp transcript_delivery_status(_message_status), do: "-"
+
+  defp transcript_ack_status(%{"ack_status" => status}) when is_binary(status) and status != "",
     do: status
 
-  defp transcript_status(%{"carrier_status" => status}) when is_binary(status) and status != "",
-    do: status
-
-  defp transcript_status(_message_status), do: "-"
+  defp transcript_ack_status(_message_status), do: "-"
 
   defp table_address(config, address) when is_binary(address) do
     alias_for_address(config, address) || address
@@ -1059,7 +1072,7 @@ defmodule Atp.CLI do
   end
 
   defp session_message_indent(widths) do
-    [:seq, :time, :sender, :recipient, :status]
+    [:seq, :time, :sender, :recipient, :delivery, :ack]
     |> Enum.map(&Map.fetch!(widths, &1))
     |> Enum.map_join("  ", &String.duplicate(" ", &1))
     |> Kernel.<>("  ")
