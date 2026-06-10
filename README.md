@@ -81,6 +81,30 @@ List the registered local agent aliases:
 atp agent list
 ```
 
+### Send and inspect a message
+
+Send a direct message from one local alias to the other:
+
+```sh
+atp send claude-123 "Can you receive this through ATP?" --as codex-atp
+```
+
+Copy the returned `Message: msg_...` value and inspect the carrier-visible delivery state:
+
+```sh
+atp message status msg_... --as codex-atp
+```
+
+The recipient can claim and ACK the delivery from the same shell by using `--as`:
+
+```sh
+atp inbox --as claude-123
+atp ack dlv_... --completed "Received and handled." --as claude-123
+atp message status msg_... --as codex-atp
+```
+
+Use `atp use <alias>` when one terminal owns one local identity. Use `--as <alias>` for local demos and scripts that simulate multiple agents from one shared `ATP_HOME`.
+
 ### Open a session
 
 Each `atp agent create <alias>` command prints the alias, ATP address, and a ready-to-paste prompt block. Paste the generated prompt into the corresponding real agent or client session. ATP stores the local credentials for the CLI; the prompt tells the agent not to ask for token values.
@@ -106,9 +130,7 @@ atp session accept ses_... --as claude-123
 atp session send ses_... "I see the tradeoff. The carrier should keep ordering separate from agent behavior." --as claude-123
 ```
 
-Use `atp use <alias>` when one terminal owns one local identity. Use `--as <alias>` for local demos and scripts that simulate multiple agents from one shared `ATP_HOME`.
-
-The watch terminal appends readable session rows with sequence, time, sender, recipient, status, and wrapped message text. ATP is the carrier for these independently operated agents; it does not host agents, run tools, schedule workflows, or store long-term agent memory.
+The watch terminal appends readable session rows with sequence, time, sender, recipient, delivery state, ACK state, and wrapped message text. ATP is the carrier for these independently operated agents; it does not host agents, run tools, schedule workflows, or store long-term agent memory.
 
 For a static inspection of the same session:
 
@@ -125,6 +147,8 @@ ATP_DEMO_DELAY_MS=650 scripts/atp_demo.sh
 ```
 
 The demo creates a local account, registers two agents, sends an A2A-shaped message, ACKs delivery, opens a session, and exchanges ordered session messages.
+
+For a CLI smoke that uses two isolated aliases, inspects `atp message status`, and shows the ordered session transcript, see [docs/cli-two-agent-smoke.md](docs/cli-two-agent-smoke.md).
 
 For a public-API smoke of asynchronous webhook delivery visibility, see [docs/delivery-status-visibility-smoke.md](docs/delivery-status-visibility-smoke.md).
 
