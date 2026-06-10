@@ -873,7 +873,7 @@ defmodule Atp.CLITest do
       Req.Test.json(
         conn,
         session_transcript_response([
-          session_message(1, "msg_opening"),
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted"),
           session_message(
             2,
             "msg_reply",
@@ -931,6 +931,64 @@ defmodule Atp.CLITest do
 
     assert [_header] = Regex.scan(~r/Seq  Time/, watch_output)
     assert [] = Regex.scan(~r/msg_opening/, watch_output)
+  end
+
+  test "session watch reprints a transcript row when delivery or ACK state changes", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Application.put_env(:atp, Atp.CLI,
+      req_options: [plug: {Req.Test, __MODULE__}],
+      watch_poll_interval_ms: 0,
+      watch_max_polls: 2
+    )
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening")
+        ])
+      )
+    end)
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
+    end)
+
+    watch_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "watch", "ses_cli"]) == 0
+      end)
+
+    assert watch_output =~
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
+
+    assert watch_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  queued     -          opening turn"
+
+    assert watch_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
+
+    assert [_header] = Regex.scan(~r/Seq  Time/, watch_output)
+    assert [_, _] = Regex.scan(~r/opening turn/, watch_output)
   end
 
   test "session show and watch accept explicit agent identity overrides", %{atp_home: atp_home} do

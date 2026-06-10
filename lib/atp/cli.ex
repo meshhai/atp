@@ -349,7 +349,7 @@ defmodule Atp.CLI do
              config,
              token,
              session_id,
-             MapSet.new(),
+             %{},
              false,
              0,
              watch_max_polls()
@@ -987,11 +987,11 @@ defmodule Atp.CLI do
     messages
     |> Enum.reduce({[], seen}, fn message_status, {messages, seen} ->
       key = message_key(message_status)
+      state = transcript_watch_state(message_status)
 
-      if MapSet.member?(seen, key) do
-        {messages, seen}
-      else
-        {[message_status | messages], MapSet.put(seen, key)}
+      case Map.fetch(seen, key) do
+        {:ok, ^state} -> {messages, seen}
+        _new_or_changed -> {[message_status | messages], Map.put(seen, key, state)}
       end
     end)
     |> then(fn {messages, seen} -> {Enum.reverse(messages), seen} end)
@@ -1007,7 +1007,15 @@ defmodule Atp.CLI do
 
   defp message_key(message_status) do
     message = Map.get(message_status, "message", %{})
-    message["session_sequence"] || message["id"] || message_status
+
+    case {message["session_sequence"], message["id"]} do
+      {nil, nil} -> message_status
+      key -> key
+    end
+  end
+
+  defp transcript_watch_state(message_status) do
+    {transcript_delivery_status(message_status), transcript_ack_status(message_status)}
   end
 
   defp transcript_delivery_status(%{"carrier_status" => status})
