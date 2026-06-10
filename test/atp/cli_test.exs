@@ -417,6 +417,190 @@ defmodule Atp.CLITest do
     assert output =~ "Delivery: none yet (polling recipient should run `atp inbox`)"
   end
 
+  test "message status uses the active alias and renders delivery attempts safely", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/messages/msg_cli_status"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(conn, %{
+        "message" => %{
+          "id" => "msg_cli_status",
+          "from" => "atp://agent/agt_codex_atp",
+          "to" => "atp://agent/agt_claude_123",
+          "created_at" => "2026-05-27T12:10:00Z",
+          "payload" => %{
+            "messageId" => "a2a-msg-cli-status",
+            "role" => "ROLE_USER",
+            "parts" => [
+              %{"text" => "raw payload text containing whsec_payload_secret and sig_body"}
+            ]
+          }
+        },
+        "carrier_status" => "delivered",
+        "ack_status" => "completed",
+        "terminal_at" => "2026-05-27T12:12:00Z",
+        "deliveries" => [
+          %{
+            "id" => "dlv_polling_status",
+            "mode" => "polling",
+            "status" => "leased",
+            "claimed_at" => "2026-05-27T12:10:10Z",
+            "leased_until" => "2026-05-27T12:11:10Z",
+            "attempt_count" => 0,
+            "max_attempts" => nil,
+            "next_attempt_at" => nil,
+            "delivered_at" => nil,
+            "last_error" => nil,
+            "attempts" => []
+          },
+          %{
+            "id" => "dlv_webhook_status",
+            "mode" => "webhook",
+            "status" => "retry_scheduled",
+            "claimed_at" => nil,
+            "leased_until" => nil,
+            "attempt_count" => 1,
+            "max_attempts" => 3,
+            "next_attempt_at" => "2026-05-27T12:15:00Z",
+            "delivered_at" => nil,
+            "last_error" => "transport_error",
+            "webhook_secret" => "whsec_delivery_secret",
+            "attempts" => [
+              %{
+                "id" => "wha_status_1",
+                "attempt_number" => 1,
+                "result" => "retry_scheduled",
+                "response_status" => 503,
+                "error" => "timeout",
+                "next_attempt_at" => "2026-05-27T12:15:00Z",
+                "created_at" => "2026-05-27T12:10:30Z",
+                "request_url" => "https://recipient.example.test/hook?secret=whsec_attempt_url",
+                "signature" => "sig_attempt_header",
+                "raw_body" => "raw body containing whsec_attempt_body"
+              }
+            ]
+          }
+        ]
+      })
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["message", "status", "msg_cli_status"]) == 0
+      end)
+
+    assert output =~ "Message status."
+    assert output =~ "Message: msg_cli_status"
+    assert output =~ "Sender: codex-atp (atp://agent/agt_codex_atp)"
+    assert output =~ "Recipient: claude-123 (atp://agent/agt_claude_123)"
+    assert output =~ "Created: 2026-05-27T12:10:00Z"
+    assert output =~ "Carrier status: delivered"
+    assert output =~ "ACK status: completed"
+    assert output =~ "Terminal: 2026-05-27T12:12:00Z"
+    assert output =~ "Delivery: dlv_polling_status"
+    assert output =~ "Mode: polling"
+    assert output =~ "Attempt count: 0"
+    assert output =~ "Claimed: 2026-05-27T12:10:10Z"
+    assert output =~ "Lease until: 2026-05-27T12:11:10Z"
+    assert output =~ "Delivery: dlv_webhook_status"
+    assert output =~ "Mode: webhook"
+    assert output =~ "Attempt count: 1/3"
+    assert output =~ "Next retry: 2026-05-27T12:15:00Z"
+    assert output =~ "Last error: transport_error"
+    assert output =~ "Attempt #1: retry_scheduled"
+    assert output =~ "Response: 503"
+    assert output =~ "Error: timeout"
+    assert output =~ "Retry: 2026-05-27T12:15:00Z"
+    assert output =~ "Created: 2026-05-27T12:10:30Z"
+
+    refute output =~ "raw payload text"
+    refute output =~ "whsec_"
+    refute output =~ "sig_"
+    refute output =~ "raw body"
+    refute output =~ "recipient.example.test"
+  end
+
+  test "message status accepts an explicit agent identity override", %{atp_home: atp_home} do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/messages/msg_override_status"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
+
+      Req.Test.json(conn, %{
+        "message" => %{
+          "id" => "msg_override_status",
+          "from" => "atp://agent/agt_claude_123",
+          "to" => "atp://agent/agt_codex_atp",
+          "created_at" => "2026-05-27T12:20:00Z"
+        },
+        "carrier_status" => "queued",
+        "ack_status" => nil,
+        "terminal_at" => nil,
+        "deliveries" => []
+      })
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run([
+                 "message",
+                 "status",
+                 "msg_override_status",
+                 "--as",
+                 "claude-123"
+               ]) == 0
+      end)
+
+    assert output =~ "Message: msg_override_status"
+    assert output =~ "Sender: claude-123 (atp://agent/agt_claude_123)"
+    assert output =~ "Recipient: codex-atp (atp://agent/agt_codex_atp)"
+    assert output =~ "ACK status: -"
+    assert output =~ "Deliveries: none"
+  end
+
+  test "message status reports missing messages as server not found errors", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/messages/msg_missing"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      conn
+      |> put_status(404)
+      |> Req.Test.json(%{
+        "error" => %{
+          "code" => "not_found",
+          "message" => "The requested resource could not be found."
+        }
+      })
+    end)
+
+    stderr =
+      capture_io(:stderr, fn ->
+        assert Atp.CLI.run(["message", "status", "msg_missing"]) == 1
+      end)
+
+    assert stderr =~ "server returned 404 not_found: The requested resource could not be found."
+  end
+
   test "session commands open, accept, reject, and send using local aliases", %{
     atp_home: atp_home
   } do
@@ -638,7 +822,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     show_output =
@@ -652,10 +841,10 @@ defmodule Atp.CLITest do
     assert show_output =~ "Recipient: claude-123 (atp://agent/agt_claude_123)"
 
     assert show_output =~
-             "Seq  Time                  Sender      Recipient   Status    Message"
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
 
     assert show_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
 
     Application.put_env(:atp, Atp.CLI,
       req_options: [plug: {Req.Test, __MODULE__}],
@@ -668,7 +857,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     Req.Test.expect(__MODULE__, fn conn ->
@@ -679,15 +873,35 @@ defmodule Atp.CLITest do
       Req.Test.json(
         conn,
         session_transcript_response([
-          session_message(1, "msg_opening"),
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted"),
           session_message(
             2,
             "msg_reply",
-            "atp://agent/agt_claude_123",
-            "atp://agent/agt_codex_atp",
-            "2026-05-27T12:01:00Z",
-            nil,
-            "reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient status and message columns aligned in the terminal"
+            from: "atp://agent/agt_claude_123",
+            to: "atp://agent/agt_codex_atp",
+            created_at: "2026-05-27T12:01:00Z",
+            carrier_status: "queued",
+            text:
+              "reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient delivery ack and message columns aligned in the terminal"
+          ),
+          session_message(
+            3,
+            "msg_delivered",
+            from: "atp://agent/agt_codex_atp",
+            to: "atp://agent/agt_claude_123",
+            created_at: "2026-05-27T12:02:00Z",
+            carrier_status: "delivered",
+            text: "delivered turn waiting on ACK"
+          ),
+          session_message(
+            4,
+            "msg_completed",
+            from: "atp://agent/agt_claude_123",
+            to: "atp://agent/agt_codex_atp",
+            created_at: "2026-05-27T12:03:00Z",
+            carrier_status: "delivered",
+            ack_status: "completed",
+            text: "completed turn"
           )
         ])
       )
@@ -699,19 +913,159 @@ defmodule Atp.CLITest do
       end)
 
     assert watch_output =~
-             "Seq  Time                  Sender      Recipient   Status    Message"
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
 
     assert watch_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
 
     assert watch_output =~
-             "2    2026-05-27T12:01:00Z  claude-123  codex-atp   queued    reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient status and"
+             "2    2026-05-27T12:01:00Z  claude-123  codex-atp   queued     -          reply turn with a longer message that should wrap onto a continuation row while keeping sender recipient delivery"
+
+    assert watch_output =~ ~r/\n {70,}and message columns aligned in the terminal/
 
     assert watch_output =~
-             "                                                             message columns aligned in the terminal"
+             "3    2026-05-27T12:02:00Z  codex-atp   claude-123  delivered  -          delivered turn waiting on ACK"
+
+    assert watch_output =~
+             "4    2026-05-27T12:03:00Z  claude-123  codex-atp   delivered  completed  completed turn"
 
     assert [_header] = Regex.scan(~r/Seq  Time/, watch_output)
     assert [] = Regex.scan(~r/msg_opening/, watch_output)
+  end
+
+  test "session watch reprints a transcript row when delivery or ACK state changes", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Application.put_env(:atp, Atp.CLI,
+      req_options: [plug: {Req.Test, __MODULE__}],
+      watch_poll_interval_ms: 0,
+      watch_max_polls: 2
+    )
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening")
+        ])
+      )
+    end)
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
+    end)
+
+    watch_output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "watch", "ses_cli"]) == 0
+      end)
+
+    assert watch_output =~
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
+
+    assert watch_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  queued     -          opening turn"
+
+    assert watch_output =~
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
+
+    assert [_header] = Regex.scan(~r/Seq  Time/, watch_output)
+    assert [_, _] = Regex.scan(~r/opening turn/, watch_output)
+  end
+
+  test "session transcript prefers delivery row status over carrier status", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_retrying",
+            carrier_status: "queued",
+            deliveries: [%{"id" => "dlv_retrying", "status" => "retry_scheduled"}],
+            text: "retrying turn"
+          )
+        ])
+      )
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "show", "ses_cli"]) == 0
+      end)
+
+    assert output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+retry_scheduled\s+-\s+retrying turn/
+
+    refute output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+queued\s+-\s+retrying turn/
+  end
+
+  test "session transcript derives effective delivery status across deliveries", %{
+    atp_home: atp_home
+  } do
+    seed_initialized_state!(atp_home)
+    seed_agent!(atp_home, "codex-atp")
+    seed_agent!(atp_home, "claude-123")
+    seed_active_alias!(atp_home, "codex-atp")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert conn.method == "GET"
+      assert conn.request_path == "/api/sessions/ses_cli"
+      assert get_req_header(conn, "authorization") == ["Bearer agk_codex_atp"]
+
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_delivered_after_retry",
+            carrier_status: "delivered",
+            deliveries: [
+              %{"id" => "dlv_webhook_retry", "mode" => "webhook", "status" => "retry_scheduled"},
+              %{"id" => "dlv_polling_delivered", "mode" => "polling", "status" => "delivered"}
+            ],
+            text: "delivered after retry"
+          )
+        ])
+      )
+    end)
+
+    output =
+      capture_io(fn ->
+        assert Atp.CLI.run(["session", "show", "ses_cli"]) == 0
+      end)
+
+    assert output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+delivered\s+-\s+delivered after retry/
+
+    refute output =~
+             ~r/1\s+2026-05-27T12:00:00Z\s+codex-atp\s+claude-123\s+retry_scheduled\s+-\s+delivered after retry/
   end
 
   test "session show and watch accept explicit agent identity overrides", %{atp_home: atp_home} do
@@ -725,7 +1079,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     show_output =
@@ -736,7 +1095,7 @@ defmodule Atp.CLITest do
     assert show_output =~ "Session: ses_cli"
 
     assert show_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
 
     Application.put_env(:atp, Atp.CLI,
       req_options: [plug: {Req.Test, __MODULE__}],
@@ -749,7 +1108,12 @@ defmodule Atp.CLITest do
       assert conn.request_path == "/api/sessions/ses_cli"
       assert get_req_header(conn, "authorization") == ["Bearer agk_claude_123"]
 
-      Req.Test.json(conn, session_transcript_response([session_message(1, "msg_opening")]))
+      Req.Test.json(
+        conn,
+        session_transcript_response([
+          session_message(1, "msg_opening", carrier_status: "delivered", ack_status: "accepted")
+        ])
+      )
     end)
 
     watch_output =
@@ -758,10 +1122,10 @@ defmodule Atp.CLITest do
       end)
 
     assert watch_output =~
-             "Seq  Time                  Sender      Recipient   Status    Message"
+             "Seq  Time                  Sender      Recipient   Delivery   ACK        Message"
 
     assert watch_output =~
-             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  accepted  opening turn"
+             "1    2026-05-27T12:00:00Z  codex-atp   claude-123  delivered  accepted   opening turn"
   end
 
   defp seed_initialized_state!(atp_home) do
@@ -836,31 +1200,57 @@ defmodule Atp.CLITest do
     }
   end
 
-  defp session_message(1, message_id) do
-    session_message(
+  defp session_message(sequence, message_id, opts \\ [])
+
+  defp session_message(1, message_id, opts) do
+    build_session_message(
       1,
       message_id,
-      "atp://agent/agt_codex_atp",
-      "atp://agent/agt_claude_123",
-      "2026-05-27T12:00:00Z",
-      "accepted",
-      "opening turn"
+      Keyword.merge(
+        [
+          from: "atp://agent/agt_codex_atp",
+          to: "atp://agent/agt_claude_123",
+          created_at: "2026-05-27T12:00:00Z",
+          carrier_status: "queued",
+          ack_status: nil,
+          text: "opening turn"
+        ],
+        opts
+      )
     )
   end
 
-  defp session_message(2, message_id) do
-    session_message(
+  defp session_message(2, message_id, opts) do
+    build_session_message(
       2,
       message_id,
-      "atp://agent/agt_claude_123",
-      "atp://agent/agt_codex_atp",
-      "2026-05-27T12:01:00Z",
-      nil,
-      "reply turn"
+      Keyword.merge(
+        [
+          from: "atp://agent/agt_claude_123",
+          to: "atp://agent/agt_codex_atp",
+          created_at: "2026-05-27T12:01:00Z",
+          carrier_status: "queued",
+          ack_status: nil,
+          text: "reply turn"
+        ],
+        opts
+      )
     )
   end
 
-  defp session_message(sequence, message_id, from, to, created_at, ack_status, text) do
+  defp session_message(sequence, message_id, opts) do
+    build_session_message(sequence, message_id, opts)
+  end
+
+  defp build_session_message(sequence, message_id, opts) do
+    from = Keyword.fetch!(opts, :from)
+    to = Keyword.fetch!(opts, :to)
+    created_at = Keyword.fetch!(opts, :created_at)
+    carrier_status = Keyword.fetch!(opts, :carrier_status)
+    ack_status = Keyword.get(opts, :ack_status)
+    deliveries = Keyword.get(opts, :deliveries, [])
+    text = Keyword.fetch!(opts, :text)
+
     %{
       "message" => %{
         "id" => message_id,
@@ -875,8 +1265,9 @@ defmodule Atp.CLITest do
           "parts" => [%{"text" => text}]
         }
       },
-      "carrier_status" => "queued",
-      "ack_status" => ack_status
+      "carrier_status" => carrier_status,
+      "ack_status" => ack_status,
+      "deliveries" => deliveries
     }
   end
 

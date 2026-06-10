@@ -61,6 +61,14 @@ defmodule Atp.CLI do
   defp dispatch(["send", "--as", alias, recipient, text]),
     do: send_message(recipient, text, alias)
 
+  defp dispatch(["message", "status", message_id]), do: message_status(message_id, nil)
+
+  defp dispatch(["message", "status", message_id, "--as", alias]),
+    do: message_status(message_id, alias)
+
+  defp dispatch(["message", "status", "--as", alias, message_id]),
+    do: message_status(message_id, alias)
+
   defp dispatch(["inbox"]), do: claim_inbox(nil)
   defp dispatch(["inbox", "--as", alias]), do: claim_inbox(alias)
   defp dispatch(["--as", alias, "inbox"]), do: claim_inbox(alias)
@@ -234,6 +242,18 @@ defmodule Atp.CLI do
     end
   end
 
+  defp message_status(message_id, alias_override) do
+    with {:ok, config, token} <- session_read_context(alias_override),
+         {:ok, body} <-
+           get(
+             config.server_url,
+             "/api/messages/#{message_id}",
+             authorization_headers(token)
+           ) do
+      {:ok, message_status_output(config, body)}
+    end
+  end
+
   defp claim_inbox(alias_override) do
     with {:ok, config, _alias, _metadata, token} <- agent_context(alias_override),
          {:ok, body} <-
@@ -329,7 +349,7 @@ defmodule Atp.CLI do
              config,
              token,
              session_id,
-             MapSet.new(),
+             %{},
              false,
              0,
              watch_max_polls()
@@ -473,6 +493,7 @@ defmodule Atp.CLI do
       atp use <alias>
       atp whoami
       atp send <alias-or-address> "<text>" [--as <alias>]
+      atp message status <message-id> [--as <alias>]
       atp inbox [--as <alias>]
       atp ack <delivery-id> --completed "<text>" [--as <alias>]
       atp session open <alias-or-address> "<text>" [--as <alias>]
@@ -613,6 +634,136 @@ defmodule Atp.CLI do
 
   defp first_delivery_id(_body), do: nil
 
+  defp message_status_output(config, body) do
+    message = Map.get(body, "message", %{})
+
+    [
+      "Message status.",
+      "Message: #{status_field(message["id"])}",
+      "Sender: #{status_address(config, message["from"])}",
+      "Recipient: #{status_address(config, message["to"])}",
+      "Created: #{status_field(message["created_at"])}",
+      "Carrier status: #{status_field(body["carrier_status"])}",
+      "ACK status: #{status_field(body["ack_status"])}",
+      "Terminal: #{status_field(body["terminal_at"])}",
+      "",
+      message_deliveries_output(Map.get(body, "deliveries", []))
+    ]
+    |> Enum.join("\n")
+    |> Kernel.<>("\n")
+  end
+
+  defp message_deliveries_output(deliveries) when is_list(deliveries) do
+    case deliveries do
+      [] ->
+        "Deliveries: none"
+
+      deliveries ->
+        deliveries
+        |> Enum.map(&delivery_status_output/1)
+        |> then(&Enum.join(["Deliveries:" | &1], "\n"))
+    end
+  end
+
+  defp message_deliveries_output(_deliveries), do: "Deliveries: none"
+
+  defp delivery_status_output(delivery) when is_map(delivery) do
+    [
+      "- Delivery: #{status_field(delivery["id"])}",
+      "  Mode: #{status_field(delivery["mode"])}",
+      "  Status: #{status_field(delivery["status"])}",
+      "  Attempt count: #{delivery_attempt_count(delivery)}",
+      "  Claimed: #{status_field(delivery["claimed_at"])}",
+      "  Lease until: #{status_field(delivery["leased_until"])}",
+      "  Next retry: #{status_field(delivery["next_attempt_at"])}",
+      "  Delivered: #{status_field(delivery["delivered_at"])}"
+    ]
+    |> maybe_append_last_error(delivery)
+    |> Kernel.++(webhook_attempt_lines(Map.get(delivery, "attempts", [])))
+    |> Enum.join("\n")
+  end
+
+  defp delivery_status_output(_delivery), do: "- Delivery: -"
+
+  defp delivery_attempt_count(%{"attempt_count" => count, "max_attempts" => max_attempts})
+       when not is_nil(max_attempts) do
+    "#{status_field(count)}/#{status_field(max_attempts)}"
+  end
+
+  defp delivery_attempt_count(%{"attempt_count" => count}), do: status_field(count)
+  defp delivery_attempt_count(_delivery), do: "-"
+
+  defp maybe_append_last_error(lines, %{"last_error" => error}) do
+    case status_error_field(error) do
+      "-" -> lines
+      error -> lines ++ ["  Last error: #{error}"]
+    end
+  end
+
+  defp maybe_append_last_error(lines, _delivery), do: lines
+
+  defp webhook_attempt_lines(attempts) when is_list(attempts) do
+    case attempts do
+      [] ->
+        ["  Webhook attempts: none"]
+
+      attempts ->
+        ["  Webhook attempts:" | Enum.flat_map(attempts, &webhook_attempt_output/1)]
+    end
+  end
+
+  defp webhook_attempt_lines(_attempts), do: ["  Webhook attempts: none"]
+
+  defp webhook_attempt_output(attempt) when is_map(attempt) do
+    [
+      "  - Attempt ##{status_field(attempt["attempt_number"])}: #{status_field(attempt["result"])}",
+      "    Response: #{status_field(attempt["response_status"])}",
+      "    Error: #{status_error_field(attempt["error"])}",
+      "    Retry: #{status_field(attempt["next_attempt_at"])}",
+      "    Created: #{status_field(attempt["created_at"])}"
+    ]
+  end
+
+  defp webhook_attempt_output(_attempt), do: ["  - Attempt #-: -"]
+
+  defp status_address(config, address) when is_binary(address),
+    do: format_address(config, address)
+
+  defp status_address(_config, _address), do: "-"
+
+  defp status_field(nil), do: "-"
+
+  defp status_field(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[\t\r\n]+/, " ")
+    |> String.trim()
+    |> blank_status_field()
+  end
+
+  defp status_field(value), do: value |> to_string() |> status_field()
+
+  defp status_error_field(value) do
+    value
+    |> status_field()
+    |> redact_status_error()
+  end
+
+  defp blank_status_field(""), do: "-"
+  defp blank_status_field(value), do: value
+
+  defp redact_status_error("-"), do: "-"
+
+  defp redact_status_error(value) do
+    if Regex.match?(
+         ~r/(token|secret|signature|authorization|bearer|whsec_|raw body|request body)/i,
+         value
+       ) do
+      "internal_error"
+    else
+      value
+    end
+  end
+
   defp claimed_delivery(%{"delivery" => nil}), do: nil
   defp claimed_delivery(%{"delivery" => delivery}) when is_map(delivery), do: delivery
   defp claimed_delivery(%{"id" => _id} = delivery), do: delivery
@@ -704,8 +855,8 @@ defmodule Atp.CLI do
     session_table_header(widths) <> format_session_rows(config, messages, widths)
   end
 
-  @session_table_default_widths %{seq: 3, time: 4, sender: 6, recipient: 9, status: 6}
-  @session_table_max_widths %{seq: 6, time: 30, sender: 24, recipient: 24, status: 12}
+  @session_table_default_widths %{seq: 3, time: 4, sender: 6, recipient: 9, delivery: 9, ack: 9}
+  @session_table_max_widths %{seq: 6, time: 30, sender: 24, recipient: 24, delivery: 16, ack: 12}
   @session_message_width 120
 
   defp session_table_header(widths) do
@@ -714,7 +865,8 @@ defmodule Atp.CLI do
       pad_table_cell("Time", :time, widths),
       pad_table_cell("Sender", :sender, widths),
       pad_table_cell("Recipient", :recipient, widths),
-      pad_table_cell("Status", :status, widths),
+      pad_table_cell("Delivery", :delivery, widths),
+      pad_table_cell("ACK", :ack, widths),
       "Message"
     ]
     |> Enum.join("  ")
@@ -738,7 +890,8 @@ defmodule Atp.CLI do
         |> widen_table_column(:time, message["created_at"])
         |> widen_table_column(:sender, table_address(config, message["from"]))
         |> widen_table_column(:recipient, table_address(config, message["to"]))
-        |> widen_table_column(:status, transcript_status(message_status))
+        |> widen_table_column(:delivery, transcript_delivery_status(message_status))
+        |> widen_table_column(:ack, transcript_ack_status(message_status))
       end)
     end)
   end
@@ -761,7 +914,8 @@ defmodule Atp.CLI do
         pad_table_cell(message["created_at"], :time, widths),
         pad_table_cell(table_address(config, message["from"]), :sender, widths),
         pad_table_cell(table_address(config, message["to"]), :recipient, widths),
-        pad_table_cell(transcript_status(message_status), :status, widths),
+        pad_table_cell(transcript_delivery_status(message_status), :delivery, widths),
+        pad_table_cell(transcript_ack_status(message_status), :ack, widths),
         first_message_line
       ]
       |> Enum.join("  ")
@@ -833,11 +987,11 @@ defmodule Atp.CLI do
     messages
     |> Enum.reduce({[], seen}, fn message_status, {messages, seen} ->
       key = message_key(message_status)
+      state = transcript_watch_state(message_status)
 
-      if MapSet.member?(seen, key) do
-        {messages, seen}
-      else
-        {[message_status | messages], MapSet.put(seen, key)}
+      case Map.fetch(seen, key) do
+        {:ok, ^state} -> {messages, seen}
+        _new_or_changed -> {[message_status | messages], Map.put(seen, key, state)}
       end
     end)
     |> then(fn {messages, seen} -> {Enum.reverse(messages), seen} end)
@@ -853,16 +1007,45 @@ defmodule Atp.CLI do
 
   defp message_key(message_status) do
     message = Map.get(message_status, "message", %{})
-    message["session_sequence"] || message["id"] || message_status
+
+    case {message["session_sequence"], message["id"]} do
+      {nil, nil} -> message_status
+      key -> key
+    end
   end
 
-  defp transcript_status(%{"ack_status" => status}) when is_binary(status) and status != "",
+  defp transcript_watch_state(message_status) do
+    {transcript_delivery_status(message_status), transcript_ack_status(message_status)}
+  end
+
+  defp transcript_delivery_status(%{"deliveries" => deliveries} = message_status)
+       when is_list(deliveries) do
+    effective_delivery_status(deliveries) || transcript_carrier_status(message_status) || "-"
+  end
+
+  defp transcript_delivery_status(message_status),
+    do: transcript_carrier_status(message_status) || "-"
+
+  defp transcript_carrier_status(%{"carrier_status" => status})
+       when is_binary(status) and status != "",
+       do: status
+
+  defp transcript_carrier_status(_message_status), do: nil
+
+  defp effective_delivery_status(deliveries) do
+    statuses =
+      Enum.flat_map(deliveries, fn
+        %{"status" => status} when is_binary(status) and status != "" -> [status]
+        _delivery -> []
+      end)
+
+    Enum.find(~w(delivered leased retry_scheduled failed), &(&1 in statuses))
+  end
+
+  defp transcript_ack_status(%{"ack_status" => status}) when is_binary(status) and status != "",
     do: status
 
-  defp transcript_status(%{"carrier_status" => status}) when is_binary(status) and status != "",
-    do: status
-
-  defp transcript_status(_message_status), do: "-"
+  defp transcript_ack_status(_message_status), do: "-"
 
   defp table_address(config, address) when is_binary(address) do
     alias_for_address(config, address) || address
@@ -908,7 +1091,7 @@ defmodule Atp.CLI do
   end
 
   defp session_message_indent(widths) do
-    [:seq, :time, :sender, :recipient, :status]
+    [:seq, :time, :sender, :recipient, :delivery, :ack]
     |> Enum.map(&Map.fetch!(widths, &1))
     |> Enum.map_join("  ", &String.duplicate(" ", &1))
     |> Kernel.<>("  ")

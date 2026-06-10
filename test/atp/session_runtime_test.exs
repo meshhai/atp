@@ -648,6 +648,7 @@ defmodule Atp.SessionRuntimeTest do
 
     assert error_code(response) == "message_expired"
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    _registry_state = :sys.get_state(@session_registry)
     assert [] = Registry.lookup(@session_registry, session_id)
 
     persisted_session = Repo.get!(Session, session_id)
@@ -698,6 +699,7 @@ defmodule Atp.SessionRuntimeTest do
 
     assert error_code(response) == "message_expired"
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+    _registry_state = :sys.get_state(@session_registry)
     assert [] = Registry.lookup(@session_registry, session_id)
 
     persisted_session = Repo.get!(Session, session_id)

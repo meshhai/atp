@@ -105,11 +105,13 @@ ack_completed() {
   local recipient_token="$1"
   local delivery_id="$2"
   local idempotency_key="$3"
+  local ack_message_id="$RUN_ID-delivered-ack"
 
   request POST "/api/deliveries/$delivery_id/acks" "$recipient_token" "$idempotency_key" \
     "$(jq -n \
-      --arg message_id "$RUN_ID-delivered-ack" \
-      '{status: "completed", payload: {messageId: $message_id, role: "ROLE_AGENT", parts: [{text: "Webhook received and completed."}]}}')"
+      --arg message_id "$ack_message_id" \
+      --arg context_id "ctx_$ack_message_id" \
+      '{status: "completed", payload: {messageId: $message_id, role: "ROLE_AGENT", contextId: $context_id, parts: [{text: "Webhook received and completed."}]}}')"
 }
 
 fetch_status() {
@@ -222,7 +224,7 @@ print_status_summary <<<"$delivered_status"
 
 delivered_delivery_id="$(jq -r '.deliveries[0].id' <<<"$delivered_status")"
 ack_completed "$recipient_token" "$delivered_delivery_id" "$RUN_ID-ack-delivered" >/dev/null
-acked_status="$(fetch_status "$sender_token" "$delivered_message_id")"
+acked_status="$(wait_for_status "$sender_token" "$delivered_message_id" '.ack_status == "completed"' "completed ACK status")"
 
 echo "Sender-visible status after recipient ACK:"
 print_status_summary <<<"$acked_status"
