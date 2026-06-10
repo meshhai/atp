@@ -13,7 +13,7 @@ defmodule Atp.Transport.DurableLedger do
   and avoid exposing storage-engine mechanics.
   """
 
-  alias Atp.Identity.{Agent, Idempotency}
+  alias Atp.Identity.{Account, Agent, Idempotency}
   alias Atp.Transport.{DeliveryClaim, Message, Session}
   alias Atp.Transport.WebhookDelivery.AttemptResult
 
@@ -200,12 +200,13 @@ defmodule Atp.Transport.DurableLedger do
   @callback opening_session_id_for_delivery(Agent.t(), String.t()) :: String.t() | nil
 
   @doc """
-  Reads a participant-visible message status from the durable carrier ledger.
+  Reads a participant- or account-visible message status from the durable carrier ledger.
 
-  Implementations must allow only the sender or recipient to read the message
-  and must preserve the public message status response shape.
+  Implementations must allow only the sender, recipient, or an account that owns
+  either participant to read the message and must preserve the public message
+  status response shape.
   """
-  @callback get_message_status(Agent.t(), String.t()) :: read_result()
+  @callback get_message_status(Agent.t() | Account.t(), String.t()) :: read_result()
 
   @doc """
   Upserts a recipient-owned sender policy in the durable carrier ledger.
@@ -370,9 +371,13 @@ defmodule Atp.Transport.DurableLedger do
     adapter().opening_session_id_for_delivery(agent, delivery_id)
   end
 
-  @spec get_message_status(Agent.t(), String.t()) :: read_result()
+  @spec get_message_status(Agent.t() | Account.t(), String.t()) :: read_result()
   def get_message_status(%Agent{} = agent, message_id) when is_binary(message_id) do
     adapter().get_message_status(agent, message_id)
+  end
+
+  def get_message_status(%Account{} = account, message_id) when is_binary(message_id) do
+    adapter().get_message_status(account, message_id)
   end
 
   @spec upsert_sender_policy(Agent.t(), String.t(), map(), String.t() | nil, String.t()) ::

@@ -6,7 +6,7 @@ defmodule Atp.Transport.Message do
   import Ecto.Changeset
 
   alias Atp.Identity.{Account, Agent}
-  alias Atp.Transport.Session
+  alias Atp.Transport.{Delivery, Session}
 
   @primary_key {:id, :string, autogenerate: false}
   @foreign_key_type :string
@@ -20,6 +20,7 @@ defmodule Atp.Transport.Message do
     belongs_to(:sender_agent, Agent)
     belongs_to(:recipient_agent, Agent)
     belongs_to(:session, Session)
+    has_many(:deliveries, Delivery)
 
     field(:sender_address, :string)
     field(:recipient_address, :string)
@@ -52,6 +53,7 @@ defmodule Atp.Transport.Message do
           terminal_at: DateTime.t() | nil,
           expires_at: DateTime.t(),
           session_sequence: pos_integer() | nil,
+          deliveries: [Delivery.t()] | Ecto.Association.NotLoaded.t(),
           inserted_at: DateTime.t() | nil
         }
 

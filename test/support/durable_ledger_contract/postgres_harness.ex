@@ -12,7 +12,7 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
   import Ecto.Query
   import Phoenix.ConnTest
 
-  alias Atp.Identity.Agent
+  alias Atp.Identity.{Account, Agent}
   alias Atp.Repo
 
   alias Atp.Transport.{
@@ -322,6 +322,9 @@ defmodule Atp.Support.DurableLedgerContract.PostgresHarness do
 
   @spec get_message!(String.t()) :: Message.t()
   def get_message!(message_id), do: Repo.get!(Message, message_id)
+
+  @spec get_account!(String.t()) :: Account.t()
+  def get_account!(account_id), do: Repo.get!(Account, account_id)
 
   @spec get_messages_for_session!(String.t()) :: [Message.t()]
   def get_messages_for_session!(session_id) do

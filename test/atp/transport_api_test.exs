@@ -87,6 +87,74 @@ defmodule Atp.TransportAPITest do
     assert recipient_status["message"] == sent["message"]
   end
 
+  test "account keys read statuses for messages involving owned agents and hide unrelated messages",
+       %{conn: conn} do
+    sender_account = create_account!(conn, %{"name" => "Status Sender Network"})
+    sender_token = sender_account["account_api_key"]["token"]
+    sender = register_agent!(sender_token, "register-status-sender", %{})
+
+    recipient_account = create_account!(build_conn(), %{"name" => "Status Recipient Network"})
+    recipient_token = recipient_account["account_api_key"]["token"]
+    recipient = register_agent!(recipient_token, "register-status-recipient", %{})
+
+    sent =
+      send_message!(
+        sender["agent_api_key"]["token"],
+        "send-account-visible-message",
+        recipient["address"],
+        a2a_user_text("account-visible-message", "visible to account owners")
+      )
+
+    delivery =
+      claim_inbox!(recipient["agent_api_key"]["token"], "claim-account-visible-message", %{
+        "lease_seconds" => 60
+      })
+
+    message_id = sent["message"]["id"]
+
+    sender_account_status =
+      build_conn()
+      |> authorize(sender_token)
+      |> get("/api/messages/#{message_id}")
+      |> json_response(200)
+
+    assert sender_account_status["message"] == sent["message"]
+    assert sender_account_status["carrier_status"] == "delivered"
+    assert is_nil(sender_account_status["ack_status"])
+
+    assert [%{"id" => delivery_id, "mode" => "polling", "status" => "leased"}] =
+             sender_account_status["deliveries"]
+
+    assert delivery_id == delivery["id"]
+
+    recipient_account_status =
+      build_conn()
+      |> authorize(recipient_token)
+      |> get("/api/messages/#{message_id}")
+      |> json_response(200)
+
+    assert recipient_account_status == sender_account_status
+
+    sender_agent_status =
+      build_conn()
+      |> authorize(sender["agent_api_key"]["token"])
+      |> get("/api/messages/#{message_id}")
+      |> json_response(200)
+
+    assert sender_agent_status == sender_account_status
+
+    unrelated_account = create_account!(build_conn(), %{"name" => "Unrelated Status Network"})
+    unrelated_token = unrelated_account["account_api_key"]["token"]
+
+    unrelated_status =
+      build_conn()
+      |> authorize(unrelated_token)
+      |> get("/api/messages/#{message_id}")
+      |> json_response(404)
+
+    assert error_code(unrelated_status) == "not_found"
+  end
+
   test "active leases hide messages and expired leases allow another claim", %{conn: conn} do
     account = create_account!(conn)
     account_token = account["account_api_key"]["token"]

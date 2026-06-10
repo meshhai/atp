@@ -153,7 +153,8 @@ defmodule Atp.ArchitectureTest do
   test "transport facade routes status reads and sender policy mutation through durable ledger" do
     transport_source = File.read!("lib/atp/transport.ex")
 
-    assert transport_source =~ transport_delegate_pattern(:get_message_status, :DurableLedger)
+    assert transport_source =~ "DurableLedger.get_message_status(agent, message_id)"
+    assert transport_source =~ "DurableLedger.get_message_status(account, message_id)"
     assert transport_source =~ transport_delegate_pattern(:upsert_sender_policy, :DurableLedger)
     refute transport_source =~ transport_delegate_pattern(:get_message_status, :Ledger)
     refute transport_source =~ transport_delegate_pattern(:upsert_sender_policy, :Ledger)

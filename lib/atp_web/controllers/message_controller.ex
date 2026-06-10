@@ -24,7 +24,7 @@ defmodule AtpWeb.MessageController do
 
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    case Transport.get_message_status(conn.assigns.atp_agent, id) do
+    case Transport.get_message_status(conn.assigns.atp_principal, id) do
       {:ok, body} ->
         json(conn, body)
 

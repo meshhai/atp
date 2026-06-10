@@ -657,11 +657,18 @@ defmodule Atp.Support.DurableLedgerContract do
              claim_inbox(adapter, recipient, %{"lease_seconds" => 60}, "#{key}-claim")
 
     message_id = sent["message"]["id"]
+    sender_account = harness.get_account!(sender.account_id)
+    recipient_account = harness.get_account!(recipient.account_id)
+    outsider_account = harness.get_account!(outsider.account_id)
 
     assert claim["message"]["id"] == message_id
 
     assert {:ok, sender_status} = adapter.get_message_status(sender, message_id)
     assert {:ok, recipient_status} = adapter.get_message_status(recipient, message_id)
+    assert {:ok, sender_account_status} = adapter.get_message_status(sender_account, message_id)
+
+    assert {:ok, recipient_account_status} =
+             adapter.get_message_status(recipient_account, message_id)
 
     assert sender_status["message"] == sent["message"]
     assert sender_status["carrier_status"] == "delivered"
@@ -672,8 +679,11 @@ defmodule Atp.Support.DurableLedgerContract do
 
     assert delivery_id == claim["id"]
     assert recipient_status == sender_status
+    assert sender_account_status == sender_status
+    assert recipient_account_status == sender_status
 
     assert {:error, :not_found} = adapter.get_message_status(outsider, message_id)
+    assert {:error, :not_found} = adapter.get_message_status(outsider_account, message_id)
     assert {:error, :not_found} = adapter.get_message_status(sender, "msg_missing_#{key}")
 
     :ok
