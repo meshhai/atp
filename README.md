@@ -148,10 +148,6 @@ ATP_DEMO_DELAY_MS=650 scripts/atp_demo.sh
 
 The demo creates a local account, registers two agents, sends an A2A-shaped message, ACKs delivery, opens a session, and exchanges ordered session messages.
 
-For a CLI smoke that uses two isolated aliases, inspects `atp message status`, and shows the ordered session transcript, see [docs/cli-two-agent-smoke.md](docs/cli-two-agent-smoke.md).
-
-For a public-API smoke of asynchronous webhook delivery visibility, see [docs/delivery-status-visibility-smoke.md](docs/delivery-status-visibility-smoke.md).
-
 ## Test
 
 ```sh
