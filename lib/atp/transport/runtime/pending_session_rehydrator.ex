@@ -46,7 +46,7 @@ defmodule Atp.Transport.Runtime.PendingSessionRehydrator do
 
       {:error, reason} ->
         Logger.warning(
-          "Failed to list pending ATP sessions for runtime rehydration reason=#{inspect(reason)}"
+          "Failed to list pending ATP sessions for runtime rehydration reason_class=#{error_class(reason)}"
         )
 
         schedule_retry(state)
@@ -58,7 +58,7 @@ defmodule Atp.Transport.Runtime.PendingSessionRehydrator do
        when is_function(list_pending_session_ids, 0) do
     {:ok, list_pending_session_ids.()}
   rescue
-    exception -> {:error, Exception.message(exception)}
+    exception -> {:error, {:exception, exception}}
   catch
     kind, reason -> {:error, {kind, reason}}
   end
@@ -76,7 +76,7 @@ defmodule Atp.Transport.Runtime.PendingSessionRehydrator do
 
       {:error, reason} ->
         Logger.warning(
-          "Failed to rehydrate pending ATP session runtime session_id=#{session_id} reason=#{inspect(reason)}"
+          "Failed to rehydrate pending ATP session runtime session_id=#{session_id} reason_class=#{error_class(reason)}"
         )
 
         {:error, reason}
@@ -86,4 +86,10 @@ defmodule Atp.Transport.Runtime.PendingSessionRehydrator do
   defp schedule_retry(%{retry_interval_ms: retry_interval_ms}) do
     Process.send_after(self(), :rehydrate_pending_sessions, retry_interval_ms)
   end
+
+  defp error_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp error_class({:exception, _exception}), do: "exception"
+  defp error_class({kind, _reason}) when kind in [:error, :exit, :throw], do: Atom.to_string(kind)
+  defp error_class({_class, _reason}), do: "internal_error"
+  defp error_class(_reason), do: "internal_error"
 end

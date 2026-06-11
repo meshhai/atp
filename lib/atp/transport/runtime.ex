@@ -226,7 +226,7 @@ defmodule Atp.Transport.Runtime do
 
   defp log_session_warm_failure(session_id, reason) do
     Logger.warning(
-      "Failed to warm accepted ATP session runtime session_id=#{session_id} reason=#{inspect(reason)}"
+      "Failed to warm accepted ATP session runtime session_id=#{session_id} reason_class=#{error_class(reason)}"
     )
   end
 
@@ -250,7 +250,12 @@ defmodule Atp.Transport.Runtime do
 
   defp log_session_start_failure(session_id, reason) do
     Logger.warning(
-      "Failed to start pending ATP session runtime session_id=#{session_id} reason=#{inspect(reason)}"
+      "Failed to start pending ATP session runtime session_id=#{session_id} reason_class=#{error_class(reason)}"
     )
   end
+
+  defp error_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp error_class({kind, _reason}) when kind in [:error, :exit, :throw], do: Atom.to_string(kind)
+  defp error_class({_class, _reason}), do: "internal_error"
+  defp error_class(_reason), do: "internal_error"
 end

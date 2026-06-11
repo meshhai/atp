@@ -171,11 +171,24 @@ defmodule Atp.SessionRuntimeTest do
     def get_session(_agent, _session_id), do: {:error, :unexpected_get_session}
 
     @impl DurableLedger
-    def fetch_open_session(session_id), do: DurableLedger.Postgres.fetch_open_session(session_id)
+    def fetch_open_session(session_id) do
+      config = recording_config()
+
+      case Keyword.fetch(config, :fetch_open_session_result) do
+        {:ok, result} -> result
+        :error -> DurableLedger.Postgres.fetch_open_session(session_id)
+      end
+    end
 
     @impl DurableLedger
-    def fetch_runtime_session(session_id),
-      do: DurableLedger.Postgres.fetch_runtime_session(session_id)
+    def fetch_runtime_session(session_id) do
+      config = recording_config()
+
+      case Keyword.fetch(config, :fetch_runtime_session_result) do
+        {:ok, result} -> result
+        :error -> DurableLedger.Postgres.fetch_runtime_session(session_id)
+      end
+    end
 
     @impl DurableLedger
     def list_pending_session_ids, do: DurableLedger.Postgres.list_pending_session_ids()
@@ -509,6 +522,8 @@ defmodule Atp.SessionRuntimeTest do
 
     Application.put_env(:atp, RecordingSessionSendLedger,
       test_pid: self(),
+      fetch_runtime_session_result:
+        {:error, {:adapter_error, "postgres://secret:password@example.test/atp"}},
       open_result:
         {:ok, 201,
          %{"session" => %{"id" => "ses_runtime_open_warm_failure", "status" => "pending"}}, nil}
@@ -547,6 +562,9 @@ defmodule Atp.SessionRuntimeTest do
       end)
 
     assert log =~ "Failed to start pending ATP session runtime"
+    assert log =~ "reason_class=exit"
+    refute log =~ "postgres://secret"
+    refute log =~ "password@example.test"
 
     assert_received {
       :durable_session_open,
@@ -1015,6 +1033,7 @@ defmodule Atp.SessionRuntimeTest do
       end)
 
     assert log =~ "Failed to warm accepted ATP session runtime"
+    assert log =~ "reason_class=exit"
     assert is_nil(Process.whereis(@session_registry))
     assert is_nil(Process.whereis(@session_supervisor))
 
@@ -1319,23 +1338,127 @@ defmodule Atp.SessionRuntimeTest do
       send(parent, {:pending_rehydrate_attempt, attempt})
 
       if attempt == 1 do
-        raise "temporary pending session list failure"
+        raise "temporary pending session list failure postgres://secret:password@example.test/atp"
       else
         []
       end
     end
 
-    capture_log(fn ->
-      start_supervised!(
-        {PendingSessionRehydrator,
-         session_supervisor: session_supervisor,
-         list_pending_session_ids: list_pending_session_ids,
-         retry_interval_ms: 10}
-      )
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {PendingSessionRehydrator,
+           session_supervisor: session_supervisor,
+           list_pending_session_ids: list_pending_session_ids,
+           retry_interval_ms: 10}
+        )
 
-      assert_receive {:pending_rehydrate_attempt, 1}, 500
-      assert_receive {:pending_rehydrate_attempt, 2}, 500
+        assert_receive {:pending_rehydrate_attempt, 1}, 500
+        assert_receive {:pending_rehydrate_attempt, 2}, 500
+      end)
+
+    assert log =~ "Failed to list pending ATP sessions for runtime rehydration"
+    assert log =~ "reason_class=exception"
+    refute log =~ "postgres://secret"
+    refute log =~ "password@example.test"
+  end
+
+  test "pending session rehydrator sanitizes individual session start failure reasons" do
+    parent = self()
+    session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    attempts = start_supervised!({Elixir.Agent, fn -> 0 end})
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
     end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      fetch_runtime_session_result:
+        {:error, {:adapter_error, "https://recipient.example.test/hook?token=secret-token"}}
+    )
+
+    list_pending_session_ids = fn ->
+      attempt =
+        Elixir.Agent.get_and_update(attempts, fn current_attempt ->
+          next_attempt = current_attempt + 1
+          {next_attempt, next_attempt}
+        end)
+
+      send(parent, {:pending_start_sanitize_attempt, attempt})
+      ["ses_secret_runtime_start_failure"]
+    end
+
+    log =
+      capture_log(fn ->
+        rehydrator =
+          start_supervised!(
+            {PendingSessionRehydrator,
+             session_supervisor: session_supervisor,
+             list_pending_session_ids: list_pending_session_ids,
+             retry_interval_ms: 10}
+          )
+
+        assert_receive {:pending_start_sanitize_attempt, 1}, 500
+        assert_receive {:pending_start_sanitize_attempt, 2}, 500
+        GenServer.stop(rehydrator)
+      end)
+
+    assert log =~ "Failed to rehydrate pending ATP session runtime"
+    assert log =~ "reason_class=internal_error"
+    refute log =~ "recipient.example.test"
+    refute log =~ "secret-token"
+  end
+
+  test "accepted session warm failure logs sanitized reason classes" do
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      fetch_open_session_result:
+        {:error, {:database_url, "postgres://secret:password@example.test/atp"}}
+    )
+
+    recipient = %Agent{
+      id: "agt_runtime_sanitized_warm_recipient",
+      account_id: "acc_runtime_sanitized_warm",
+      address: "atp://agent/agt_runtime_sanitized_warm_recipient",
+      status: "active"
+    }
+
+    log =
+      capture_log(fn ->
+        assert {:ok, 201,
+                %{
+                  "ack" => %{"status" => "accepted"},
+                  "session" => %{"id" => "ses_runtime_sanitized_warm", "status" => "open"}
+                }} =
+                 Runtime.accept_session(
+                   recipient,
+                   "ses_runtime_sanitized_warm",
+                   %{},
+                   "runtime-sanitized-warm",
+                   "POST /api/sessions/ses_runtime_sanitized_warm/accept"
+                 )
+      end)
+
+    assert log =~ "Failed to warm accepted ATP session runtime"
+    assert log =~ "reason_class=internal_error"
+    refute log =~ "postgres://secret"
+    refute log =~ "password@example.test"
   end
 
   test "pending session rehydrator can start with default options" do
