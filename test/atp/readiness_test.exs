@@ -73,14 +73,23 @@ defmodule Atp.ReadinessTest do
   end
 
   test "reports ready when database runtime and enabled dispatcher are available" do
+    attempt_supervisor =
+      :"atp_readiness_attempt_supervisor_#{System.unique_integer([:positive])}"
+
+    start_supervised!({DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one})
+
     dispatcher =
       start_supervised!(
         {WebhookDispatcher,
-         enabled: true, dispatch_on_start?: false, interval_ms: 60_000, name: nil}
+         enabled: true,
+         dispatch_on_start?: false,
+         interval_ms: 60_000,
+         name: nil,
+         attempt_supervisor: attempt_supervisor}
       )
 
     assert Readiness.check(
-             webhook_dispatcher_config: [enabled: true],
+             webhook_dispatcher_config: [enabled: true, attempt_supervisor: attempt_supervisor],
              webhook_dispatcher_server: dispatcher
            ) ==
              %{
@@ -91,6 +100,53 @@ defmodule Atp.ReadinessTest do
                  "webhook_dispatcher" => "ok"
                }
              }
+  end
+
+  test "malformed enabled dispatcher configuration is unavailable" do
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true, dispatch_on_start?: false, interval_ms: 60_000, name: nil}
+      )
+
+    for enabled <- [nil, "false", "true", :enabled, 1] do
+      assert Readiness.check(
+               repo: RecordingRepo,
+               webhook_dispatcher_config: [enabled: enabled],
+               webhook_dispatcher_server: dispatcher
+             ) == %{
+               "status" => "error",
+               "checks" => %{
+                 "database" => "ok",
+                 "transport_runtime" => "ok",
+                 "webhook_dispatcher" => "error"
+               }
+             }
+    end
+  end
+
+  test "enabled webhook dispatcher requires an available attempt supervisor" do
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true, dispatch_on_start?: false, interval_ms: 60_000, name: nil}
+      )
+
+    assert Readiness.check(
+             repo: RecordingRepo,
+             webhook_dispatcher_config: [
+               enabled: true,
+               attempt_supervisor: :missing_readiness_attempt_supervisor
+             ],
+             webhook_dispatcher_server: dispatcher
+           ) == %{
+             "status" => "error",
+             "checks" => %{
+               "database" => "ok",
+               "transport_runtime" => "ok",
+               "webhook_dispatcher" => "error"
+             }
+           }
   end
 
   test "uses configured dispatcher name when no server override is provided" do

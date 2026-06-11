@@ -58,4 +58,41 @@ defmodule Atp.ReadyProbeTest do
     refute public_output =~ "http"
     refute public_output =~ "secret"
   end
+
+  test "GET /ready requires an enabled dispatcher's attempt supervisor", %{conn: conn} do
+    name = :ready_probe_dispatcher_missing_attempt_supervisor
+
+    start_supervised!(
+      {WebhookDispatcher,
+       enabled: true,
+       dispatch_on_start?: false,
+       interval_ms: 60_000,
+       name: name,
+       attempt_supervisor: WebhookDispatcher.AttemptSupervisor}
+    )
+
+    Application.put_env(:atp, WebhookDispatcher,
+      enabled: true,
+      name: name,
+      attempt_supervisor: :missing_ready_probe_attempt_supervisor
+    )
+
+    response =
+      conn
+      |> get("/ready")
+      |> json_response(503)
+
+    assert response == %{
+             "status" => "error",
+             "checks" => %{
+               "database" => "ok",
+               "transport_runtime" => "ok",
+               "webhook_dispatcher" => "error"
+             }
+           }
+
+    public_output = inspect(response)
+    refute public_output =~ "ready_probe_dispatcher_missing_attempt_supervisor"
+    refute public_output =~ "missing_ready_probe_attempt_supervisor"
+  end
 end

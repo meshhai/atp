@@ -14,6 +14,7 @@ defmodule Atp.Readiness do
   @status_ok "ok"
   @status_error "error"
   @status_disabled "disabled"
+  @default_attempt_supervisor WebhookDispatcher.AttemptSupervisor
 
   @database_schema_requirements [
     {"atp_accounts", "accounts", ~w(id name plan inserted_at updated_at)},
@@ -88,16 +89,9 @@ defmodule Atp.Readiness do
   end
 
   defp webhook_dispatcher_status(opts) do
-    config = webhook_dispatcher_config(opts)
-
-    if Keyword.get(config, :enabled, true) == false do
-      @status_disabled
-    else
-      opts
-      |> Keyword.get_lazy(:webhook_dispatcher_server, fn ->
-        Keyword.get(config, :name, WebhookDispatcher)
-      end)
-      |> process_status()
+    case webhook_dispatcher_config(opts) do
+      {:ok, config} -> webhook_dispatcher_status(opts, config)
+      :error -> @status_error
     end
   end
 
@@ -106,16 +100,57 @@ defmodule Atp.Readiness do
     |> Keyword.get_lazy(:webhook_dispatcher_config, fn ->
       Application.get_env(:atp, WebhookDispatcher, [])
     end)
-    |> normalize_keyword()
+    |> normalize_dispatcher_config()
   end
 
-  defp normalize_keyword(config) when is_list(config), do: config
-  defp normalize_keyword(_config), do: []
+  defp normalize_dispatcher_config(config) when is_list(config) do
+    if Keyword.keyword?(config), do: {:ok, config}, else: :error
+  end
+
+  defp normalize_dispatcher_config(_config), do: :error
+
+  defp webhook_dispatcher_status(opts, config) do
+    case dispatcher_enabled?(config) do
+      {:ok, false} -> @status_disabled
+      {:ok, true} -> enabled_webhook_dispatcher_status(opts, config)
+      :error -> @status_error
+    end
+  end
+
+  defp dispatcher_enabled?(config) do
+    case Keyword.fetch(config, :enabled) do
+      {:ok, enabled?} when is_boolean(enabled?) -> {:ok, enabled?}
+      {:ok, _enabled?} -> :error
+      :error -> {:ok, true}
+    end
+  end
+
+  defp enabled_webhook_dispatcher_status(opts, config) do
+    dispatcher_server =
+      Keyword.get_lazy(opts, :webhook_dispatcher_server, fn ->
+        Keyword.get(config, :name, WebhookDispatcher)
+      end)
+
+    attempt_supervisor =
+      Keyword.get_lazy(opts, :webhook_dispatcher_attempt_supervisor, fn ->
+        Keyword.get(config, :attempt_supervisor, @default_attempt_supervisor)
+      end)
+
+    if process_available?(dispatcher_server) and process_available?(attempt_supervisor) do
+      @status_ok
+    else
+      @status_error
+    end
+  end
 
   defp process_status(server) do
+    if process_available?(server), do: @status_ok, else: @status_error
+  end
+
+  defp process_available?(server) do
     case process_for(server) do
-      pid when is_pid(pid) -> @status_ok
-      _not_available -> @status_error
+      pid when is_pid(pid) -> true
+      _not_available -> false
     end
   end
 
