@@ -14,6 +14,7 @@ defmodule AtpWeb do
       HealthController,
       InboxController,
       MessageController,
+      ReadyController,
       SessionController,
       WebhookEndpointController,
       {Plugs, [Authenticate, RequireAccount, RequireAgent]}

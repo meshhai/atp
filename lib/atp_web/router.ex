@@ -23,6 +23,7 @@ defmodule AtpWeb.Router do
     pipe_through(:api)
 
     get("/health", HealthController, :show)
+    get("/ready", ReadyController, :show)
   end
 
   scope "/api", AtpWeb do
