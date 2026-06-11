@@ -808,6 +808,156 @@ defmodule Atp.WebhookDispatcherTest do
     assert Process.alive?(restarted_dispatcher)
   end
 
+  test "stale worker messages from unknown pids are ignored while attempts are in flight" do
+    attempt_supervisor = :atp_stale_message_in_flight_attempt_supervisor_test
+    start_supervised!({DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one})
+
+    claim =
+      delivery_claim!(
+        delivery: %Delivery{
+          id: "dlv_stale_message_in_flight",
+          status: "retry_scheduled",
+          max_attempts: 2
+        },
+        message: %Message{
+          id: "msg_stale_message_in_flight",
+          carrier_status: "queued",
+          expires_at: DateTime.add(DateTime.utc_now(:microsecond), 60, :second)
+        },
+        recipient_agent: %Agent{
+          id: "agt_stale_message_in_flight",
+          account_id: "acct_stale_message_in_flight"
+        }
+      )
+
+    worker = start_existing_attempt_child!(attempt_supervisor, claim, :stale_message_in_flight)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         attempt_supervisor: attempt_supervisor,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    assert %{in_flight: in_flight} = :sys.get_state(dispatcher)
+    assert map_size(in_flight) == 1
+
+    send(dispatcher, {self(), {:ok, :stale_result}})
+    send(dispatcher, {self(), {:task_exit, {:error, :stale_exit}}})
+
+    assert %{in_flight: in_flight_after_stale_messages} = :sys.get_state(dispatcher)
+    assert map_size(in_flight_after_stale_messages) == 1
+    assert Process.alive?(worker)
+
+    send(worker, {:exit_existing_attempt, :normal})
+    assert :ok = GenServer.stop(dispatcher)
+  end
+
+  test "shutdown treats normally stopped re-monitored attempts as complete" do
+    for {tag, exit_signal} <- [
+          normal: :normal,
+          shutdown: :shutdown,
+          shutdown_tuple: {:shutdown, :dispatcher_stopping}
+        ] do
+      attempt_supervisor = :"atp_#{tag}_shutdown_attempt_supervisor_test"
+
+      start_supervised!(
+        {DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one},
+        id: {:shutdown_attempt_supervisor, tag}
+      )
+
+      claim =
+        delivery_claim!(
+          delivery: %Delivery{
+            id: "dlv_#{tag}_shutdown",
+            status: "retry_scheduled",
+            max_attempts: 2
+          },
+          message: %Message{
+            id: "msg_#{tag}_shutdown",
+            carrier_status: "queued",
+            expires_at: DateTime.add(DateTime.utc_now(:microsecond), 60, :second)
+          },
+          recipient_agent: %Agent{
+            id: "agt_#{tag}_shutdown",
+            account_id: "acct_#{tag}_shutdown"
+          }
+        )
+
+      worker = start_existing_attempt_child!(attempt_supervisor, claim, tag)
+
+      dispatcher =
+        start_supervised!(
+          {WebhookDispatcher,
+           enabled: true,
+           dispatch_on_start?: false,
+           attempt_supervisor: attempt_supervisor,
+           shutdown_wait_ms: 500,
+           interval_ms: 60_000,
+           name: nil},
+          id: {:shutdown_dispatcher, tag}
+        )
+
+      assert %{in_flight: in_flight} = :sys.get_state(dispatcher)
+      assert map_size(in_flight) == 1
+
+      stop_task = Task.async(fn -> GenServer.stop(dispatcher, :normal, 1_000) end)
+      send(worker, {:exit_existing_attempt, exit_signal})
+
+      assert :ok = Task.await(stop_task, 1_000)
+      refute_process_alive!(worker)
+      refute_process_alive!(dispatcher)
+    end
+  end
+
+  test "shutdown can skip waiting for re-monitored attempts when configured with zero wait" do
+    attempt_supervisor = :atp_zero_wait_shutdown_attempt_supervisor_test
+    start_supervised!({DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one})
+
+    claim =
+      delivery_claim!(
+        delivery: %Delivery{
+          id: "dlv_zero_wait_shutdown",
+          status: "retry_scheduled",
+          max_attempts: 2
+        },
+        message: %Message{
+          id: "msg_zero_wait_shutdown",
+          carrier_status: "queued",
+          expires_at: DateTime.add(DateTime.utc_now(:microsecond), 60, :second)
+        },
+        recipient_agent: %Agent{
+          id: "agt_zero_wait_shutdown",
+          account_id: "acct_zero_wait_shutdown"
+        }
+      )
+
+    worker = start_existing_attempt_child!(attempt_supervisor, claim, :zero_wait_shutdown)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         attempt_supervisor: attempt_supervisor,
+         shutdown_wait_ms: 0,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    assert %{in_flight: in_flight} = :sys.get_state(dispatcher)
+    assert map_size(in_flight) == 1
+
+    assert :ok = GenServer.stop(dispatcher, :normal, 1_000)
+    assert Process.alive?(worker)
+
+    send(worker, {:exit_existing_attempt, :normal})
+    refute_process_alive!(worker)
+  end
+
   test "externally stopped workers record durable task-exit attempts while dispatcher runs", %{
     conn: conn
   } do
@@ -1335,6 +1485,33 @@ defmodule Atp.WebhookDispatcherTest do
         end),
       attempt_number: Keyword.get(attrs, :attempt_number, 1)
     }
+  end
+
+  defp start_existing_attempt_child!(attempt_supervisor, %DeliveryClaim{} = claim, tag) do
+    test_pid = self()
+
+    child_spec = %{
+      id: {:existing_attempt, tag},
+      start:
+        {Task, :start_link,
+         [
+           fn ->
+             Process.put({WebhookDispatcher, :delivery_claim}, claim)
+             send(test_pid, {:existing_attempt_ready, tag, self()})
+
+             receive do
+               {:exit_existing_attempt, :normal} -> :ok
+               {:exit_existing_attempt, reason} -> exit(reason)
+             end
+           end
+         ]},
+      restart: :temporary
+    }
+
+    assert {:ok, worker} = DynamicSupervisor.start_child(attempt_supervisor, child_spec)
+    assert_receive {:existing_attempt_ready, ^tag, ^worker}, 500
+
+    worker
   end
 
   defp allow_dispatcher(dispatcher) when is_pid(dispatcher) do

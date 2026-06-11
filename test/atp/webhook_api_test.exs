@@ -1182,6 +1182,9 @@ defmodule Atp.WebhookAPITest do
         "/network-error" ->
           Req.Test.transport_error(request_conn, :closed)
 
+        "/bad-alpn" ->
+          Req.Test.transport_error(request_conn, {:bad_alpn_protocol, :http2})
+
         "/bad-request" ->
           Plug.Conn.send_resp(request_conn, 400, "")
       end
@@ -1235,6 +1238,17 @@ defmodule Atp.WebhookAPITest do
       )
 
     assert_retry_scheduled(network_error, nil, "closed", 3)
+
+    bad_alpn =
+      send_after_configuring_webhook!(
+        sender,
+        recipient,
+        "/bad-alpn",
+        "bad-alpn",
+        a2a_user_text("bad-alpn-webhook", "bad ALPN")
+      )
+
+    assert_retry_scheduled(bad_alpn, nil, "bad_alpn_protocol", 3)
 
     bad_request =
       send_after_configuring_webhook!(
