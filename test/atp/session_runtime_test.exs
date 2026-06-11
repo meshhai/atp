@@ -32,8 +32,11 @@ defmodule Atp.SessionRuntimeTest do
     end
 
     @impl DurableLedger
-    def open_session(_initiator, _params, _idempotency_key, _route) do
-      {:error, :unexpected_open_session}
+    def open_session(initiator, params, idempotency_key, route) do
+      config = recording_config()
+      notify_test_pid(config, {:durable_session_open, initiator, params, idempotency_key, route})
+
+      Keyword.get(config, :open_result, {:error, :unexpected_open_session})
     end
 
     @impl DurableLedger
@@ -57,9 +60,12 @@ defmodule Atp.SessionRuntimeTest do
 
     @impl DurableLedger
     def send_session_message(sender, session_id, params, idempotency_key, route) do
-      test_pid =
+      config =
         :atp
         |> Application.fetch_env!(__MODULE__)
+
+      test_pid =
+        config
         |> Keyword.fetch!(:test_pid)
 
       send(test_pid, {
@@ -71,23 +77,29 @@ defmodule Atp.SessionRuntimeTest do
         route
       })
 
-      {:ok, 201,
-       %{
-         "session" => %{"id" => session_id, "last_sequence" => 2},
-         "message_status" => %{
-           "message" => %{"id" => "msg_recorded", "session_id" => session_id}
-         }
-       }, nil}
+      case Keyword.get(config, :send_result) do
+        nil ->
+          {:ok, 201,
+           %{
+             "session" => %{"id" => session_id, "last_sequence" => 2},
+             "message_status" => %{
+               "message" => %{"id" => "msg_recorded", "session_id" => session_id}
+             }
+           }, nil}
+
+        send_result when is_function(send_result, 1) ->
+          send_result.(session_id)
+
+        send_result ->
+          send_result
+      end
     end
 
     @impl DurableLedger
     def accept_session(recipient, session_id, params, idempotency_key, route) do
-      test_pid =
-        :atp
-        |> Application.fetch_env!(__MODULE__)
-        |> Keyword.fetch!(:test_pid)
+      config = recording_config()
 
-      send(test_pid, {
+      notify_test_pid(config, {
         :durable_session_accept,
         recipient,
         session_id,
@@ -96,21 +108,21 @@ defmodule Atp.SessionRuntimeTest do
         route
       })
 
-      {:ok, 201,
-       %{
-         "ack" => %{"status" => "accepted"},
-         "session" => %{"id" => session_id, "status" => "open"}
-       }}
+      Keyword.get(config, :accept_result, {
+        :ok,
+        201,
+        %{
+          "ack" => %{"status" => "accepted"},
+          "session" => %{"id" => session_id, "status" => "open"}
+        }
+      })
     end
 
     @impl DurableLedger
     def reject_session(recipient, session_id, params, idempotency_key, route) do
-      test_pid =
-        :atp
-        |> Application.fetch_env!(__MODULE__)
-        |> Keyword.fetch!(:test_pid)
+      config = recording_config()
 
-      send(test_pid, {
+      notify_test_pid(config, {
         :durable_session_reject,
         recipient,
         session_id,
@@ -119,21 +131,21 @@ defmodule Atp.SessionRuntimeTest do
         route
       })
 
-      {:ok, 201,
-       %{
-         "ack" => %{"status" => "rejected"},
-         "session" => %{"id" => session_id, "status" => "rejected"}
-       }}
+      Keyword.get(config, :reject_result, {
+        :ok,
+        201,
+        %{
+          "ack" => %{"status" => "rejected"},
+          "session" => %{"id" => session_id, "status" => "rejected"}
+        }
+      })
     end
 
     @impl DurableLedger
     def ack_delivery(recipient, delivery_id, params, idempotency_key, route) do
-      test_pid =
-        :atp
-        |> Application.fetch_env!(__MODULE__)
-        |> Keyword.fetch!(:test_pid)
+      config = recording_config()
 
-      send(test_pid, {
+      notify_test_pid(config, {
         :durable_delivery_ack,
         recipient,
         delivery_id,
@@ -142,11 +154,14 @@ defmodule Atp.SessionRuntimeTest do
         route
       })
 
-      {:ok, 201,
-       %{
-         "ack" => %{"status" => params["status"]},
-         "message_status" => %{"ack_status" => params["status"]}
-       }}
+      Keyword.get(config, :ack_result, {
+        :ok,
+        201,
+        %{
+          "ack" => %{"status" => params["status"]},
+          "message_status" => %{"ack_status" => params["status"]}
+        }
+      })
     end
 
     @impl DurableLedger
@@ -156,23 +171,50 @@ defmodule Atp.SessionRuntimeTest do
     def get_session(_agent, _session_id), do: {:error, :unexpected_get_session}
 
     @impl DurableLedger
-    def fetch_open_session(session_id), do: DurableLedger.Postgres.fetch_open_session(session_id)
+    def fetch_open_session(session_id) do
+      config = recording_config()
+
+      case Keyword.fetch(config, :fetch_open_session_result) do
+        {:ok, result} -> result
+        :error -> DurableLedger.Postgres.fetch_open_session(session_id)
+      end
+    end
 
     @impl DurableLedger
-    def fetch_runtime_session(session_id),
-      do: DurableLedger.Postgres.fetch_runtime_session(session_id)
+    def fetch_runtime_session(session_id) do
+      config = recording_config()
+
+      case Keyword.fetch(config, :fetch_runtime_session_result) do
+        {:ok, result} -> result
+        :error -> DurableLedger.Postgres.fetch_runtime_session(session_id)
+      end
+    end
 
     @impl DurableLedger
     def list_pending_session_ids, do: DurableLedger.Postgres.list_pending_session_ids()
 
     @impl DurableLedger
     def expire_pending_opening_session(session_id, now) do
-      DurableLedger.Postgres.expire_pending_opening_session(session_id, now)
+      config = recording_config()
+      notify_test_pid(config, {:durable_pending_expiry, session_id, now})
+
+      Keyword.get_lazy(config, :expire_result, fn ->
+        DurableLedger.Postgres.expire_pending_opening_session(session_id, now)
+      end)
     end
 
     @impl DurableLedger
     def opening_session_id_for_delivery(agent, delivery_id) do
-      DurableLedger.Postgres.opening_session_id_for_delivery(agent, delivery_id)
+      config = recording_config()
+
+      case Keyword.fetch(config, :opening_session_id) do
+        {:ok, session_id} ->
+          notify_test_pid(config, {:durable_opening_session_lookup, agent, delivery_id})
+          session_id
+
+        :error ->
+          DurableLedger.Postgres.opening_session_id_for_delivery(agent, delivery_id)
+      end
     end
 
     @impl DurableLedger
@@ -204,6 +246,17 @@ defmodule Atp.SessionRuntimeTest do
     @impl DurableLedger
     def terminalize_claimed_webhook_delivery(_claim, _reason, _opts) do
       {:error, :unexpected_terminalize}
+    end
+
+    defp recording_config do
+      Application.get_env(:atp, __MODULE__, [])
+    end
+
+    defp notify_test_pid(config, message) do
+      case Keyword.get(config, :test_pid) do
+        test_pid when is_pid(test_pid) -> send(test_pid, message)
+        _other -> :ok
+      end
     end
   end
 
@@ -453,6 +506,73 @@ defmodule Atp.SessionRuntimeTest do
 
     assert DateTime.compare(deadline_at, opening_message.expires_at) == :eq
     assert is_reference(timer_ref)
+  end
+
+  test "public open preserves durable success when pending runtime warmup fails" do
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+      ensure_runtime_supervisor_running()
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      fetch_runtime_session_result:
+        {:error, {:adapter_error, "postgres://secret:password@example.test/atp"}},
+      open_result:
+        {:ok, 201,
+         %{"session" => %{"id" => "ses_runtime_open_warm_failure", "status" => "pending"}}, nil}
+    )
+
+    ensure_runtime_supervisor_running()
+    :ok = Supervisor.terminate_child(Atp.Supervisor, Atp.Transport.Runtime.Supervisor)
+    assert is_nil(Process.whereis(@session_registry))
+    assert is_nil(Process.whereis(@session_supervisor))
+
+    initiator = %Agent{
+      id: "agt_runtime_open_warm_failure",
+      account_id: "acc_runtime_open_warm_failure",
+      address: "atp://agent/agt_runtime_open_warm_failure",
+      status: "active"
+    }
+
+    log =
+      capture_log(fn ->
+        assert {:ok, 201,
+                %{
+                  "session" => %{
+                    "id" => "ses_runtime_open_warm_failure",
+                    "status" => "pending"
+                  }
+                }} =
+                 Runtime.open_session(
+                   initiator,
+                   %{
+                     "to" => "atp://agent/agt_runtime_open_warm_failure_recipient",
+                     "payload" => a2a_user_text("runtime-open-warm-failure", "pending")
+                   },
+                   "runtime-open-warm-failure",
+                   "POST /api/sessions"
+                 )
+      end)
+
+    assert log =~ "Failed to start pending ATP session runtime"
+    assert log =~ "reason_class=exit"
+    refute log =~ "postgres://secret"
+    refute log =~ "password@example.test"
+
+    assert_received {
+      :durable_session_open,
+      ^initiator,
+      _params,
+      "runtime-open-warm-failure",
+      "POST /api/sessions"
+    }
   end
 
   test "pending opening expiry timer persists terminal state and stops the process", %{
@@ -913,6 +1033,7 @@ defmodule Atp.SessionRuntimeTest do
       end)
 
     assert log =~ "Failed to warm accepted ATP session runtime"
+    assert log =~ "reason_class=exit"
     assert is_nil(Process.whereis(@session_registry))
     assert is_nil(Process.whereis(@session_supervisor))
 
@@ -1217,7 +1338,152 @@ defmodule Atp.SessionRuntimeTest do
       send(parent, {:pending_rehydrate_attempt, attempt})
 
       if attempt == 1 do
-        raise "temporary pending session list failure"
+        raise "temporary pending session list failure postgres://secret:password@example.test/atp"
+      else
+        []
+      end
+    end
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {PendingSessionRehydrator,
+           session_supervisor: session_supervisor,
+           list_pending_session_ids: list_pending_session_ids,
+           retry_interval_ms: 10}
+        )
+
+        assert_receive {:pending_rehydrate_attempt, 1}, 500
+        assert_receive {:pending_rehydrate_attempt, 2}, 500
+      end)
+
+    assert log =~ "Failed to list pending ATP sessions for runtime rehydration"
+    assert log =~ "reason_class=exception"
+    refute log =~ "postgres://secret"
+    refute log =~ "password@example.test"
+  end
+
+  test "pending session rehydrator sanitizes individual session start failure reasons" do
+    parent = self()
+    session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    attempts = start_supervised!({Elixir.Agent, fn -> 0 end})
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      fetch_runtime_session_result:
+        {:error, {:adapter_error, "https://recipient.example.test/hook?token=secret-token"}}
+    )
+
+    list_pending_session_ids = fn ->
+      attempt =
+        Elixir.Agent.get_and_update(attempts, fn current_attempt ->
+          next_attempt = current_attempt + 1
+          {next_attempt, next_attempt}
+        end)
+
+      send(parent, {:pending_start_sanitize_attempt, attempt})
+      ["ses_secret_runtime_start_failure"]
+    end
+
+    log =
+      capture_log(fn ->
+        rehydrator =
+          start_supervised!(
+            {PendingSessionRehydrator,
+             session_supervisor: session_supervisor,
+             list_pending_session_ids: list_pending_session_ids,
+             retry_interval_ms: 10}
+          )
+
+        assert_receive {:pending_start_sanitize_attempt, 1}, 500
+        assert_receive {:pending_start_sanitize_attempt, 2}, 500
+        GenServer.stop(rehydrator)
+      end)
+
+    assert log =~ "Failed to rehydrate pending ATP session runtime"
+    assert log =~ "reason_class=internal_error"
+    refute log =~ "recipient.example.test"
+    refute log =~ "secret-token"
+  end
+
+  test "accepted session warm failure logs sanitized reason classes" do
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      fetch_open_session_result:
+        {:error, {:database_url, "postgres://secret:password@example.test/atp"}}
+    )
+
+    recipient = %Agent{
+      id: "agt_runtime_sanitized_warm_recipient",
+      account_id: "acc_runtime_sanitized_warm",
+      address: "atp://agent/agt_runtime_sanitized_warm_recipient",
+      status: "active"
+    }
+
+    log =
+      capture_log(fn ->
+        assert {:ok, 201,
+                %{
+                  "ack" => %{"status" => "accepted"},
+                  "session" => %{"id" => "ses_runtime_sanitized_warm", "status" => "open"}
+                }} =
+                 Runtime.accept_session(
+                   recipient,
+                   "ses_runtime_sanitized_warm",
+                   %{},
+                   "runtime-sanitized-warm",
+                   "POST /api/sessions/ses_runtime_sanitized_warm/accept"
+                 )
+      end)
+
+    assert log =~ "Failed to warm accepted ATP session runtime"
+    assert log =~ "reason_class=internal_error"
+    refute log =~ "postgres://secret"
+    refute log =~ "password@example.test"
+  end
+
+  test "pending session rehydrator can start with default options" do
+    assert {:ok, rehydrator} = PendingSessionRehydrator.start_link()
+
+    assert Process.alive?(rehydrator)
+    GenServer.stop(rehydrator)
+  end
+
+  test "pending session rehydrator retries after thrown pending-list failures" do
+    parent = self()
+    session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    attempts = start_supervised!({Elixir.Agent, fn -> 0 end})
+
+    list_pending_session_ids = fn ->
+      attempt =
+        Elixir.Agent.get_and_update(attempts, fn current_attempt ->
+          next_attempt = current_attempt + 1
+          {next_attempt, next_attempt}
+        end)
+
+      send(parent, {:pending_rehydrate_throw_attempt, attempt})
+
+      if attempt == 1 do
+        throw({:temporary_pending_session_list_failure, "internal"})
       else
         []
       end
@@ -1231,9 +1497,47 @@ defmodule Atp.SessionRuntimeTest do
          retry_interval_ms: 10}
       )
 
-      assert_receive {:pending_rehydrate_attempt, 1}, 500
-      assert_receive {:pending_rehydrate_attempt, 2}, 500
+      assert_receive {:pending_rehydrate_throw_attempt, 1}, 500
+      assert_receive {:pending_rehydrate_throw_attempt, 2}, 500
     end)
+  end
+
+  test "pending session rehydrator treats already-started sessions as ready", %{conn: conn} do
+    pending_session =
+      open_pending_session_without_runtime_context!(conn, "runtime-rehydrate-already-started")
+
+    session_id = pending_session["id"]
+    on_exit(fn -> stop_session_server(session_id) end)
+
+    pid = start_supervised!({SessionServer, session_id})
+    assert Process.alive?(pid)
+
+    parent = self()
+    session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    attempts = start_supervised!({Elixir.Agent, fn -> 0 end})
+
+    list_pending_session_ids = fn ->
+      attempt =
+        Elixir.Agent.get_and_update(attempts, fn current_attempt ->
+          next_attempt = current_attempt + 1
+          {next_attempt, next_attempt}
+        end)
+
+      send(parent, {:pending_rehydrate_already_started_attempt, attempt})
+      [session_id]
+    end
+
+    rehydrator =
+      start_supervised!(
+        {PendingSessionRehydrator,
+         session_supervisor: session_supervisor,
+         list_pending_session_ids: list_pending_session_ids,
+         retry_interval_ms: 10}
+      )
+
+    assert_receive {:pending_rehydrate_already_started_attempt, 1}, 500
+    refute_receive {:pending_rehydrate_already_started_attempt, 2}, 50
+    GenServer.stop(rehydrator)
   end
 
   test "pending session rehydrator retries after individual session start failures" do
@@ -1745,6 +2049,280 @@ defmodule Atp.SessionRuntimeTest do
     assert :sys.get_state(pid) == before_state
   end
 
+  test "session server keeps runtime state when refresh fails", %{conn: conn} do
+    %{session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-refresh-error")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    before_state = :sys.get_state(pid)
+
+    session_id
+    |> then(&Repo.get!(Session, &1))
+    |> Ecto.Changeset.change(
+      status: "failed",
+      terminal_at: DateTime.utc_now(:microsecond)
+    )
+    |> Repo.update!()
+
+    assert {:error, :session_not_active} = SessionServer.refresh_session(pid)
+    assert :sys.get_state(pid) == before_state
+  end
+
+  test "session server rejects unknown webhook dispatch tickets without changing state", %{
+    conn: conn
+  } do
+    %{session: session} =
+      open_accepted_session_without_runtime_context!(
+        conn,
+        "runtime-server-unknown-dispatch-ticket"
+      )
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    before_state = :sys.get_state(pid)
+
+    assert {:error, :webhook_dispatch_ticket_not_found} =
+             GenServer.call(pid, {:await_webhook_dispatch_turn, make_ref()}, :infinity)
+
+    assert :sys.get_state(pid) == before_state
+  end
+
+  test "session server ignores wrong release tokens and stale dispatch monitor messages", %{
+    conn: conn
+  } do
+    %{initiator: initiator, session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-stale-dispatch")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      send_result: fn session_id ->
+        {:ok, 201,
+         %{
+           "session" => %{"id" => session_id, "last_sequence" => 2},
+           "message_status" => %{
+             "message" => %{"id" => "msg_ordered", "session_id" => session_id}
+           }
+         }, %{commit_value: {session_id, "del_ordered_dispatch"}}}
+      end
+    )
+
+    sender = Repo.get!(Agent, initiator["id"])
+    params = %{"payload" => a2a_user_text("runtime-server-stale-dispatch", "ordered")}
+    route = "POST /api/sessions/#{session_id}/messages"
+
+    assert {:ok, 201, _body, %{commit_value: {^session_id, "del_ordered_dispatch"}}, ticket} =
+             GenServer.call(
+               pid,
+               {:send_session_message, sender, params, "runtime-server-stale-dispatch-send",
+                route},
+               :infinity
+             )
+
+    assert is_reference(ticket)
+
+    assert_received {
+      :durable_session_send,
+      ^sender,
+      ^session_id,
+      ^params,
+      "runtime-server-stale-dispatch-send",
+      ^route
+    }
+
+    assert {:ok, release_token} =
+             GenServer.call(pid, {:await_webhook_dispatch_turn, ticket}, :infinity)
+
+    assert %SessionState{
+             webhook_dispatch_owner: {^ticket, ^release_token},
+             webhook_dispatch_ticket_monitors: %{^ticket => monitor_ref}
+           } = :sys.get_state(pid)
+
+    wrong_release_token = make_ref()
+    GenServer.cast(pid, {:release_webhook_dispatch_turn, ticket, wrong_release_token})
+
+    assert %SessionState{webhook_dispatch_owner: {^ticket, ^release_token}} =
+             :sys.get_state(pid)
+
+    GenServer.cast(pid, {:release_webhook_dispatch_turn, ticket, release_token})
+
+    assert %SessionState{
+             webhook_dispatch_owner: nil,
+             webhook_dispatch_ticket_monitors: ticket_monitors,
+             webhook_dispatch_monitor_tickets: monitor_tickets
+           } = state_after_release = :sys.get_state(pid)
+
+    refute Map.has_key?(ticket_monitors, ticket)
+    refute Map.has_key?(monitor_tickets, monitor_ref)
+
+    send(pid, {:DOWN, monitor_ref, :process, self(), :normal})
+    assert {:ok, _summary} = SessionServer.summary(pid)
+    assert :sys.get_state(pid) == state_after_release
+  end
+
+  test "session server advances waiting webhook dispatchers past stale queued tickets", %{
+    conn: conn
+  } do
+    %{session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-stale-queued-ticket")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    stale_ticket = make_ref()
+    valid_ticket = make_ref()
+    valid_monitor_ref = make_ref()
+
+    :sys.replace_state(pid, fn %SessionState{} = state ->
+      %SessionState{
+        state
+        | webhook_dispatch_queue: :queue.from_list([stale_ticket, valid_ticket]),
+          webhook_dispatch_ticket_monitors: %{valid_ticket => valid_monitor_ref},
+          webhook_dispatch_monitor_tickets: %{valid_monitor_ref => valid_ticket}
+      }
+    end)
+
+    waiter =
+      Task.async(fn ->
+        GenServer.call(pid, {:await_webhook_dispatch_turn, valid_ticket}, :infinity)
+      end)
+
+    assert {:ok, release_token} = Task.await(waiter, 500)
+
+    assert %SessionState{
+             webhook_dispatch_owner: {^valid_ticket, ^release_token},
+             webhook_dispatch_queue: queue,
+             webhook_dispatch_waiters: waiters
+           } = :sys.get_state(pid)
+
+    assert :queue.is_empty(queue)
+    assert waiters == %{}
+
+    GenServer.cast(pid, {:release_webhook_dispatch_turn, valid_ticket, release_token})
+
+    assert %SessionState{webhook_dispatch_owner: nil} = :sys.get_state(pid)
+  end
+
+  test "session server removes queued webhook dispatch tickets when callers die", %{
+    conn: conn
+  } do
+    %{session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-dead-dispatch-caller")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    removed_ticket = make_ref()
+    remaining_ticket = make_ref()
+    removed_monitor_ref = make_ref()
+    remaining_monitor_ref = make_ref()
+    owner_ticket = make_ref()
+    owner_token = make_ref()
+
+    :sys.replace_state(pid, fn %SessionState{} = state ->
+      %SessionState{
+        state
+        | webhook_dispatch_owner: {owner_ticket, owner_token},
+          webhook_dispatch_queue: :queue.from_list([removed_ticket, remaining_ticket]),
+          webhook_dispatch_ticket_monitors: %{
+            removed_ticket => removed_monitor_ref,
+            remaining_ticket => remaining_monitor_ref
+          },
+          webhook_dispatch_monitor_tickets: %{
+            removed_monitor_ref => removed_ticket,
+            remaining_monitor_ref => remaining_ticket
+          }
+      }
+    end)
+
+    send(pid, {:DOWN, removed_monitor_ref, :process, self(), :shutdown})
+
+    assert %SessionState{
+             webhook_dispatch_owner: {^owner_ticket, ^owner_token},
+             webhook_dispatch_queue: queue,
+             webhook_dispatch_ticket_monitors: ticket_monitors,
+             webhook_dispatch_monitor_tickets: monitor_tickets
+           } = :sys.get_state(pid)
+
+    assert :queue.to_list(queue) == [remaining_ticket]
+    refute Map.has_key?(ticket_monitors, removed_ticket)
+    assert Map.fetch!(ticket_monitors, remaining_ticket) == remaining_monitor_ref
+    refute Map.has_key?(monitor_tickets, removed_monitor_ref)
+    assert Map.fetch!(monitor_tickets, remaining_monitor_ref) == remaining_ticket
+  end
+
+  test "pending opening expiry no-ops keep live processes healthy", %{conn: conn} do
+    pending_session =
+      open_pending_session_without_runtime_context!(conn, "runtime-pending-expiry-noop")
+
+    pending_pid = start_supervised!({SessionServer, pending_session["id"]})
+    before_pending_state = :sys.get_state(pending_pid)
+
+    send(pending_pid, :expire_pending_opening_session)
+    assert {:ok, pending_summary} = SessionServer.summary(pending_pid)
+    assert pending_summary.session_status == "pending"
+
+    assert %SessionState{
+             status: "pending",
+             lifecycle_deadline_at: pending_deadline_at,
+             lifecycle_timer_ref: pending_timer_ref
+           } = :sys.get_state(pending_pid)
+
+    assert DateTime.compare(pending_deadline_at, before_pending_state.lifecycle_deadline_at) ==
+             :eq
+
+    assert is_reference(pending_timer_ref)
+
+    %{session: accepted_session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-open-expiry-noop")
+
+    accepted_pid = start_supervised!({SessionServer, accepted_session["id"]})
+    before_accepted_state = :sys.get_state(accepted_pid)
+
+    send(accepted_pid, :expire_pending_opening_session)
+    assert {:ok, accepted_summary} = SessionServer.summary(accepted_pid)
+    assert accepted_summary.session_status == "open"
+    assert :sys.get_state(accepted_pid) == before_accepted_state
+  end
+
+  test "pending opening expiry stops the process on durable hard failures", %{conn: conn} do
+    pending_session =
+      open_pending_session_without_runtime_context!(conn, "runtime-pending-expiry-hard-failure")
+
+    pending_pid = start_supervised!({SessionServer, pending_session["id"]})
+    pending_ref = Process.monitor(pending_pid)
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      expire_result: {:error, :not_found}
+    )
+
+    send(pending_pid, :expire_pending_opening_session)
+
+    assert_receive {:durable_pending_expiry, session_id, %DateTime{}}, 500
+    assert session_id == pending_session["id"]
+    assert_receive {:DOWN, ^pending_ref, :process, ^pending_pid, :normal}, 5_000
+  end
+
   test "session server persists sends through the durable ledger", %{conn: conn} do
     %{initiator: initiator, session: session} =
       open_accepted_session_without_runtime_context!(conn, "runtime-server-durable-ledger")
@@ -1964,6 +2542,99 @@ defmodule Atp.SessionRuntimeTest do
       "runtime-delivery-ack",
       ^route
     }
+  end
+
+  test "runtime stops pending processes after terminal lifecycle errors", %{conn: conn} do
+    accept_context =
+      open_pending_session_context_without_runtime!(conn, "runtime-terminal-accept-error")
+
+    reject_context =
+      open_pending_session_context_without_runtime!(conn, "runtime-terminal-reject-error")
+
+    accept_session_id = accept_context.session["id"]
+    reject_session_id = reject_context.session["id"]
+    accept_pid = start_supervised!({SessionServer, accept_session_id})
+    reject_pid = start_supervised!({SessionServer, reject_session_id})
+    accept_ref = Process.monitor(accept_pid)
+    reject_ref = Process.monitor(reject_pid)
+
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      accept_result: {:error, :message_expired},
+      reject_result: {:error, :message_expired}
+    )
+
+    accept_recipient = Repo.get!(Agent, accept_context.recipient["id"])
+
+    assert {:error, :message_expired} =
+             Runtime.accept_session(
+               accept_recipient,
+               accept_session_id,
+               %{},
+               "runtime-terminal-accept-error",
+               "POST /api/sessions/#{accept_session_id}/accept"
+             )
+
+    assert_receive {:DOWN, ^accept_ref, :process, ^accept_pid, :normal}, 5_000
+
+    reject_recipient = Repo.get!(Agent, reject_context.recipient["id"])
+
+    assert {:error, :message_expired} =
+             Runtime.reject_session(
+               reject_recipient,
+               reject_session_id,
+               %{},
+               "runtime-terminal-reject-error",
+               "POST /api/sessions/#{reject_session_id}/reject"
+             )
+
+    assert_receive {:DOWN, ^reject_ref, :process, ^reject_pid, :normal}, 5_000
+  end
+
+  test "runtime leaves pending process alive after non-terminal reject errors", %{conn: conn} do
+    context =
+      open_pending_session_context_without_runtime!(conn, "runtime-nonterminal-reject-error")
+
+    session_id = context.session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      reject_result: {:error, :not_found}
+    )
+
+    recipient = Repo.get!(Agent, context.recipient["id"])
+
+    assert {:error, :not_found} =
+             Runtime.reject_session(
+               recipient,
+               session_id,
+               %{},
+               "runtime-nonterminal-reject-error",
+               "POST /api/sessions/#{session_id}/reject"
+             )
+
+    assert Process.alive?(pid)
+    assert [{^pid, _metadata}] = Registry.lookup(@session_registry, session_id)
   end
 
   test "durable session sends reject non-open sessions", %{conn: conn} do

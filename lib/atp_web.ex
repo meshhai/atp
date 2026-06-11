@@ -11,8 +11,10 @@ defmodule AtpWeb do
       AccountController,
       AgentController,
       DeliveryController,
+      HealthController,
       InboxController,
       MessageController,
+      ReadyController,
       SessionController,
       WebhookEndpointController,
       {Plugs, [Authenticate, RequireAccount, RequireAgent]}

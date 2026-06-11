@@ -19,6 +19,13 @@ defmodule AtpWeb.Router do
     plug(AtpWeb.Plugs.Authenticate)
   end
 
+  scope "/", AtpWeb do
+    pipe_through(:api)
+
+    get("/health", HealthController, :show)
+    get("/ready", ReadyController, :show)
+  end
+
   scope "/api", AtpWeb do
     pipe_through(:api)
 
