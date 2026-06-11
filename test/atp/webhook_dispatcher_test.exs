@@ -4,8 +4,20 @@ defmodule Atp.WebhookDispatcherTest do
   import Ecto.Query
   import ExUnit.CaptureLog
 
+  alias Atp.Identity.Agent
   alias Atp.Repo
-  alias Atp.Transport.{Delivery, Message, WebhookAttempt, WebhookDelivery, WebhookDispatcher}
+
+  alias Atp.Transport.{
+    Delivery,
+    DeliveryClaim,
+    DurableLedger,
+    Message,
+    WebhookAttempt,
+    WebhookDelivery,
+    WebhookDispatcher
+  }
+
+  alias Atp.Transport.WebhookDispatcher.AttemptWorker
   alias Ecto.Adapters.SQL.Sandbox
 
   @dispatcher_scan_event [:atp, :transport, :webhook_dispatcher, :scan]
@@ -14,18 +26,293 @@ defmodule Atp.WebhookDispatcherTest do
   @dispatcher_attempt_finish_event [:atp, :transport, :webhook_dispatcher, :attempt, :finish]
   @dispatcher_task_exit_event [:atp, :transport, :webhook_dispatcher, :attempt, :exit]
 
+  defmodule ClaimErrorLedger do
+    def claim_due_webhook_delivery(_opts), do: {:error, :ledger_unavailable}
+  end
+
+  defmodule FailingTaskExitLedger do
+    def terminalize_claimed_webhook_delivery(%DeliveryClaim{}, :message_acked, _opts) do
+      raise "leaked terminalization failure"
+    end
+
+    def finish_claimed_webhook_delivery(
+          %DeliveryClaim{},
+          %WebhookDelivery.AttemptResult{},
+          _opts
+        ) do
+      throw({:leaked_task_exit_failure, "recipient.example.test", "whsec_secret"})
+    end
+  end
+
   setup do
     old_config = Application.get_env(:atp, WebhookDispatcher)
+    old_ledger_config = Application.get_env(:atp, DurableLedger)
 
     on_exit(fn ->
-      if is_nil(old_config) do
-        Application.delete_env(:atp, WebhookDispatcher)
-      else
-        Application.put_env(:atp, WebhookDispatcher, old_config)
-      end
+      restore_application_env(WebhookDispatcher, old_config)
+      restore_application_env(DurableLedger, old_ledger_config)
     end)
 
     :ok
+  end
+
+  test "disabled webhook dispatcher does not scan claim or dispatch due work", %{conn: conn} do
+    test_pid = self()
+    attach_dispatcher_telemetry!(test_pid)
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      send(test_pid, {:disabled_dispatcher_webhook_request, headers["atp-delivery-id"]})
+      Plug.Conn.send_resp(request_conn, 204, "")
+    end)
+
+    [delivery_id] = create_due_webhook_deliveries!(conn, 1, "disabled-dispatcher")
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: false, dispatch_on_start?: true, batch_size: 1, interval_ms: 10, name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+    send(dispatcher, :dispatch_due)
+    assert :ok = WebhookDispatcher.wakeup(dispatcher)
+
+    refute_receive {:webhook_dispatcher_telemetry, _event, _measurements, _metadata}, 100
+    refute_receive {:disabled_dispatcher_webhook_request, ^delivery_id}, 100
+
+    assert %{status: "retry_scheduled", claim_token: nil, leased_until: nil} =
+             Map.fetch!(delivery_records([delivery_id]), delivery_id)
+
+    assert %{enabled?: false, timer_ref: nil, pending_dispatches: 0, in_flight: in_flight} =
+             :sys.get_state(dispatcher)
+
+    assert map_size(in_flight) == 0
+  end
+
+  test "wakeup is a safe no-op for nil and unavailable dispatchers" do
+    assert :ok = WebhookDispatcher.wakeup(nil)
+    assert :ok = WebhookDispatcher.wakeup(:atp_missing_wakeup_dispatcher_test)
+
+    name = :atp_dead_wakeup_dispatcher_test
+    dispatcher = start_supervised!({WebhookDispatcher, enabled: false, name: name})
+
+    assert :ok = GenServer.stop(dispatcher)
+    refute_process_alive!(dispatcher)
+    assert :ok = WebhookDispatcher.wakeup(name)
+  end
+
+  test "invalid numeric options fall back to safe defaults" do
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 0,
+         interval_ms: "soon",
+         max_in_flight: -1,
+         shutdown_wait_ms: -10,
+         name: nil}
+      )
+
+    assert %{
+             batch_size: 50,
+             interval_ms: 5_000,
+             max_in_flight: 10,
+             shutdown_wait_ms: 1_000
+           } = :sys.get_state(dispatcher)
+  end
+
+  test "dispatch_on_start schedules an immediate deterministic scan" do
+    test_pid = self()
+    attach_dispatcher_telemetry!(test_pid)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: true,
+         batch_size: 1,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_scan_event, scan_measurements,
+                    %{trigger: :timer, batch_size: 1} = scan_metadata},
+                   500
+
+    assert scan_measurements.in_flight == 0
+    assert_safe_telemetry!(scan_measurements, scan_metadata)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_claim_event, claim_measurements,
+                    %{result: :empty} = claim_metadata},
+                   500
+
+    assert claim_measurements.in_flight == 0
+    assert_safe_telemetry!(claim_measurements, claim_metadata)
+  end
+
+  test "claim errors clear pending dispatches and leave dispatcher alive" do
+    test_pid = self()
+    attach_dispatcher_telemetry!(test_pid)
+    Application.put_env(:atp, DurableLedger, adapter: ClaimErrorLedger)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 5,
+         max_in_flight: 2,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    send(dispatcher, :dispatch_due)
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_scan_event, _measurements,
+                    %{trigger: :timer}},
+                   500
+
+    assert_receive {:webhook_dispatcher_telemetry, @dispatcher_claim_event, claim_measurements,
+                    %{result: :error, error_class: "ledger_unavailable"} = claim_metadata},
+                   500
+
+    assert claim_measurements.pending_dispatches == 5
+    assert_safe_telemetry!(claim_measurements, claim_metadata)
+
+    assert %{pending_dispatches: 0, in_flight: in_flight} = :sys.get_state(dispatcher)
+    assert map_size(in_flight) == 0
+    assert Process.alive?(dispatcher)
+  end
+
+  test "stale worker result and monitor messages are ignored safely" do
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true, dispatch_on_start?: false, interval_ms: 60_000, name: nil}
+      )
+
+    send(dispatcher, {self(), {:ok, :stale_result}})
+    send(dispatcher, {self(), {:task_exit, {:error, :stale_exit}}})
+    send(dispatcher, {:DOWN, make_ref(), :process, self(), :killed})
+
+    assert_dispatcher_idle!(dispatcher)
+    assert Process.alive?(dispatcher)
+  end
+
+  test "attempt worker claim helper ignores processes without delivery claims" do
+    claim_key = {WebhookDispatcher, :delivery_claim}
+
+    Process.put(claim_key, :not_a_delivery_claim)
+
+    try do
+      assert is_nil(AttemptWorker.claim(self()))
+    after
+      Process.delete(claim_key)
+    end
+  end
+
+  test "dispatcher restart ignores existing supervisor children without delivery claims" do
+    attempt_supervisor = :atp_non_claim_attempt_supervisor_test
+
+    start_supervised!({DynamicSupervisor, name: attempt_supervisor, strategy: :one_for_one})
+
+    {:ok, non_claim_child} =
+      DynamicSupervisor.start_child(
+        attempt_supervisor,
+        {Task,
+         fn ->
+           receive do
+             :stop_non_claim_child -> :ok
+           end
+         end}
+      )
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         attempt_supervisor: attempt_supervisor,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    assert %{in_flight: in_flight} = :sys.get_state(dispatcher)
+    assert map_size(in_flight) == 0
+    assert Process.alive?(dispatcher)
+
+    send(non_claim_child, :stop_non_claim_child)
+  end
+
+  test "caught delivery failures record sanitized task-exit attempts", %{conn: conn} do
+    test_pid = self()
+    [delivery_id] = create_due_webhook_deliveries!(conn, 1, "throw-dispatcher")
+
+    Req.Test.stub(WebhookDelivery, fn request_conn ->
+      headers = Map.new(request_conn.req_headers)
+      send(test_pid, {:throwing_webhook_started, headers["atp-delivery-id"]})
+      throw({:leaked_throw, "https://recipient.example.test/atp/webhook", "whsec_secret"})
+    end)
+
+    dispatcher =
+      start_supervised!(
+        {WebhookDispatcher,
+         enabled: true,
+         dispatch_on_start?: false,
+         batch_size: 1,
+         max_in_flight: 1,
+         interval_ms: 60_000,
+         name: nil}
+      )
+
+    allow_dispatcher(dispatcher)
+
+    log =
+      capture_log(fn ->
+        send(dispatcher, :dispatch_due)
+        assert_receive {:throwing_webhook_started, ^delivery_id}, 500
+        assert_retry_scheduled_task_exit!(delivery_id)
+      end)
+
+    assert_sanitized_task_crash_log!(log)
+    assert_dispatcher_idle!(dispatcher)
+    assert Process.alive?(dispatcher)
+  end
+
+  test "attempt worker returns a sanitized fallback when task-exit recording fails" do
+    Application.put_env(:atp, DurableLedger, adapter: FailingTaskExitLedger)
+
+    claim =
+      delivery_claim!(
+        delivery: %Delivery{
+          id: "dlv_failing_task_exit",
+          status: "retry_scheduled",
+          max_attempts: 2
+        },
+        message: %Message{
+          id: "msg_failing_task_exit",
+          current_ack_status: "completed",
+          expires_at: DateTime.add(DateTime.utc_now(:microsecond), 60, :second)
+        },
+        recipient_agent: %Agent{
+          id: "agt_failing_task_exit",
+          account_id: "acct_failing_task_exit",
+          webhook_active: true,
+          webhook_url: "https://recipient.example.test/atp/webhook",
+          webhook_secret: "whsec_secret"
+        }
+      )
+
+    {:ok, worker} =
+      AttemptWorker.start_link(claim: claim, dispatcher: self(), callers: [self()])
+
+    assert_receive {^worker, {:task_exit, {:error, :task_exit_record_failed}}}, 500
+    refute_process_alive!(worker)
   end
 
   test "direct message intake wakeup dispatches newly committed webhook work", %{conn: conn} do
@@ -989,6 +1276,23 @@ defmodule Atp.WebhookDispatcherTest do
 
   defp dispatcher_config(module) do
     Application.get_env(:atp, module, [])
+  end
+
+  defp restore_application_env(module, nil), do: Application.delete_env(:atp, module)
+  defp restore_application_env(module, config), do: Application.put_env(:atp, module, config)
+
+  defp delivery_claim!(attrs) when is_list(attrs) do
+    %DeliveryClaim{
+      delivery: Keyword.fetch!(attrs, :delivery),
+      message: Keyword.fetch!(attrs, :message),
+      recipient_agent: Keyword.fetch!(attrs, :recipient_agent),
+      claim_token: Keyword.get(attrs, :claim_token, "dcl_test"),
+      leased_until:
+        Keyword.get_lazy(attrs, :leased_until, fn ->
+          DateTime.add(DateTime.utc_now(:microsecond), 60, :second)
+        end),
+      attempt_number: Keyword.get(attrs, :attempt_number, 1)
+    }
   end
 
   defp allow_dispatcher(dispatcher) when is_pid(dispatcher) do

@@ -117,6 +117,8 @@ defmodule Atp.Transport.WebhookDispatcher do
     {:noreply, state}
   end
 
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:noreply, state}
+
   @impl true
   def handle_cast(:dispatch_wakeup, %{enabled?: true} = state) do
     {:noreply, dispatch_due(state, :wakeup)}
