@@ -53,6 +53,14 @@ defmodule Atp.ReadinessTest do
     end
   end
 
+  defmodule RaisingRegistry do
+    def whereis_name(_name), do: raise("leaked registry exception")
+  end
+
+  defmodule ThrowingRegistry do
+    def whereis_name(_name), do: throw({:leaked_registry_throw, "#PID<0.0.0>"})
+  end
+
   test "uses default configured checks" do
     assert Readiness.check() == %{
              "status" => "ok",
@@ -293,6 +301,30 @@ defmodule Atp.ReadinessTest do
       public_output = inspect(result)
       refute public_output =~ "ecto://"
       refute public_output =~ "leaked"
+    end
+  end
+
+  test "dispatcher registry lookup exceptions and throws are sanitized" do
+    for registry <- [RaisingRegistry, ThrowingRegistry] do
+      result =
+        Readiness.check(
+          repo: RecordingRepo,
+          webhook_dispatcher_config: [enabled: true],
+          webhook_dispatcher_server: {:via, registry, :dispatcher}
+        )
+
+      assert result == %{
+               "status" => "error",
+               "checks" => %{
+                 "database" => "ok",
+                 "transport_runtime" => "ok",
+                 "webhook_dispatcher" => "error"
+               }
+             }
+
+      public_output = inspect(result)
+      refute public_output =~ "leaked"
+      refute public_output =~ "#PID"
     end
   end
 end

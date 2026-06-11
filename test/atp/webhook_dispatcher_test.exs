@@ -44,6 +44,12 @@ defmodule Atp.WebhookDispatcherTest do
     end
   end
 
+  defmodule RaisingTaskExitLedger do
+    def finish_claimed_webhook_delivery(%DeliveryClaim{}, %WebhookDelivery.AttemptResult{}, _opts) do
+      raise "leaked task exit failure"
+    end
+  end
+
   setup do
     old_config = Application.get_env(:atp, WebhookDispatcher)
     old_ledger_config = Application.get_env(:atp, DurableLedger)
@@ -214,6 +220,11 @@ defmodule Atp.WebhookDispatcherTest do
     after
       Process.delete(claim_key)
     end
+
+    pid = spawn(fn -> :ok end)
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 500
+    assert is_nil(AttemptWorker.claim(pid))
   end
 
   test "dispatcher restart ignores existing supervisor children without delivery claims" do
@@ -302,6 +313,37 @@ defmodule Atp.WebhookDispatcherTest do
         recipient_agent: %Agent{
           id: "agt_failing_task_exit",
           account_id: "acct_failing_task_exit",
+          webhook_active: true,
+          webhook_url: "https://recipient.example.test/atp/webhook",
+          webhook_secret: "whsec_secret"
+        }
+      )
+
+    {:ok, worker} =
+      AttemptWorker.start_link(claim: claim, dispatcher: self(), callers: [self()])
+
+    assert_receive {^worker, {:task_exit, {:error, :task_exit_record_failed}}}, 500
+    refute_process_alive!(worker)
+  end
+
+  test "attempt worker returns a sanitized fallback when task-exit recording raises" do
+    Application.put_env(:atp, DurableLedger, adapter: RaisingTaskExitLedger)
+
+    claim =
+      delivery_claim!(
+        delivery: %Delivery{
+          id: "dlv_raising_task_exit",
+          status: "retry_scheduled",
+          max_attempts: 2
+        },
+        message: %Message{
+          id: "msg_raising_task_exit",
+          current_ack_status: "completed",
+          expires_at: DateTime.add(DateTime.utc_now(:microsecond), 60, :second)
+        },
+        recipient_agent: %Agent{
+          id: "agt_raising_task_exit",
+          account_id: "acct_raising_task_exit",
           webhook_active: true,
           webhook_url: "https://recipient.example.test/atp/webhook",
           webhook_secret: "whsec_secret"

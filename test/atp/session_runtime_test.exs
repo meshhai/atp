@@ -1248,6 +1248,85 @@ defmodule Atp.SessionRuntimeTest do
     end)
   end
 
+  test "pending session rehydrator can start with default options" do
+    assert {:ok, rehydrator} = PendingSessionRehydrator.start_link()
+
+    assert Process.alive?(rehydrator)
+    GenServer.stop(rehydrator)
+  end
+
+  test "pending session rehydrator retries after thrown pending-list failures" do
+    parent = self()
+    session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    attempts = start_supervised!({Elixir.Agent, fn -> 0 end})
+
+    list_pending_session_ids = fn ->
+      attempt =
+        Elixir.Agent.get_and_update(attempts, fn current_attempt ->
+          next_attempt = current_attempt + 1
+          {next_attempt, next_attempt}
+        end)
+
+      send(parent, {:pending_rehydrate_throw_attempt, attempt})
+
+      if attempt == 1 do
+        throw({:temporary_pending_session_list_failure, "internal"})
+      else
+        []
+      end
+    end
+
+    capture_log(fn ->
+      start_supervised!(
+        {PendingSessionRehydrator,
+         session_supervisor: session_supervisor,
+         list_pending_session_ids: list_pending_session_ids,
+         retry_interval_ms: 10}
+      )
+
+      assert_receive {:pending_rehydrate_throw_attempt, 1}, 500
+      assert_receive {:pending_rehydrate_throw_attempt, 2}, 500
+    end)
+  end
+
+  test "pending session rehydrator treats already-started sessions as ready", %{conn: conn} do
+    pending_session =
+      open_pending_session_without_runtime_context!(conn, "runtime-rehydrate-already-started")
+
+    session_id = pending_session["id"]
+    on_exit(fn -> stop_session_server(session_id) end)
+
+    pid = start_supervised!({SessionServer, session_id})
+    assert Process.alive?(pid)
+
+    parent = self()
+    session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    attempts = start_supervised!({Elixir.Agent, fn -> 0 end})
+
+    list_pending_session_ids = fn ->
+      attempt =
+        Elixir.Agent.get_and_update(attempts, fn current_attempt ->
+          next_attempt = current_attempt + 1
+          {next_attempt, next_attempt}
+        end)
+
+      send(parent, {:pending_rehydrate_already_started_attempt, attempt})
+      [session_id]
+    end
+
+    rehydrator =
+      start_supervised!(
+        {PendingSessionRehydrator,
+         session_supervisor: session_supervisor,
+         list_pending_session_ids: list_pending_session_ids,
+         retry_interval_ms: 10}
+      )
+
+    assert_receive {:pending_rehydrate_already_started_attempt, 1}, 500
+    refute_receive {:pending_rehydrate_already_started_attempt, 2}, 50
+    GenServer.stop(rehydrator)
+  end
+
   test "pending session rehydrator retries after individual session start failures" do
     parent = self()
     session_supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
