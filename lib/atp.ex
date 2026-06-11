@@ -12,6 +12,7 @@ defmodule Atp do
       CLI,
       Identity,
       {Identity, [Account, AccountApiKey, Agent, AgentApiKey, IdempotencyKey]},
+      Readiness,
       Transport,
       {Transport,
        [
