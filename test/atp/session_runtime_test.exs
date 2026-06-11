@@ -57,9 +57,12 @@ defmodule Atp.SessionRuntimeTest do
 
     @impl DurableLedger
     def send_session_message(sender, session_id, params, idempotency_key, route) do
-      test_pid =
+      config =
         :atp
         |> Application.fetch_env!(__MODULE__)
+
+      test_pid =
+        config
         |> Keyword.fetch!(:test_pid)
 
       send(test_pid, {
@@ -71,13 +74,22 @@ defmodule Atp.SessionRuntimeTest do
         route
       })
 
-      {:ok, 201,
-       %{
-         "session" => %{"id" => session_id, "last_sequence" => 2},
-         "message_status" => %{
-           "message" => %{"id" => "msg_recorded", "session_id" => session_id}
-         }
-       }, nil}
+      case Keyword.get(config, :send_result) do
+        nil ->
+          {:ok, 201,
+           %{
+             "session" => %{"id" => session_id, "last_sequence" => 2},
+             "message_status" => %{
+               "message" => %{"id" => "msg_recorded", "session_id" => session_id}
+             }
+           }, nil}
+
+        send_result when is_function(send_result, 1) ->
+          send_result.(session_id)
+
+        send_result ->
+          send_result
+      end
     end
 
     @impl DurableLedger
@@ -1743,6 +1755,163 @@ defmodule Atp.SessionRuntimeTest do
              )
 
     assert :sys.get_state(pid) == before_state
+  end
+
+  test "session server keeps runtime state when refresh fails", %{conn: conn} do
+    %{session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-refresh-error")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    before_state = :sys.get_state(pid)
+
+    session_id
+    |> then(&Repo.get!(Session, &1))
+    |> Ecto.Changeset.change(
+      status: "failed",
+      terminal_at: DateTime.utc_now(:microsecond)
+    )
+    |> Repo.update!()
+
+    assert {:error, :session_not_active} = SessionServer.refresh_session(pid)
+    assert :sys.get_state(pid) == before_state
+  end
+
+  test "session server rejects unknown webhook dispatch tickets without changing state", %{
+    conn: conn
+  } do
+    %{session: session} =
+      open_accepted_session_without_runtime_context!(
+        conn,
+        "runtime-server-unknown-dispatch-ticket"
+      )
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    before_state = :sys.get_state(pid)
+
+    assert {:error, :webhook_dispatch_ticket_not_found} =
+             GenServer.call(pid, {:await_webhook_dispatch_turn, make_ref()}, :infinity)
+
+    assert :sys.get_state(pid) == before_state
+  end
+
+  test "session server ignores wrong release tokens and stale dispatch monitor messages", %{
+    conn: conn
+  } do
+    %{initiator: initiator, session: session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-server-stale-dispatch")
+
+    session_id = session["id"]
+    pid = start_supervised!({SessionServer, session_id})
+    original_ledger_config = Application.get_env(:atp, DurableLedger)
+    original_recorder_config = Application.get_env(:atp, RecordingSessionSendLedger)
+
+    on_exit(fn ->
+      restore_application_env(DurableLedger, original_ledger_config)
+      restore_application_env(RecordingSessionSendLedger, original_recorder_config)
+    end)
+
+    Application.put_env(:atp, DurableLedger, adapter: RecordingSessionSendLedger)
+
+    Application.put_env(:atp, RecordingSessionSendLedger,
+      test_pid: self(),
+      send_result: fn session_id ->
+        {:ok, 201,
+         %{
+           "session" => %{"id" => session_id, "last_sequence" => 2},
+           "message_status" => %{
+             "message" => %{"id" => "msg_ordered", "session_id" => session_id}
+           }
+         }, %{commit_value: {session_id, "del_ordered_dispatch"}}}
+      end
+    )
+
+    sender = Repo.get!(Agent, initiator["id"])
+    params = %{"payload" => a2a_user_text("runtime-server-stale-dispatch", "ordered")}
+    route = "POST /api/sessions/#{session_id}/messages"
+
+    assert {:ok, 201, _body, %{commit_value: {^session_id, "del_ordered_dispatch"}}, ticket} =
+             GenServer.call(
+               pid,
+               {:send_session_message, sender, params, "runtime-server-stale-dispatch-send",
+                route},
+               :infinity
+             )
+
+    assert is_reference(ticket)
+
+    assert_received {
+      :durable_session_send,
+      ^sender,
+      ^session_id,
+      ^params,
+      "runtime-server-stale-dispatch-send",
+      ^route
+    }
+
+    assert {:ok, release_token} =
+             GenServer.call(pid, {:await_webhook_dispatch_turn, ticket}, :infinity)
+
+    assert %SessionState{
+             webhook_dispatch_owner: {^ticket, ^release_token},
+             webhook_dispatch_ticket_monitors: %{^ticket => monitor_ref}
+           } = :sys.get_state(pid)
+
+    wrong_release_token = make_ref()
+    GenServer.cast(pid, {:release_webhook_dispatch_turn, ticket, wrong_release_token})
+
+    assert %SessionState{webhook_dispatch_owner: {^ticket, ^release_token}} =
+             :sys.get_state(pid)
+
+    GenServer.cast(pid, {:release_webhook_dispatch_turn, ticket, release_token})
+
+    assert %SessionState{
+             webhook_dispatch_owner: nil,
+             webhook_dispatch_ticket_monitors: ticket_monitors,
+             webhook_dispatch_monitor_tickets: monitor_tickets
+           } = state_after_release = :sys.get_state(pid)
+
+    refute Map.has_key?(ticket_monitors, ticket)
+    refute Map.has_key?(monitor_tickets, monitor_ref)
+
+    send(pid, {:DOWN, monitor_ref, :process, self(), :normal})
+    assert {:ok, _summary} = SessionServer.summary(pid)
+    assert :sys.get_state(pid) == state_after_release
+  end
+
+  test "pending opening expiry no-ops keep live processes healthy", %{conn: conn} do
+    pending_session =
+      open_pending_session_without_runtime_context!(conn, "runtime-pending-expiry-noop")
+
+    pending_pid = start_supervised!({SessionServer, pending_session["id"]})
+    before_pending_state = :sys.get_state(pending_pid)
+
+    send(pending_pid, :expire_pending_opening_session)
+    assert {:ok, pending_summary} = SessionServer.summary(pending_pid)
+    assert pending_summary.session_status == "pending"
+
+    assert %SessionState{
+             status: "pending",
+             lifecycle_deadline_at: pending_deadline_at,
+             lifecycle_timer_ref: pending_timer_ref
+           } = :sys.get_state(pending_pid)
+
+    assert DateTime.compare(pending_deadline_at, before_pending_state.lifecycle_deadline_at) ==
+             :eq
+
+    assert is_reference(pending_timer_ref)
+
+    %{session: accepted_session} =
+      open_accepted_session_without_runtime_context!(conn, "runtime-open-expiry-noop")
+
+    accepted_pid = start_supervised!({SessionServer, accepted_session["id"]})
+    before_accepted_state = :sys.get_state(accepted_pid)
+
+    send(accepted_pid, :expire_pending_opening_session)
+    assert {:ok, accepted_summary} = SessionServer.summary(accepted_pid)
+    assert accepted_summary.session_status == "open"
+    assert :sys.get_state(accepted_pid) == before_accepted_state
   end
 
   test "session server persists sends through the durable ledger", %{conn: conn} do
