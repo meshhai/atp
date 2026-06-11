@@ -4,6 +4,30 @@ defmodule Atp.ReadinessTest do
   alias Atp.Readiness
   alias Atp.Transport.WebhookDispatcher
 
+  @database_schema_requirements [
+    {"atp_accounts", "accounts", ~w(id name plan inserted_at updated_at)},
+    {"atp_account_api_keys", "account_api_keys",
+     ~w(id account_id label token_hash last_used_at revoked_at inserted_at updated_at)},
+    {"atp_agents", "agents",
+     ~w(id account_id address display_name description status webhook_url webhook_secret webhook_active inserted_at updated_at)},
+    {"atp_agent_api_keys", "agent_api_keys",
+     ~w(id account_id agent_id label token_hash last_used_at revoked_at inserted_at updated_at)},
+    {"atp_idempotency_keys", "idempotency_keys",
+     ~w(id account_id key route request_hash response_status response_body principal_type principal_id inserted_at)},
+    {"atp_messages", "messages",
+     ~w(id sender_account_id recipient_account_id sender_agent_id recipient_agent_id sender_address recipient_address trust payload content_type carrier_status current_ack_status terminal_at expires_at inserted_at updated_at session_id session_sequence)},
+    {"atp_deliveries", "deliveries",
+     ~w(id message_id recipient_agent_id mode status leased_until inserted_at updated_at attempt_count max_attempts next_attempt_at delivered_at last_error claim_token claimed_at)},
+    {"atp_acks", "acks",
+     ~w(id message_id delivery_id recipient_agent_id status payload inserted_at)},
+    {"atp_sessions", "sessions",
+     ~w(id initiator_account_id recipient_account_id initiator_agent_id recipient_agent_id initiator_address recipient_address status opening_message_id last_sequence opened_at terminal_at inserted_at updated_at)},
+    {"atp_agent_sender_policies", "sender_policies",
+     ~w(id recipient_agent_id sender_agent_id sender_account_id effect inserted_at updated_at)},
+    {"atp_webhook_attempts", "webhook_attempts",
+     ~w(id delivery_id message_id recipient_agent_id attempt_number request_url response_status error result next_attempt_at inserted_at)}
+  ]
+
   defmodule RecordingRepo do
     def query(sql, params, opts) do
       send(self(), {:readiness_query, sql, params, opts})
@@ -141,13 +165,15 @@ defmodule Atp.ReadinessTest do
            }
 
     assert_received {:readiness_query, sql, [], opts}
-    assert sql =~ "atp_agents"
-    assert sql =~ "atp_messages"
-    assert sql =~ "atp_deliveries"
-    assert sql =~ "claim_token"
-    assert sql =~ "claimed_at"
-    assert sql =~ "atp_sessions"
-    assert sql =~ "atp_webhook_attempts"
+
+    for {table_name, table_alias, columns} <- @database_schema_requirements do
+      assert sql =~ "#{table_name} AS #{table_alias}"
+
+      for column <- columns do
+        assert sql =~ "#{table_alias}.#{column}"
+      end
+    end
+
     assert sql =~ "LIMIT 0"
     assert opts[:log] == false
   end
