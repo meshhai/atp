@@ -184,3 +184,79 @@ URLs, tokens, queue depths, agent data, or message payload content.
 Treat probes as load balancer and process manager signals, not diagnostic
 endpoints. Use logs, telemetry, database inspection, or an operator console for
 private debugging.
+
+## Telemetry And Logging
+
+ATP currently exposes operational telemetry for the webhook dispatcher. Attach
+handlers to these event names:
+
+| Event | When it fires |
+| --- | --- |
+| `[:atp, :transport, :webhook_dispatcher, :scan]` | A dispatcher scan begins because of its timer or an explicit wakeup. |
+| `[:atp, :transport, :webhook_dispatcher, :claim]` | The dispatcher asks the ledger for due webhook delivery work and receives `claimed`, `empty`, or `error`. |
+| `[:atp, :transport, :webhook_dispatcher, :attempt, :start]` | A claimed webhook delivery attempt worker starts. |
+| `[:atp, :transport, :webhook_dispatcher, :attempt, :finish]` | A worker finishes through the normal durable delivery path. |
+| `[:atp, :transport, :webhook_dispatcher, :attempt, :exit]` | A worker exits unexpectedly and ATP records the durable task-exit outcome. Normal and shutdown exits are intentionally not emitted as errors. |
+
+Webhook dispatcher measurements are capacity counters: `in_flight`,
+`max_in_flight`, `available_capacity`, and `pending_dispatches`. Treat them as
+node-local dispatcher state, not a durable backlog or queue-depth metric.
+
+Webhook dispatcher metadata is coarse but may contain carrier IDs needed to
+correlate with the durable ledger:
+
+- `trigger`, `batch_size`, and `result` for scans, claims, and attempt
+  outcomes.
+- `delivery_id`, `message_id`, and `attempt_number` for claimed work and
+  attempts.
+- `message_status` when an attempt maps to a carrier message state.
+- `error_class`, such as `internal_error` or `internal_task_exit`, instead of
+  exception text or adapter details.
+
+ATP warning logs currently cover session runtime recovery edges:
+
+- accepted session warm-start failures
+- pending session start failures
+- pending session rehydration list failures
+- individual pending session rehydration start failures
+
+Logs and telemetry must not include agent API keys, claim tokens, webhook
+signing secrets, webhook URLs, request bodies, message payload content,
+database URLs, SQL text, adapter exception details, or raw downstream response
+bodies. They also must not include raw delivery records, full delivery structs,
+or durable claim internals. Treat delivery IDs, message IDs, session IDs, and
+attempt numbers as operator correlation fields, not public probe data.
+
+## Release Checklist
+
+`mix precommit` is the canonical local release gate for this repository. It
+runs:
+
+```sh
+mix deps.audit
+mix deps.unlock --check-unused
+mix compile --warnings-as-errors
+mix format --check-formatted
+mix cmd bash -n install.sh
+mix test
+mix credo --strict
+mix sobelow --root . --ignore Config.CSP --skip --exit Low
+mix xref graph --format cycles --label compile
+```
+
+Before promoting a production build:
+
+1. Run `mix precommit` on the commit intended for review or release.
+2. Build the deployment artifact from that verified commit.
+3. Apply database migrations explicitly before traffic is promoted.
+4. Start or restart the single ATP service instance.
+5. Confirm `GET /health` returns `200`.
+6. Confirm `GET /ready` returns `200` before sending carrier traffic.
+7. Run a minimal carrier smoke test against the target deployment, such as
+   creating agents, sending a direct message, claiming the recipient inbox
+   delivery, ACKing it, and reading message status.
+8. Review logs and webhook dispatcher telemetry for unexpected readiness,
+   runtime, dispatch, retry, or task-exit signals.
+
+Follow `docs/agents/pr-lifecycle.md` for branch, PR, and release-tag workflow.
+Do not tag feature-branch commits for public releases.
