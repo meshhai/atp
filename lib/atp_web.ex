@@ -11,6 +11,7 @@ defmodule AtpWeb do
       AccountController,
       AgentController,
       DeliveryController,
+      HealthController,
       InboxController,
       MessageController,
       SessionController,
