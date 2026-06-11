@@ -82,6 +82,51 @@ defmodule Atp.ReadinessTest do
            }
   end
 
+  test "uses configured via dispatcher name when no server override is provided" do
+    registry = :"atp_readiness_dispatcher_registry_#{System.unique_integer([:positive])}"
+    start_supervised!({Registry, keys: :unique, name: registry})
+
+    name = {:via, Registry, {registry, :dispatcher}}
+
+    start_supervised!(
+      {WebhookDispatcher,
+       enabled: true, dispatch_on_start?: false, interval_ms: 60_000, name: name}
+    )
+
+    assert Readiness.check(
+             repo: RecordingRepo,
+             webhook_dispatcher_config: [enabled: true, name: name]
+           ) == %{
+             "status" => "ok",
+             "checks" => %{
+               "database" => "ok",
+               "transport_runtime" => "ok",
+               "webhook_dispatcher" => "ok"
+             }
+           }
+  end
+
+  test "uses configured global dispatcher name when no server override is provided" do
+    name = {:global, {:atp_readiness_global_dispatcher, System.unique_integer([:positive])}}
+
+    start_supervised!(
+      {WebhookDispatcher,
+       enabled: true, dispatch_on_start?: false, interval_ms: 60_000, name: name}
+    )
+
+    assert Readiness.check(
+             repo: RecordingRepo,
+             webhook_dispatcher_config: [enabled: true, name: name]
+           ) == %{
+             "status" => "ok",
+             "checks" => %{
+               "database" => "ok",
+               "transport_runtime" => "ok",
+               "webhook_dispatcher" => "ok"
+             }
+           }
+  end
+
   test "database check uses a cheap schema-sensitive query without logging details" do
     assert Readiness.check(
              repo: RecordingRepo,

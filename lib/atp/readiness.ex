@@ -105,13 +105,35 @@ defmodule Atp.Readiness do
   defp process_for(nil), do: nil
 
   defp process_for(server) when is_atom(server) do
-    case Process.whereis(server) do
-      pid when is_pid(pid) -> if(Process.alive?(pid), do: pid)
-      _not_found -> nil
-    end
+    server
+    |> Process.whereis()
+    |> live_pid()
+  end
+
+  defp process_for({:global, name}) do
+    name
+    |> :global.whereis_name()
+    |> live_pid()
+  catch
+    _kind, _reason -> nil
+  end
+
+  defp process_for({:via, module, name}) when is_atom(module) do
+    module.whereis_name(name)
+    |> live_pid()
+  rescue
+    _exception -> nil
+  catch
+    _kind, _reason -> nil
   end
 
   defp process_for(_unsupported_server), do: nil
+
+  defp live_pid(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: pid
+  end
+
+  defp live_pid(_not_pid), do: nil
 
   defp overall_status(checks) do
     if Enum.all?(checks, fn {_name, status} -> status in [@status_ok, @status_disabled] end) do
