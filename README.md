@@ -170,6 +170,9 @@ Production expects:
 - optional `ATP_HOST`
 - optional `ATP_POOL_SIZE`
 
+For the single-node production contract, migration expectations, and probe
+semantics, see [docs/production.md](docs/production.md).
+
 ## Security
 
 See [SECURITY.md](SECURITY.md).
